@@ -91,12 +91,18 @@ async def translate_units(
     concurrency: int = 4,
     on_progress: Callable[[int, int], None] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> None:
     """按 source_text 去重分组，相同原文只调用一次 LLM；多个不同分组打包进同一次请求
     （见 batch_size），减少大文本量下的请求数和重复的 system prompt token 开销。
 
     on_progress(completed, total) 在每个去重分组翻译完成后调用一次，供 GUI 显示
     "翻译批次 X/Y" 进度用（见 spec 第 10 节），不传则跳过。
+
+    cancel_check() 在每个批次真正发请求前检查一次：返回 True 就跳过这个批次，不发起
+    新的 API 调用（对应用户点了"停止"或者软件被要求中断）。已经在缓存命中路径写完的
+    结果、以及调用这个函数之前就已经在途的批次不受影响——已经花出去的 token 不浪费，
+    只是不再新增。
     """
     system_prompt = _build_system_prompt(glossary)
     semaphore = asyncio.Semaphore(concurrency)
@@ -131,9 +137,17 @@ async def translate_units(
     for group, cached in cache_hits:
         _write_result(group, cached)
 
+    def _cancelled() -> bool:
+        return cancel_check is not None and cancel_check()
+
     async def _translate_single_job(job: _Job) -> None:
         user_prompt = _build_single_user_prompt(job.protected_text, job.context)
         async with semaphore:
+            # 取消检查放在拿到并发名额之后、真正发请求之前：还在排队等名额的批次，
+            # 轮到它的时候如果已经被取消就直接放弃，不发这次请求；但已经拿到名额、
+            # 正在等待响应的调用不会被这个检查打断，等它自然跑完并落盘。
+            if _cancelled():
+                return
             raw = await client.chat(system_prompt, user_prompt)
         translated_text = restore(raw.strip(), job.mapping)
         store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
@@ -146,6 +160,8 @@ async def translate_units(
 
         user_prompt = _build_batch_user_prompt(batch)
         async with semaphore:
+            if _cancelled():
+                return
             raw = await client.chat(system_prompt, user_prompt)
 
         parsed = _parse_batch_response(raw, len(batch))

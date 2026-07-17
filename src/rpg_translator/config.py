@@ -10,6 +10,7 @@ load_dotenv()
 
 _KEYRING_SERVICE = "rpg_translator"
 _KEYRING_USERNAME = "deepseek_api_key"
+_KEYRING_FALLBACK_USERNAME = "fallback_api_key"
 
 
 class Settings(BaseSettings):
@@ -37,3 +38,15 @@ def get_deepseek_api_key() -> str | None:
 
 def set_deepseek_api_key(key: str) -> None:
     keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, key)
+
+
+def get_fallback_api_key() -> str | None:
+    """备用 provider 的 Key，同样走 keyring，本地调试兜底读 .env 的 FALLBACK_API_KEY。"""
+    key = keyring.get_password(_KEYRING_SERVICE, _KEYRING_FALLBACK_USERNAME)
+    if key:
+        return key
+    return os.environ.get("FALLBACK_API_KEY")
+
+
+def set_fallback_api_key(key: str) -> None:
+    keyring.set_password(_KEYRING_SERVICE, _KEYRING_FALLBACK_USERNAME, key)

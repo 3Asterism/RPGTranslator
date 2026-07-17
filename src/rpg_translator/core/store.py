@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS text_units (
     source_text TEXT NOT NULL,
     control_code_map TEXT NOT NULL,
     translated_text TEXT,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    extra_locators TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS translation_memory (
@@ -37,7 +38,17 @@ class Store:
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """CREATE TABLE IF NOT EXISTS 不会给已存在的旧表补新列，这里手动补，
+        兼容 extra_locators 字段加入之前生成的 units.db。"""
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(text_units)")}
+        if "extra_locators" not in columns:
+            self._conn.execute(
+                "ALTER TABLE text_units ADD COLUMN extra_locators TEXT NOT NULL DEFAULT '[]'"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -60,6 +71,7 @@ class Store:
                 json.dumps(u.control_code_map, ensure_ascii=False),
                 u.translated_text,
                 u.status,
+                json.dumps(u.extra_locators, ensure_ascii=False),
             )
             for u in units
         ]
@@ -67,8 +79,8 @@ class Store:
             """
             INSERT INTO text_units
                 (id, engine, file_path, locator, context, source_text,
-                 control_code_map, translated_text, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 control_code_map, translated_text, status, extra_locators)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 engine=excluded.engine,
                 file_path=excluded.file_path,
@@ -76,8 +88,15 @@ class Store:
                 context=excluded.context,
                 source_text=excluded.source_text,
                 control_code_map=excluded.control_code_map,
-                translated_text=excluded.translated_text,
-                status=excluded.status
+                extra_locators=excluded.extra_locators,
+                translated_text=CASE
+                    WHEN text_units.source_text = excluded.source_text THEN text_units.translated_text
+                    ELSE excluded.translated_text
+                END,
+                status=CASE
+                    WHEN text_units.source_text = excluded.source_text THEN text_units.status
+                    ELSE excluded.status
+                END
             """,
             rows,
         )
@@ -161,4 +180,5 @@ class Store:
             control_code_map=json.loads(row["control_code_map"]),
             translated_text=row["translated_text"],
             status=row["status"],
+            extra_locators=json.loads(row["extra_locators"]),
         )

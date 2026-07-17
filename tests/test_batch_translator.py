@@ -319,6 +319,64 @@ async def test_translate_units_falls_back_to_individual_calls_when_batch_parse_f
 
 
 @pytest.mark.anyio
+async def test_translate_units_cancel_check_stops_new_batches_but_finishes_in_flight(
+    tmp_path: Path,
+):
+    """模拟点了"停止"按钮：cancel_check() 从某一刻起一直返回 True。已经过了并发闸门、
+    正在等 API 响应的请求要跑完正常落盘（不浪费已经发出去的那次调用），但还在排队、
+    还没真正发请求的批次不应该再打进来。用并发限流卡住大部分请求在队列里，只放行
+    concurrency 个先跑，取消标记在它们跑的过程中才置位，验证排队的那些没有被调用。"""
+    release = asyncio.Event()
+
+    class _GatedStub:
+        def __init__(self):
+            self.call_count = 0
+
+        async def chat(self, system_prompt: str, user_prompt: str) -> str:
+            self.call_count += 1
+            await release.wait()
+            return "翻译结果"
+
+    stub = _GatedStub()
+    cancelled = False
+
+    def _cancel_check() -> bool:
+        return cancelled
+
+    with Store(tmp_path / "units.db") as store:
+        units = [_make_unit(str(i), f"文本{i}") for i in range(6)]
+        store.upsert_units(units)
+
+        task = asyncio.create_task(
+            translate_units(
+                stub,
+                store,
+                units,
+                glossary={},
+                concurrency=2,
+                batch_size=1,
+                cancel_check=_cancel_check,
+            )
+        )
+        # 等已经拿到并发名额的 2 个请求真正发出去（call_count 到 2 后它们卡在
+        # release.wait() 上），这时候再置位取消——它们不受影响，但排队中的另外 4 个
+        # 批次接下来轮到自己发请求前会看到取消标记，不再调用
+        for _ in range(100):
+            if stub.call_count >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert stub.call_count == 2
+
+        cancelled = True
+        release.set()
+        await task
+
+        assert stub.call_count == 2  # 排队中的 4 个批次没有被发出去
+        translated = [u for u in store.list_units() if u.status == "translated"]
+        assert len(translated) == 2
+
+
+@pytest.mark.anyio
 async def test_translate_units_against_real_provider(tmp_path: Path):
     api_key = get_deepseek_api_key()
     if not api_key:

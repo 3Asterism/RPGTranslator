@@ -36,6 +36,41 @@ def test_upsert_is_idempotent_update(tmp_path: Path):
         assert len(store.list_units()) == 1
 
 
+def test_upsert_preserves_translated_progress_when_source_text_unchanged(tmp_path: Path):
+    """断点续传的关键行为：GUI 每次点"开始翻译"都会重新跑一遍 extract 再 upsert_units
+    （见 gui/workers.py ExtractAndGlossaryWorker），extract 出来的 TextUnit 永远是全新的
+    status="pending"/translated_text=None。如果 upsert 无条件覆盖，已经翻译好、意外中断
+    前落盘的进度会在下一次重新打开软件时被直接抹掉，等于强迫用户重翻一遍、白白多花
+    API token。只要原文没变，已有的翻译结果和状态必须原样保留。"""
+    with Store(tmp_path / "units.db") as store:
+        store.upsert_units([_make_unit("u1", source_text="こんにちは")])
+        store.update_translation("u1", "你好", status="translated")
+
+        # 模拟重新打开软件后再次 extract：同一条原文，全新的 pending TextUnit
+        store.upsert_units([_make_unit("u1", source_text="こんにちは")])
+
+        fetched = store.get_unit("u1")
+        assert fetched is not None
+        assert fetched.status == "translated"
+        assert fetched.translated_text == "你好"
+
+
+def test_upsert_resets_translation_when_source_text_actually_changed(tmp_path: Path):
+    """游戏文件本身改了（原文变了），旧译文语义可能已经不对，这种情况必须重置回 pending，
+    不能沿用旧翻译——和上面"原文没变就保留进度"的场景要能区分开。"""
+    with Store(tmp_path / "units.db") as store:
+        store.upsert_units([_make_unit("u1", source_text="こんにちは")])
+        store.update_translation("u1", "你好", status="translated")
+
+        store.upsert_units([_make_unit("u1", source_text="さようなら")])
+
+        fetched = store.get_unit("u1")
+        assert fetched is not None
+        assert fetched.status == "pending"
+        assert fetched.translated_text is None
+        assert fetched.source_text == "さようなら"
+
+
 def test_get_unit_missing_returns_none(tmp_path: Path):
     with Store(tmp_path / "units.db") as store:
         assert store.get_unit("does-not-exist") is None
