@@ -89,6 +89,13 @@ class LLMClient:
                                 {"role": "user", "content": user_prompt},
                             ],
                             "stream": False,
+                            # DeepSeek-V4-Flash / Qwen3.6 这类混合思考模型默认开思考模式，
+                            # 会多算一大段 reasoning_content 且计入 completion tokens——
+                            # 实测同一句翻译请求，开思考模式 completion_tokens 200+，关掉后
+                            # 只要 1，纯属为翻译这种机械任务多付的钱。这里强制关闭；对不认识
+                            # 这个字段的 provider，未知参数按 OpenAI 兼容协议惯例会被忽略，
+                            # 不影响调用。
+                            "enable_thinking": False,
                         },
                     )
                     response.raise_for_status()

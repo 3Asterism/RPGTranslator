@@ -423,8 +423,29 @@ toolname run          <project_dir> --out <output_dir>
 - **M5**：VX Ace 换行处理，(a) 预估换行和 (b) 消息框补丁注入两条路径的验证；GUI 侧确认
   VX Ace 工程走全流程没问题（理论上不用改 GUI 代码，因为 GUI 只依赖 adapter 注册表）。
 - **M6**：打包验证，PyInstaller 产出、干净环境实测、图标/窗口标题等收尾细节。
-- **M7（之后再说）**：术语表更完善的审核界面、可选的运行时 hook 模式、RPG Maker
-  2000/2003、WOLF 之外的其他非 RPG Maker 引擎。
+- **M4.10（v1.x 追加，2026-07-18 调研后新增）**：RPG Maker 2000/2003 adapter，见第 17 节
+  调研结论。格式是 LCF 二进制（`.lmu`/`.ldb`/`.lmt`/`.lsd`），**不手写二进制解析器**——
+  `EasyRPG/liblcf`（C++，LGPL，长期活跃维护）自带 `lcf2xml`/`xml2lcf` 两个 CLI 工具做
+  二进制⇄XML 互转，本项目走 subprocess 调这两个工具 + Python 标准库 `xml` 解析/改文本
+  的路线，风险和工作量明显低于当初的 WOLF（WOLF 没有官方库，纯靠三份社区逆向代码移植）。
+  第一步任务边界：1）确认 `lcf2xml`/`xml2lcf` 在 Windows 上的可用形式（官方预编译二进制
+  vs 自己用 CMake 编译，需要先查当前开发机有没有可用的 C++ 工具链）；2）拿一个真实
+  RM2k/2k3 工程验证 round-trip（不翻译直接转 XML 再转回二进制，跟原文件逐字节 diff，
+  参照 M1 的验收标准）；3）中文回填的编码/字体/locale 方案定下来再决定要不要做（见
+  第 17 节，默认方案是写 GBK/936 codepage + 提示用户配 Locale Emulator，或者可选打包
+  EasyRPG Player 当运行时）。换行处理复用 VX Ace 的静态预估换行方案，不引入 DynRPG
+  这类运行时 DLL 注入（违反第 2 节"不做运行时 hook"的范围界定）。
+- **M4.11（v1.x 追加，2026-07-18 调研后新增）**：WOLF WolfPro 加密 + 经典 XOR 加密支持，
+  补齐 M4.8 当初明确排除的两种加密场景（见第 6.4 节 / README"已知局限"）。调研发现
+  `Sinflower/UberWolf`（活跃维护的 GUI 工具）已经能自动探测 key 并解密 WolfPro，是老
+  `WolfDec`（只支持经典 XOR）的后继升级版，说明这两种加密目前都有开源先例能破。第一步
+  任务边界：1）读 UberWolf 源码把解密算法逻辑搞懂（比 wolftrans 系列更新，之前没读过）；
+  2）确认它的协议（不同于 wolftrans 的 MPL-2.0，需要单独查证，移植/调用前先确认许可证
+  义务）；3）找一个 WolfPro 保护或经典 XOR 加密的真实/示例工程验证移植后的 Python 实现
+  能否正确解密；4）验证通过再决定是移植核心逻辑进 `wolf_binary.py`还是走子进程调用
+  UberWolf 编译产物，如实汇报工作量评估，不强行交付（同 M4.8 的风险披露原则）。
+- **M7（之后再说）**：术语表更完善的审核界面、可选的运行时 hook 模式、WOLF/RPG Maker
+  2000/2003 之外的其他非 RPG Maker 引擎。
 
 ---
 
@@ -458,6 +479,12 @@ toolname run          <project_dir> --out <output_dir>
   阶段判定不可行，验收标准改为"交付一份可行性评估报告"，不强行要求功能完整。
 - M5：抽样一个存在长对话的 VX Ace 游戏，回填后译文在游戏内不溢出消息框。
 - M6：在没装 Python 的干净 Windows 虚拟机上双击 exe 能直接打开并完成一次完整汉化流程。
+- M4.10：`lcf2xml`/`xml2lcf` round-trip 能在真实 RM2k/2k3 工程上跟原文件逐字节 diff 一致
+  （或只有预期内格式差异）；如果调研判定 liblcf 工具链在当前环境下不可行，验收标准改为
+  "交付一份可行性评估报告"，参照 M4.8 的风险披露原则。
+- M4.11：Python 实现（或子进程调用 UberWolf）能正确解密一个真实 WolfPro 保护或经典 XOR
+  加密的 WOLF 工程，解密产物能被现有 `wolf_binary.py` 正常读出文本；不可行则同样降级为
+  可行性评估报告。
 
 ---
 
@@ -470,5 +497,71 @@ toolname run          <project_dir> --out <output_dir>
   范围，明确排除更老的 RPG Maker 2000/2003 和 WOLF 之外的其他非 RPG Maker 引擎；对应改动
   见第 2、4、6.3、6.4、13、15 节，新增里程碑 M4.5 / M4.8。WOLF 因为没有官方格式文档，
   M4.8 定位为"先研究可行性，再决定是否/如何实现"，不是直接承诺完整适配。
+- **2026-07-18**：用户要求调研 RPG Maker 2000/2003 支持可行性、以及 WOLF 已知局限
+  （WolfPro/经典 XOR 加密不支持）有没有解法。调研结论见第 17 节，新增里程碑 M4.10 /
+  M4.11（第 13、15 节），排期在 M4.8 之后、M7 之前——之前 M7"之后再说"里的 RPG Maker
+  2000/2003 条目已经从"不打算做"升级为"有明确落地路径、已排进里程碑"。
+- **2026-07-18**：真实工程调试过程中发现 `llm_client.py` 一直没有关闭 DeepSeek-V4-Flash /
+  Qwen3.6 这类混合思考模型的思考模式，实测同一句翻译请求 completion_tokens 从 200+
+  降到 1——思考模式产生的 `reasoning_content` 会正常计入计费 token，对纯机械翻译任务
+  没有必要。已在请求体里加 `"enable_thinking": false` 固定关闭，见第 17.3 节。
+
+---
+
+## 17. 调研记录（2026-07-18）
+
+### 17.1 RPG Maker 2000/2003 支持可行性
+
+格式是 LCF 二进制（`RPG_RT.ldb` 数据库、`RPG_RT.lmt` 地图树、`MapXXXX.lmu` 单张地图、
+`SaveXX.lsd` 存档），比当初 M4.8 的 WOLF 情况好办：`EasyRPG/liblcf`（C++，LGPL，长期
+活跃维护）是这个格式事实上的权威开源实现，自带 `lcf2xml`/`xml2lcf` 两个 CLI 工具做
+二进制⇄XML 互转。落地路径不用照抄 WOLF 那套"读三份社区逆向代码、自己手写二进制
+解析器"的重活，而是 subprocess 调用这两个工具转 XML、Python 标准库 `xml` 改文本、再
+转回二进制——工程风险明显更低。
+
+其他关键点：
+- **编码**：默认 Shift-JIS；liblcf 自带 ANSI/SJIS→UTF-8 转换。回填中文需要按目标
+  codepage（简中 936/GBK）写 raw bytes，运行时还得配合系统 locale（Windows 10 上用
+  Locale Emulator）或者干脆把 EasyRPG Player 打包成可选运行时（原生 UTF-8，不用哄
+  locale）——这是个分发模式上的决策点，不是纯技术问题，实现前需要和用户确认一次。
+- **换行**：消息框同样固定行数、不自动换行，和 VX Ace 是一个路子，静态预估重排方案
+  可以直接复用，不需要引入 DynRPG 这类运行时 DLL 注入方案（本项目 v1 明确不做运行时
+  hook，见第 2 节）。
+- **字体**：目标语言缺字形时，社区里有记录在案的固定偏移可以改 `RPG_RT.exe` 里写死
+  的字体名（RM2k 是 `0x6c020`，RM2k3 是 `0x87890`），但这属于碰引擎二进制，超出当前
+  "只改数据文件、不碰引擎"的边界，要不要做需要单独决定。
+
+结论：格式本身可行性高于当初的 WOLF，主要新工作量在"接 liblcf 工具链"和"中文渲染
+locale/字体要不要管"两处，已落地为 M4.10（见第 13、15 节）。
+
+### 17.2 WOLF WolfPro / 经典 XOR 加密支持可行性
+
+M4.8 当时明确排除了这两种加密场景。调研发现社区这块有进展：`Sinflower/UberWolf`
+（GUI 工具，活跃维护）明确支持 WolfPro，带自动 key 探测，是老工具 `WolfDec`（只支持
+经典 XOR，不支持 WolfPro）的后继升级版——说明这两种加密目前都有开源先例能破，不是
+彻底无解。已落地为 M4.11（见第 13、15 节），第一步任务边界是读 UberWolf 源码把解密
+逻辑搞懂、确认其许可证是否允许移植/调用，再拿真实加密工程验证。
+
+### 17.3 LLM 调用侧的 token 成本优化：关闭混合思考模型的思考模式
+
+调试翻译流程时发现一个此前没注意到的成本项：DeepSeek-V4-Flash（SiliconFlow）和
+Qwen3.6-Flash（阿里云百炼）都是"混合思考"模型，默认会开思考模式，生成一段
+`reasoning_content` 且**正常计入计费的 completion tokens**。实测同一句翻译请求
+（"把「こんにちは」翻译成简体中文，只输出译文。"）：
+
+| 场景 | completion_tokens | 说明 |
+|---|---|---|
+| 不传参数（默认开思考） | DeepSeek 52 / Qwen 219 | 其中 DeepSeek 51 个是 `reasoning_tokens` |
+| 请求体加 `"enable_thinking": false` | 两边都是 1 | 输出内容不变，仍然是"你好" |
+
+对纯机械翻译任务，思考过程没有实际价值，白白多付几十到几百倍的 completion token。
+已在 `translate/llm_client.py` 的请求体里固定加 `"enable_thinking": false`；对不认识
+这个字段的 provider，未知参数按 OpenAI 兼容协议惯例会被忽略，不影响调用（两个当前
+配置的 provider 都已实测确认生效，见 16 节变更记录）。
+
+对照社区同类工具（AiNiee、GalTransl 等 LLM 游戏翻译方案）已经在用的省 token 手段——
+批量打包请求、术语表约束、翻译记忆去重、上下文关联复用 system prompt 吃 prompt
+caching 折扣——本项目在这几项上已经和它们持平（见 batch_translator.py），思考模式
+是目前唯一被漏掉、影响也最大的一项。
 
 现在开始，从 M0 开始搭建。
