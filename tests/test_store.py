@@ -76,6 +76,17 @@ def test_translation_memory_roundtrip(tmp_path: Path):
         assert store.get_memory(source_hash) == "你好呀"
 
 
+def test_glossary_roundtrip_and_update(tmp_path: Path):
+    with Store(tmp_path / "units.db") as store:
+        assert store.get_glossary() == {}
+
+        store.set_glossary({"ハロルド": "哈罗德", "村": "村庄"})
+        assert store.get_glossary() == {"ハロルド": "哈罗德", "村": "村庄"}
+
+        store.set_glossary({"ハロルド": "哈洛德"})
+        assert store.get_glossary() == {"ハロルド": "哈洛德", "村": "村庄"}
+
+
 def test_data_persists_across_store_reopen(tmp_path: Path):
     db_path = tmp_path / "units.db"
     with Store(db_path) as store:

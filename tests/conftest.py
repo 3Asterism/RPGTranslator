@@ -9,6 +9,11 @@ import pytest
 _JSON_DUMP_KWARGS: dict[str, Any] = {"ensure_ascii": False, "separators": (",", ":")}
 
 
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
 def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, **_JSON_DUMP_KWARGS), encoding="utf-8")
 

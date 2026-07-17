@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from rpg_translator.core.pipeline import UnknownEngineError, run_extract, run_inject
+from rpg_translator.config import Settings, get_deepseek_api_key
+from rpg_translator.core.pipeline import (
+    MissingApiKeyError,
+    UnknownEngineError,
+    run_extract,
+    run_full,
+    run_glossary,
+    run_inject,
+    run_translate,
+)
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -15,10 +25,7 @@ if sys.platform == "win32":
 app = typer.Typer(help="RPG Maker MV/MZ/VX Ace 文本提取/翻译/回填工具（开发调试用 CLI）")
 
 _NOT_IMPLEMENTED_MILESTONE = {
-    "glossary": "M2",
-    "translate": "M2",
     "qa": "M3",
-    "run": "M2",
 }
 
 
@@ -46,8 +53,16 @@ def extract(
 def glossary(
     db: Annotated[Path, typer.Option(help="SQLite 数据库路径")] = Path("units.db"),
 ) -> None:
-    """抽取/查看术语表候选。"""
-    _not_implemented("glossary")
+    """抽取术语表候选并存入数据库。"""
+    settings = Settings()
+    try:
+        candidates = asyncio.run(
+            run_glossary(db, get_deepseek_api_key(), settings.deepseek_base_url, settings.deepseek_model)
+        )
+    except MissingApiKeyError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    typer.echo(f"术语抽取完成：{len(candidates)} 条候选，已写入 {db}")
 
 
 @app.command()
@@ -56,7 +71,21 @@ def translate(
     concurrency: Annotated[int, typer.Option(help="并发请求数")] = 8,
 ) -> None:
     """调用 DeepSeek 批量翻译数据库中待翻译的 TextUnit。"""
-    _not_implemented("translate")
+    settings = Settings()
+    try:
+        translated = asyncio.run(
+            run_translate(
+                db,
+                get_deepseek_api_key(),
+                settings.deepseek_base_url,
+                settings.deepseek_model,
+                concurrency,
+            )
+        )
+    except MissingApiKeyError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    typer.echo(f"翻译完成：数据库中共有 {len(translated)} 条已翻译文本")
 
 
 @app.command()
@@ -87,9 +116,27 @@ def inject(
 def run(
     project_dir: Annotated[Path, typer.Argument(help="游戏工程根目录")],
     out: Annotated[Path, typer.Option(help="汉化版输出目录")] = Path("output"),
+    db: Annotated[Path, typer.Option(help="SQLite 数据库路径")] = Path("units.db"),
+    concurrency: Annotated[int, typer.Option(help="并发请求数")] = 8,
 ) -> None:
-    """一键跑完整链路：extract -> translate -> inject。"""
-    _not_implemented("run")
+    """一键跑完整链路：extract -> 术语抽取 -> translate -> inject。"""
+    settings = Settings()
+    try:
+        units = asyncio.run(
+            run_full(
+                project_dir,
+                db,
+                out,
+                get_deepseek_api_key(),
+                settings.deepseek_base_url,
+                settings.deepseek_model,
+                concurrency,
+            )
+        )
+    except (UnknownEngineError, MissingApiKeyError) as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    typer.echo(f"完整汉化流程完成：{len(units)} 条文本，输出到 {out}")
 
 
 if __name__ == "__main__":

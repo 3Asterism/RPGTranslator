@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 
 import keyring
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+load_dotenv()
 
 _KEYRING_SERVICE = "rpg_translator"
 _KEYRING_USERNAME = "deepseek_api_key"

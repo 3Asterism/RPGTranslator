@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS translation_memory (
     source_text TEXT NOT NULL,
     translated_text TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS glossary (
+    term TEXT PRIMARY KEY,
+    translation TEXT NOT NULL
+);
 """
 
 
@@ -126,6 +131,21 @@ class Store:
                 translated_text=excluded.translated_text
             """,
             (source_hash, source_text, translated_text),
+        )
+        self._conn.commit()
+
+    def get_glossary(self) -> dict[str, str]:
+        rows = self._conn.execute("SELECT term, translation FROM glossary").fetchall()
+        return {row["term"]: row["translation"] for row in rows}
+
+    def set_glossary(self, terms: dict[str, str]) -> None:
+        self._conn.executemany(
+            """
+            INSERT INTO glossary (term, translation)
+            VALUES (?, ?)
+            ON CONFLICT(term) DO UPDATE SET translation=excluded.translation
+            """,
+            list(terms.items()),
         )
         self._conn.commit()
 
