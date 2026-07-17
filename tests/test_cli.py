@@ -80,3 +80,39 @@ def test_glossary_and_translate_full_cli_flow_against_real_provider(tmp_path, mz
     line1 = translated_map001["events"][1]["pages"][0]["list"][1]["parameters"][0]
     assert line1 != "こんにちは、旅人よ。"  # 真的被翻译过，不是原文本
     assert "⟦CC" not in line1
+
+
+def test_qa_command_exports_csv(tmp_path: Path):
+    from rpg_translator.core.ir import TextUnit
+    from rpg_translator.core.store import Store
+
+    db_path = tmp_path / "units.db"
+    export_path = tmp_path / "conflicts.csv"
+
+    with Store(db_path) as store:
+        store.upsert_units(
+            [
+                TextUnit(
+                    id="1",
+                    engine="mz",
+                    file_path="data/Map001.json",
+                    locator="events/1/pages/0/list/1/parameters/0",
+                    context="村長との会話",
+                    source_text="はい",
+                ),
+                TextUnit(
+                    id="2",
+                    engine="mz",
+                    file_path="data/Map001.json",
+                    locator="events/1/pages/0/list/2/parameters/0",
+                    context="モンスターとの戦闘会話",
+                    source_text="はい",
+                ),
+            ]
+        )
+
+    result = runner.invoke(app, ["qa", "--db", str(db_path), "--export", str(export_path)])
+    assert result.exit_code == 0
+    assert "QA 扫描完成" in result.output
+    assert export_path.is_file()
+    assert "はい" in export_path.read_text(encoding="utf-8-sig")

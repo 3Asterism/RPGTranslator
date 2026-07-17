@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,66 @@ def _make_unit(uid: str, source_text: str, status: str = "pending", context: str
         source_text=source_text,
         status=status,
     )
+
+
+class _ConcurrencyTrackingStub:
+    """记录同时在跑的请求数峰值，用来验证信号量并发限流是否真的生效。"""
+
+    def __init__(self, delay: float = 0.05):
+        self.delay = delay
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        await asyncio.sleep(self.delay)
+        self.in_flight -= 1
+        return "翻译结果"
+
+
+@pytest.mark.anyio
+async def test_translate_units_resume_after_interruption_skips_already_translated(
+    tmp_path: Path,
+):
+    """模拟"翻译到一半被 kill 掉重新执行"：第一轮只翻完一部分，第二轮对全量重跑，
+    已经翻译过的那部分不应该再次调用 LLM——对应 M3 断点续跑验收标准。"""
+    stub = _StubClient("翻译结果")
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("1", "こんにちは"),
+            _make_unit("2", "さようなら"),
+            _make_unit("3", "ありがとう"),
+        ]
+        store.upsert_units(units)
+
+        # 第一轮：模拟进程只跑到第一条就被 kill 掉
+        await translate_units(stub, store, [units[0]], glossary={}, concurrency=4)
+        assert stub.call_count == 1
+        assert store.get_unit("1").status == "translated"
+
+        # 第二轮：重新执行，对全部三条 units 再跑一次 pipeline
+        # （store.list_units() 里 unit 1 现在已经是 status=translated）
+        all_units_from_store = store.list_units()
+        await translate_units(stub, store, all_units_from_store, glossary={}, concurrency=4)
+
+        # 只有 2、3 是新调用的，1 不应该被重复调用
+        assert stub.call_count == 1 + 2
+        assert store.get_unit("2").status == "translated"
+        assert store.get_unit("3").status == "translated"
+
+
+@pytest.mark.anyio
+async def test_translate_units_respects_concurrency_limit(tmp_path: Path):
+    stub = _ConcurrencyTrackingStub(delay=0.05)
+    with Store(tmp_path / "units.db") as store:
+        # 8 个互不相同的 source_text，确保会产生 8 次并发调用，而不是被去重掉
+        units = [_make_unit(str(i), f"文本{i}") for i in range(8)]
+        store.upsert_units(units)
+
+        await translate_units(stub, store, units, glossary={}, concurrency=3)
+
+        assert stub.max_in_flight <= 3
 
 
 @pytest.mark.anyio

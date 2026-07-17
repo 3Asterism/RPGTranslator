@@ -15,6 +15,7 @@ from rpg_translator.core.pipeline import (
     run_full,
     run_glossary,
     run_inject,
+    run_qa,
     run_translate,
 )
 
@@ -23,16 +24,6 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8")
 
 app = typer.Typer(help="RPG Maker MV/MZ/VX Ace 文本提取/翻译/回填工具（开发调试用 CLI）")
-
-_NOT_IMPLEMENTED_MILESTONE = {
-    "qa": "M3",
-}
-
-
-def _not_implemented(command: str) -> None:
-    milestone = _NOT_IMPLEMENTED_MILESTONE[command]
-    typer.echo(f"`{command}` 尚未实现，计划在里程碑 {milestone} 完成。", err=True)
-    raise typer.Exit(code=1)
 
 
 @app.command()
@@ -94,7 +85,11 @@ def qa(
     export: Annotated[Path | None, typer.Option(help="导出待复核列表 CSV 路径")] = None,
 ) -> None:
     """一致性校验：标记同一原文在不同语境下的疑似冲突。"""
-    _not_implemented("qa")
+    conflicts = run_qa(db, export)
+    if export is not None:
+        typer.echo(f"QA 扫描完成：{len(conflicts)} 条候选冲突，已导出到 {export}")
+    else:
+        typer.echo(f"QA 扫描完成：{len(conflicts)} 条候选冲突（未导出，使用 --export 指定 CSV 路径）")
 
 
 @app.command()

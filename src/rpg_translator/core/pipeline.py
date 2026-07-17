@@ -9,6 +9,7 @@ from rpg_translator.engines.mv_mz import MVAdapter, MZAdapter
 from rpg_translator.translate.batch_translator import translate_units
 from rpg_translator.translate.glossary import extract_glossary_candidates
 from rpg_translator.translate.llm_client import LLMClient, LLMConfig
+from rpg_translator.translate.qa import ConflictRow, export_conflicts_csv, find_context_conflicts
 
 REGISTERED_ADAPTERS: list[type[EngineAdapter]] = [MVAdapter, MZAdapter]
 
@@ -110,3 +111,11 @@ async def run_full(
 
     adapter.inject(project_dir, all_units, output_dir)
     return all_units
+
+
+def run_qa(db_path: Path, export_path: Path | None) -> list[ConflictRow]:
+    with Store(db_path) as store:
+        conflicts = find_context_conflicts(store)
+    if export_path is not None:
+        export_conflicts_csv(conflicts, export_path)
+    return conflicts
