@@ -634,6 +634,191 @@ def vxace_project(tmp_path: Path) -> Path:
     return build_vxace_project(tmp_path)
 
 
+def build_xp_project(root: Path) -> Path:
+    """手搭的 RPG Maker XP 合成工程——和 build_vxace_project 结构基本一致，
+    但关键差异是文本字段用 `bytes` 而不是 `str`：M4.9 用真实 XP 工程（GitHub
+    上的 GPL-3.0 开源同人游戏 torresflo/Pokemon-Obsidian）实测发现，XP 用的
+    老版本 Ruby（1.8，字符串没有编码感知）marshal 出来的字符串，`rubymarshal`
+    读出来原样是 `bytes`，不会像 VX Ace（Ruby 1.9+，ivar 编码标记）那样自动
+    解码——之前代码对这类值直接调用 Python `str()`，抽出来的"文本"其实是
+    `b'...'` 这种 repr 字面量，完全不能用（见 _rgss_common.py 的
+    `rv_str`/`_encode_like`）。这份 fixture 特意用 `bytes` 值复现真实格式，
+    保证这个真机 bug 有回归测试兜底，不用每次都靠下载真实工程才能测出来。
+    """
+    from rubymarshal.classes import RubyObject
+    from rubymarshal.writer import writes
+
+    def _write_rv(path: Path, obj: Any) -> None:
+        path.write_bytes(writes(obj))
+
+    data_dir = root / "xp_project" / "Data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    page_list = [
+        RubyObject("RPG::EventCommand", {"@code": 401, "@indent": 0, "@parameters": [b"Bonjour, voyageur."]}),
+        RubyObject("RPG::EventCommand", {"@code": 401, "@indent": 0, "@parameters": [b"Bienvenue au village."]}),
+        RubyObject(
+            "RPG::EventCommand",
+            {"@code": 102, "@indent": 0, "@parameters": [[b"Oui", b"Non"], 1, 0, 2, 0]},
+        ),
+        RubyObject("RPG::EventCommand", {"@code": 108, "@indent": 0, "@parameters": [b"plugin:config=1"]}),
+        RubyObject("RPG::EventCommand", {"@code": 320, "@indent": 0, "@parameters": [1, b"Heros"]}),
+        RubyObject("RPG::EventCommand", {"@code": 0, "@indent": 0, "@parameters": []}),
+    ]
+    page = RubyObject(
+        "RPG::Event::Page",
+        {
+            "@condition": RubyObject("RPG::Event::Page::Condition", {}),
+            "@graphic": RubyObject("RPG::Event::Page::Graphic", {}),
+            "@move_type": 0,
+            "@move_speed": 3,
+            "@move_frequency": 3,
+            "@move_route": RubyObject("RPG::MoveRoute", {"@list": [], "@repeat": True}),
+            "@walk_anime": True,
+            "@step_anime": False,
+            "@direction_fix": False,
+            "@through": False,
+            "@priority_type": 1,
+            "@trigger": 0,
+            "@list": page_list,
+        },
+    )
+    event = RubyObject("RPG::Event", {"@id": 1, "@name": b"EV001", "@x": 1, "@y": 1, "@pages": [page]})
+    game_map = RubyObject(
+        "RPG::Map",
+        {
+            "@tileset_id": 1,
+            "@width": 5,
+            "@height": 5,
+            "@autoplay_bgm": False,
+            "@bgm": RubyObject("RPG::AudioFile", {}),
+            "@autoplay_bgs": False,
+            "@bgs": RubyObject("RPG::AudioFile", {}),
+            "@encounter_list": [],
+            "@encounter_step": 30,
+            "@data": [0] * (5 * 5 * 3),
+            "@events": {1: event},
+        },
+    )
+    _write_rv(data_dir / "Map001.rxdata", game_map)
+
+    common_events = [
+        None,
+        RubyObject(
+            "RPG::CommonEvent",
+            {
+                "@id": 1,
+                "@name": b"CE001",
+                "@trigger": 0,
+                "@switch_id": 1,
+                "@list": [
+                    RubyObject(
+                        "RPG::EventCommand",
+                        {"@code": 401, "@indent": 0, "@parameters": [b"Texte d'evenement commun."]},
+                    ),
+                    RubyObject("RPG::EventCommand", {"@code": 0, "@indent": 0, "@parameters": []}),
+                ],
+            },
+        ),
+    ]
+    _write_rv(data_dir / "CommonEvents.rxdata", common_events)
+
+    actors = [
+        None,
+        RubyObject(
+            "RPG::Actor",
+            {
+                "@id": 1,
+                "@name": b"Rouge",
+                "@description": b"Un jeune dresseur plein d'espoir.",
+            },
+        ),
+    ]
+    _write_rv(data_dir / "Actors.rxdata", actors)
+
+    for name in ("Classes", "Skills", "Items", "Weapons", "Armors", "Enemies", "States"):
+        _write_rv(data_dir / f"{name}.rxdata", [None])
+
+    (root / "xp_project" / "Game.rxproj").write_bytes(b"")
+
+    return root / "xp_project"
+
+
+@pytest.fixture
+def xp_project(tmp_path: Path) -> Path:
+    return build_xp_project(tmp_path)
+
+
+def build_vx_project(root: Path) -> Path:
+    """跟 build_xp_project 结构一样（VX 和 XP 是同一个老版本 Ruby 系列，字符串
+    同样是 bytes，M4.9 用真实 VX 工程 ambratolm-games/flower-in-pain 验证过），
+    只是文件后缀换成 VX 自己的 `.rvdata`（VX Ace 才是 `.rvdata2`）。"""
+    from rubymarshal.classes import RubyObject
+    from rubymarshal.writer import writes
+
+    def _write_rv(path: Path, obj: Any) -> None:
+        path.write_bytes(writes(obj))
+
+    data_dir = root / "vx_project" / "Data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    page_list = [
+        RubyObject("RPG::EventCommand", {"@code": 401, "@indent": 0, "@parameters": [b"Bonjour."]}),
+        RubyObject("RPG::EventCommand", {"@code": 0, "@indent": 0, "@parameters": []}),
+    ]
+    page = RubyObject(
+        "RPG::Event::Page",
+        {
+            "@condition": RubyObject("RPG::Event::Page::Condition", {}),
+            "@graphic": RubyObject("RPG::Event::Page::Graphic", {}),
+            "@move_type": 0,
+            "@move_speed": 3,
+            "@move_frequency": 3,
+            "@move_route": RubyObject("RPG::MoveRoute", {"@list": [], "@repeat": True}),
+            "@walk_anime": True,
+            "@step_anime": False,
+            "@direction_fix": False,
+            "@through": False,
+            "@priority_type": 1,
+            "@trigger": 0,
+            "@list": page_list,
+        },
+    )
+    event = RubyObject("RPG::Event", {"@id": 1, "@name": b"EV001", "@x": 1, "@y": 1, "@pages": [page]})
+    game_map = RubyObject(
+        "RPG::Map",
+        {
+            "@tileset_id": 1,
+            "@width": 5,
+            "@height": 5,
+            "@autoplay_bgm": False,
+            "@bgm": RubyObject("RPG::AudioFile", {}),
+            "@autoplay_bgs": False,
+            "@bgs": RubyObject("RPG::AudioFile", {}),
+            "@encounter_list": [],
+            "@encounter_step": 30,
+            "@data": [0] * (5 * 5 * 3),
+            "@events": {1: event},
+        },
+    )
+    _write_rv(data_dir / "Map001.rvdata", game_map)
+
+    actors = [None, RubyObject("RPG::Actor", {"@id": 1, "@name": b"Rouge"})]
+    _write_rv(data_dir / "Actors.rvdata", actors)
+
+    for name in ("Classes", "Skills", "Items", "Weapons", "Armors", "Enemies", "States", "CommonEvents"):
+        _write_rv(data_dir / f"{name}.rvdata", [None])
+
+    (root / "vx_project" / "Game.rvproj").write_bytes(b"")
+
+    return root / "vx_project"
+
+
+@pytest.fixture
+def vx_project(tmp_path: Path) -> Path:
+    return build_vx_project(tmp_path)
+
+
 @pytest.fixture
 def mz_project(tmp_path: Path) -> Path:
     return build_mz_project(tmp_path)

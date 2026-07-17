@@ -20,7 +20,8 @@
 |---|---|---|
 | RPG Maker MV / MZ | ✅ 完整支持 | 明文 JSON，已用真实工程校准过事件指令编码表 |
 | RPG Maker VX Ace | ✅ 完整支持 | Ruby Marshal 二进制，含消息框运行时像素级动态换行补丁（spec 9.2.b，见下方"已知局限"）；数据库/事件文本抽取已用真实工程验证过 |
-| RPG Maker XP / VX | ⚠️ 部分验证 | 同族格式，字符串编码自动探测（Shift-JIS / UTF-8）；适配器逻辑和 VX Ace 共用一套代码，但还没找到真实 XP/VX 工程单独测过 |
+| RPG Maker XP | ✅ 完整支持 | 已用真实 XP 工程（GitHub 上的 GPL-3.0 同人游戏 torresflo/Pokemon-Obsidian）验证并修复两个真机才暴露的 bug（见下方"已知局限"） |
+| RPG Maker VX | ✅ 完整支持 | 和 XP 共用一套适配器代码；已用真实 VX 工程（GitHub 上的开源同人游戏 ambratolm-games/flower-in-pain）验证并修复一个 Ruby Marshal 写入库的对象引用 bug（见下方"已知局限"） |
 | WOLF RPG エディター（ウディタ） | ✅ 完整支持 | 已用 WOLF RPG Editor 官方自带示例工程验证过（Map/CommonEvent/Database 三种文件全覆盖，含当前编辑器版本默认的 LZ4 压缩格式）；仍不支持 WolfPro 加密保护和经典 XOR 加密的工程 |
 | RPG Maker 2000/2003 | ❌ 不支持 | 完全不同的格式，明确排除在范围外 |
 
@@ -96,9 +97,20 @@ rpg-translator run       <项目目录> --out <输出目录>
 
 ## 已知局限
 
-- **XP / VX**（不含 Ace）目前仍只用手工构造的合成样例验证过，没找到真实工程单独测过——虽然
-  适配器代码和已经过真机验证的 VX Ace 共用一套 `_rgss_common.py`，风险比重新造一遍轮子低，
-  但字段名/事件指令编码表本身没有 XP/VX 专属的真机校准
+- **RGSS 引擎（VX Ace/XP/VX）共用的 Ruby Marshal 写入库有一个真机才暴露的对象引用 bug，已
+  修复**：真实 XP/VX 工程（分别是 GitHub 上的 torresflo/Pokemon-Obsidian、
+  ambratolm-games/flower-in-pain 两个开源同人游戏）实测发现，第三方 `rubymarshal` 库的
+  `Writer.must_write` 只用 Python `id(obj)` 判断"这个对象是不是写过、该写反向引用"，既没有
+  在 `str`/`bytes` 顶层字符串值上正确登记（只有 `RubyString` 会），也没有防住 CPython 内存
+  地址复用——两个问题叠加，实测下来 8 个真实地图文件里有 3 个回填后连自己都读不回来（或者更
+  隐蔽地静默读出错误对象，不报错但数据是坏的）。已经在 `rvdata2_codec.py` 里包一层
+  `_SafeWriter` 子类堵上，真实工程重新验证过没问题了，详见该文件顶部注释和
+  `tests/test_rvdata2_codec.py` 的回归测试。
+- **XP 专属的字符串编码 bug，已修复**：XP（和大概率 VX）用的老版本 Ruby（1.8，字符串没有
+  编码感知）marshal 出来的字符串，`rubymarshal` 不会像 VX Ace（Ruby 1.9+）那样自动解码，原样
+  是 `bytes`；旧代码对这类值直接调用 Python `str()`，抽出来的"文本"其实是 `b'...'` 这种
+  repr 字面量，完全不能用，且写回时也不会正确编码回 bytes。已在 `_rgss_common.py` 加
+  `rv_str`/`_encode_like`（先试 UTF-8 后退回 cp932）修复，真实 XP/VX 工程重新验证过。
 - VX Ace 消息框运行时像素级动态换行补丁（spec 9.2.b）已实现并注入真实工程验证过：往
   `Scripts.rvdata2` 追加一段 `Window_Message#process_character` 的 monkey patch，按
   `contents.text_size` 量出的真实像素宽度决定换行点，复用引擎自带的翻页逻辑处理超过 4 行

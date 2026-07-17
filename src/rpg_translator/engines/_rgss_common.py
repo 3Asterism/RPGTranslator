@@ -80,6 +80,41 @@ def rv_set(obj: Any, key: Any, value: Any) -> None:
         obj[key] = value
 
 
+def _decode_rv_bytes(data: bytes) -> str:
+    """XP/VX 用的老版本 Ruby（1.8，字符串没有编码感知）marshal 出来的字符串，
+    `rubymarshal` 不会像 VX Ace（Ruby 1.9+，字符串统一带 ivar 编码标记）那样
+    自动解码，原样是 `bytes`——真机验证过（用一个真实 RPG Maker XP 工程实测）
+    之前这里直接对 bytes 调用 Python 内置 `str()`，抽出来的"文本"其实是
+    `b'...'` 这种 repr 字面量，完全不能用。跟 wolf_binary.py 一样先试 UTF-8
+    再退回 cp932，覆盖"现代编辑器存的 UTF-8 字节"和"经典日文 XP 工程的
+    Shift-JIS 字节"两种真实情况。"""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp932")
+
+
+def rv_str(value: Any) -> str:
+    """从 rubymarshal 属性值安全取文本：`bytes` 走 `_decode_rv_bytes`，
+    其他类型（已经是 `str`，或 VX Ace 那种已解码好的情况）走普通 `str()`。"""
+    return _decode_rv_bytes(value) if isinstance(value, bytes) else str(value)
+
+
+def _encode_like(original: Any, text: str) -> Any:
+    """回填时如果这个槽位原本是 `bytes`（老版本 Ruby 字符串），要编码回
+    `bytes` 写回去，不能留 Python `str`——不然重新序列化出来的 Marshal
+    字节码格式会跟原版不一致。用跟读取时相同的编码探测顺序（先 UTF-8 后
+    cp932）保证同一个字符串来回一致，不会读的时候当 UTF-8、写的时候却
+    编成 cp932。"""
+    if not isinstance(original, bytes):
+        return text
+    try:
+        original.decode("utf-8")
+        return text.encode("utf-8")
+    except UnicodeDecodeError:
+        return text.encode("cp932")
+
+
 def parse_locator(locator: str) -> list[Any]:
     segments: list[Any] = []
     for seg in locator.split("/"):
@@ -99,12 +134,14 @@ def locator_get(root: Any, locator: str) -> Any:
     return cur
 
 
-def locator_set(root: Any, locator: str, value: Any) -> None:
+def locator_set(root: Any, locator: str, value: str) -> None:
     segments = parse_locator(locator)
     cur = root
     for seg in segments[:-1]:
         cur = rv_get(cur, seg)
-    rv_set(cur, segments[-1], value)
+    last = segments[-1]
+    current = rv_get(cur, last)
+    rv_set(cur, last, _encode_like(current, value))
 
 
 class PendingUnit:
@@ -145,7 +182,7 @@ def extract_command_list(
                 if run_cmd.attributes.get("@code") != 401:
                     break
                 run_params = run_cmd.attributes.get("@parameters", [])
-                lines.append(str(run_params[0]) if run_params else "")
+                lines.append(rv_str(run_params[0]) if run_params else "")
                 locators.append(f"{path_prefix}/{i}/@parameters/0")
                 i += 1
             source_text = "\n".join(lines)
@@ -157,18 +194,18 @@ def extract_command_list(
         if code == 405:
             # Show Scrolling Text はスクロール表示で 4 行固定枠の制限が無いため、
             # 401 と違い合体させず 1 行ずつ独立した TextUnit のまま扱う。
-            if params and str(params[0]):
-                found.append(PendingUnit(f"{path_prefix}/{i}/@parameters/0", str(params[0]), group))
+            if params and rv_str(params[0]):
+                found.append(PendingUnit(f"{path_prefix}/{i}/@parameters/0", rv_str(params[0]), group))
         elif code == 102:
             choices = params[0] if params else []
             for ci, choice in enumerate(choices):
-                if str(choice):
+                if rv_str(choice):
                     found.append(
-                        PendingUnit(f"{path_prefix}/{i}/@parameters/0/{ci}", str(choice), group)
+                        PendingUnit(f"{path_prefix}/{i}/@parameters/0/{ci}", rv_str(choice), group)
                     )
         elif code == 320:
-            if len(params) > 1 and str(params[1]):
-                found.append(PendingUnit(f"{path_prefix}/{i}/@parameters/1", str(params[1]), group))
+            if len(params) > 1 and rv_str(params[1]):
+                found.append(PendingUnit(f"{path_prefix}/{i}/@parameters/1", rv_str(params[1]), group))
         # code 101 はヘッダーのみで話者名パラメータなし（MZ 独自機能）
         # 108/408 (Comment)・355/655 (Script) はデフォルトで無視（MV/MZ と同じ方針）
         i += 1
@@ -239,11 +276,11 @@ class RGSSAdapterBase(EngineAdapter):
         for idx, record in enumerate(records):
             if record is None or not isinstance(record, RubyObject):
                 continue
-            record_name = str(record.attributes.get("@name", ""))
+            record_name = rv_str(record.attributes.get("@name", ""))
             for field in DATABASE_TEXT_FIELDS:
                 if field not in record.attributes:
                     continue
-                text = str(record.attributes[field])
+                text = rv_str(record.attributes[field])
                 if not text.strip():
                     continue
                 if field == "@note" and is_pure_tag_note(text):
