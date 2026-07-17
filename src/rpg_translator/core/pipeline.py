@@ -8,12 +8,19 @@ from rpg_translator.core.store import Store
 from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.engines.mv_mz import MVAdapter, MZAdapter
 from rpg_translator.engines.vxace import VXAceAdapter
+from rpg_translator.engines.xp_vx import VXAdapter, XPAdapter
 from rpg_translator.translate.batch_translator import translate_units
 from rpg_translator.translate.glossary import extract_glossary_candidates
 from rpg_translator.translate.llm_client import LLMClient, LLMConfig
 from rpg_translator.translate.qa import ConflictRow, export_conflicts_csv, find_context_conflicts
 
-REGISTERED_ADAPTERS: list[type[EngineAdapter]] = [MVAdapter, MZAdapter, VXAceAdapter]
+REGISTERED_ADAPTERS: list[type[EngineAdapter]] = [
+    MVAdapter,
+    MZAdapter,
+    VXAceAdapter,
+    XPAdapter,
+    VXAdapter,
+]
 
 
 class UnknownEngineError(Exception):

@@ -23,7 +23,13 @@ from rpg_translator.gui.glossary_dialog import GlossaryDialog
 from rpg_translator.gui.settings_dialog import APP_NAME, ORG_NAME, SettingsDialog
 from rpg_translator.gui.workers import ExtractAndGlossaryWorker, TranslateAndInjectWorker
 
-_ENGINE_LABELS = {"mv": "RPG Maker MV", "mz": "RPG Maker MZ", "vxace": "RPG Maker VX Ace"}
+_ENGINE_LABELS = {
+    "mv": "RPG Maker MV",
+    "mz": "RPG Maker MZ",
+    "vxace": "RPG Maker VX Ace",
+    "xp": "RPG Maker XP",
+    "vx": "RPG Maker VX",
+}
 
 
 def resolve_dropped_path(path: Path) -> Path:

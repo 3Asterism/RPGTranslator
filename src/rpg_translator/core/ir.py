@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-EngineName = Literal["mv", "mz", "vxace"]
+EngineName = Literal["mv", "mz", "vxace", "xp", "vx"]
 TranslationStatus = Literal["pending", "translated", "reviewed"]
 
 
