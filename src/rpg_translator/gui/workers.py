@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
 from rpg_translator.core.pipeline import run_extract, run_glossary, run_inject, run_translate
+
+logger = logging.getLogger(__name__)
 
 
 class ExtractAndGlossaryWorker(QThread):
@@ -19,6 +22,7 @@ class ExtractAndGlossaryWorker(QThread):
     """
 
     finished_ok = Signal(dict, int)  # (glossary candidates, unit count)
+    usage_changed = Signal(str, int, int)  # (model, prompt_tokens, completion_tokens)
     failed = Signal(str)
 
     def __init__(
@@ -55,9 +59,11 @@ class ExtractAndGlossaryWorker(QThread):
                     self._fallback_api_key,
                     self._fallback_base_url,
                     self._fallback_model,
+                    on_usage=self.usage_changed.emit,
                 )
             )
         except Exception as e:
+            logger.exception("提取/术语抽取失败")
             self.failed.emit(str(e))
             return
         self.finished_ok.emit(candidates, len(units))
@@ -71,7 +77,8 @@ class TranslateWorker(QThread):
 
     stage_changed = Signal(str)
     progress_changed = Signal(int, int)  # (completed, total)
-    finished_ok = Signal(int)  # 翻译完成的 TextUnit 条数
+    finished_ok = Signal(int, list)  # (翻译完成的 TextUnit 条数, 失败条目 [(原文, 错误信息), ...])
+    usage_changed = Signal(str, int, int)  # (model, prompt_tokens, completion_tokens)
     failed = Signal(str)
 
     def __init__(
@@ -101,14 +108,15 @@ class TranslateWorker(QThread):
         self._cancel_event = threading.Event()
 
     def stop(self) -> None:
-        """请求停止：不打断已经发出去、正在等 API 响应的批次（等它们跑完正常落盘），
-        只是不再派发新的翻译请求。已经翻译好的内容随时都在 db 里，随时能继续翻剩下的。"""
+        """请求停止：不再派发新的翻译请求，已经发出去、正在等 API 响应的请求也会被
+        主动打断（见 translate/batch_translator.py 的 _chat_cancellable），不会傻等
+        它们自然跑完继续烧 token。被打断的条目保留 pending，随时能继续翻剩下的。"""
         self._cancel_event.set()
 
     def run(self) -> None:
         try:
             self.stage_changed.emit("翻译中…")
-            translated = asyncio.run(
+            translated, failures = asyncio.run(
                 run_translate(
                     self._db_path,
                     self._api_key,
@@ -120,13 +128,15 @@ class TranslateWorker(QThread):
                     fallback_base_url=self._fallback_base_url,
                     fallback_model=self._fallback_model,
                     cancel_check=self._cancel_event.is_set,
+                    on_usage=self.usage_changed.emit,
                 )
             )
         except Exception as e:
             # 汉化流程里任何异常都要传回 GUI 展示，不能让后台线程静默崩溃/退出
+            logger.exception("翻译失败")
             self.failed.emit(str(e))
             return
-        self.finished_ok.emit(len(translated))
+        self.finished_ok.emit(len(translated), failures)
 
 
 class InjectWorker(QThread):
@@ -148,6 +158,7 @@ class InjectWorker(QThread):
         try:
             units = run_inject(self._project_dir, self._db_path, self._output_dir)
         except Exception as e:
+            logger.exception("注入失败")
             self.failed.emit(str(e))
             return
         self.finished_ok.emit(len(units), str(self._output_dir))

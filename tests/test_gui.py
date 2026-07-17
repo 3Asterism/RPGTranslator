@@ -344,6 +344,7 @@ def test_translate_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):
     stages: list[str] = []
     progress_updates: list[tuple[int, int]] = []
     results: list[int] = []
+    failures: list[list[tuple[str, str]]] = []
     errors: list[str] = []
 
     worker = TranslateWorker(
@@ -355,7 +356,7 @@ def test_translate_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):
     )
     worker.stage_changed.connect(stages.append)
     worker.progress_changed.connect(lambda done, total: progress_updates.append((done, total)))
-    worker.finished_ok.connect(results.append)
+    worker.finished_ok.connect(lambda count, failed: (results.append(count), failures.append(failed)))
     worker.failed.connect(errors.append)
 
     worker.start()
@@ -365,6 +366,7 @@ def test_translate_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):
     assert finished_in_time, "worker 线程 180s 内没跑完（真实 API 调用异常慢，或线程卡住了）"
     assert errors == []
     assert results == [14]
+    assert failures == [[]]
     assert "翻译中…" in stages
     assert len(progress_updates) > 0
 

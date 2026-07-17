@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Callable
 
 import httpx
 
@@ -39,6 +40,7 @@ class LLMClient:
         max_retries_per_provider: int = 3,
         backoff_base_seconds: float = 1.0,
         transports: list[httpx.BaseTransport | None] | None = None,
+        on_usage: Callable[[str, int, int], None] | None = None,
     ):
         config_list = [configs] if isinstance(configs, LLMConfig) else list(configs)
         if not config_list:
@@ -48,6 +50,10 @@ class LLMClient:
         self._configs = config_list
         self._max_retries = max_retries_per_provider
         self._backoff_base_seconds = backoff_base_seconds
+        # on_usage(model, prompt_tokens, completion_tokens) 每次调用成功后回调一次，供
+        # GUI 实时统计本次会话的 token 用量/预估花费（见 gui/main_window.py 状态栏）；
+        # 不传就跳过，不影响任何现有调用方。
+        self._on_usage = on_usage
         self._http_clients = [
             httpx.AsyncClient(
                 base_url=_normalize_base_url(c.base_url),
@@ -86,7 +92,15 @@ class LLMClient:
                         },
                     )
                     response.raise_for_status()
-                    return response.json()["choices"][0]["message"]["content"]
+                    data = response.json()
+                    if self._on_usage is not None:
+                        usage = data.get("usage") or {}
+                        self._on_usage(
+                            config.model,
+                            usage.get("prompt_tokens", 0),
+                            usage.get("completion_tokens", 0),
+                        )
+                    return data["choices"][0]["message"]["content"]
                 except httpx.HTTPStatusError as e:
                     last_error = e
                     if e.response.status_code not in _RETRYABLE_STATUS_CODES:

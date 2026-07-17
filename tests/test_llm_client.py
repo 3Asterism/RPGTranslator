@@ -44,8 +44,11 @@ async def test_real_chat_completion_against_configured_provider():
     assert "你好" in result
 
 
-def _success_response(content: str) -> httpx.Response:
-    return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+def _success_response(content: str, usage: dict | None = None) -> httpx.Response:
+    body = {"choices": [{"message": {"content": content}}]}
+    if usage is not None:
+        body["usage"] = usage
+    return httpx.Response(200, json=body)
 
 
 def _error_response(status_code: int) -> httpx.Response:
@@ -154,6 +157,51 @@ async def test_chat_raises_last_error_when_all_providers_exhausted():
             await client.chat("sys", "user")
     finally:
         await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_chat_reports_usage_via_callback():
+    """响应里的 usage 字段（prompt_tokens/completion_tokens）要能通过 on_usage 回调
+    传出去，连同这次实际生效的 model 名——GUI 靠这个统计 token 用量/预估花费。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _success_response("翻译结果", usage={"prompt_tokens": 120, "completion_tokens": 30})
+
+    calls: list[tuple[str, int, int]] = []
+    config = LLMConfig(api_key="x", base_url="https://a.test", model="deepseek-v4-flash")
+    client = LLMClient(
+        config,
+        transports=[httpx.MockTransport(handler)],
+        on_usage=lambda model, p, c: calls.append((model, p, c)),
+    )
+    try:
+        await client.chat("sys", "user")
+    finally:
+        await client.aclose()
+
+    assert calls == [("deepseek-v4-flash", 120, 30)]
+
+
+@pytest.mark.anyio
+async def test_chat_missing_usage_field_does_not_crash_callback():
+    """有些兼容实现可能不返回 usage 字段，回调应该拿到 0/0 而不是直接报错。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return _success_response("翻译结果")  # 不带 usage
+
+    calls: list[tuple[str, int, int]] = []
+    config = LLMConfig(api_key="x", base_url="https://a.test", model="m")
+    client = LLMClient(
+        config,
+        transports=[httpx.MockTransport(handler)],
+        on_usage=lambda model, p, c: calls.append((model, p, c)),
+    )
+    try:
+        await client.chat("sys", "user")
+    finally:
+        await client.aclose()
+
+    assert calls == [("m", 0, 0)]
 
 
 @pytest.mark.anyio

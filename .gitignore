@@ -10,3 +10,5 @@ build/
 output/
 .idea/
 .claude/
+logs/
+game/

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QUrl, Signal
@@ -41,6 +42,9 @@ from rpg_translator.gui.settings_dialog import (
     resolve_fallback_config,
 )
 from rpg_translator.gui.workers import ExtractAndGlossaryWorker, InjectWorker, TranslateWorker
+from rpg_translator.translate.pricing import estimate_cost_cny
+
+logger = logging.getLogger(__name__)
 
 _ENGINE_LABELS = {
     "mv": "RPG Maker MV",
@@ -53,7 +57,13 @@ _ENGINE_LABELS = {
 # 手写 QSS，不引入 qt-material 之类的第三方主题库——保持 PyInstaller 打包体积和
 # 依赖面不变。配色走清爽的浅色卡片风格，参考常见开源翻译/本地化工具（如
 # Translator++、MTool 系工具）的分区块 + 强调色按钮布局。
-_STYLESHEET = """
+#
+# 在 QApplication 级别应用（见 gui/app.py），不是只在 MainWindow 上 setStyleSheet：
+# QComboBox 的下拉列表、QMessageBox 之类的顶层弹出窗口不会继承父 widget 的样式表，
+# 只有应用级样式表才能盖到它们。同时给 QLineEdit/QComboBox/QSpinBox 显式定义浅色
+# 背景——不然这几个控件的背景色会跟随系统主题（深色模式下是暗色背景），叠加这份
+# 样式表里给 QWidget 强制设的深色文字，会变成一片看不清文字的黑底方块。
+APP_STYLESHEET = """
 QMainWindow, QDialog {
     background: #f4f6f9;
 }
@@ -135,6 +145,69 @@ QPlainTextEdit {
     font-family: Consolas, "Courier New", monospace;
     font-size: 12px;
 }
+QLineEdit, QComboBox, QSpinBox {
+    background: #ffffff;
+    color: #1f2430;
+    border: 1px solid #d7dbe4;
+    border-radius: 6px;
+    padding: 5px 8px;
+    selection-background-color: #5468e0;
+    selection-color: #ffffff;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+    border: 1px solid #5468e0;
+}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
+    background: #f4f6f9;
+    color: #9aa1b2;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 24px;
+}
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    color: #1f2430;
+    border: 1px solid #d7dbe4;
+    outline: none;
+    selection-background-color: #5468e0;
+    selection-color: #ffffff;
+}
+QSpinBox::up-button, QSpinBox::down-button {
+    width: 16px;
+    border-left: 1px solid #d7dbe4;
+}
+QTableWidget {
+    background: #ffffff;
+    alternate-background-color: #f7f8fc;
+    gridline-color: #e2e6ed;
+    border: 1px solid #e2e6ed;
+    border-radius: 8px;
+    selection-background-color: #5468e0;
+    selection-color: #ffffff;
+}
+QHeaderView::section {
+    background: #eef0f7;
+    color: #3c4257;
+    padding: 6px;
+    border: none;
+    border-bottom: 1px solid #e2e6ed;
+    font-weight: 600;
+}
+QDialogButtonBox QPushButton {
+    min-width: 76px;
+}
+QCheckBox {
+    spacing: 6px;
+}
+QStatusBar {
+    background: #f4f6f9;
+    border-top: 1px solid #e2e6ed;
+}
+QLabel#usageLabel {
+    color: #626b7d;
+    padding: 2px 6px;
+}
 """
 
 
@@ -198,7 +271,8 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.setWindowTitle("RPG Maker 汉化工具")
         self.resize(760, 620)
-        self.setStyleSheet(_STYLESHEET)
+        # 样式表在 QApplication 级别应用（见 gui/app.py 的 APP_STYLESHEET），这里不用
+        # 再单独 setStyleSheet 一遍——应用级样式表本来就会级联到这个窗口和它的子控件。
 
         self._project_dir: Path | None = None
         self._adapter: EngineAdapter | None = None
@@ -207,6 +281,13 @@ class MainWindow(QMainWindow):
         self._extract_glossary_worker: ExtractAndGlossaryWorker | None = None
         self._translate_worker: TranslateWorker | None = None
         self._inject_worker: InjectWorker | None = None
+
+        # 本次会话（软件跑起来到现在）累计的 token 用量/预估花费——重开软件清零，
+        # 不落地存储，纯粹是给正在跑的这一轮汉化一个实时的量级参考。
+        self._session_prompt_tokens = 0
+        self._session_completion_tokens = 0
+        self._session_cost_cny = 0.0
+        self._session_has_unpriced_model = False
 
         self._drop_area = DropArea()
         self._drop_area.path_dropped.connect(self._on_path_dropped)
@@ -323,12 +404,37 @@ class MainWindow(QMainWindow):
         layout.addWidget(share_box)
         self.setCentralWidget(central)
 
-        file_menu = self.menuBar().addMenu("文件")
-        settings_action = file_menu.addAction("设置")
+        settings_action = self.menuBar().addAction("设置")
         settings_action.triggered.connect(self._open_settings)
+
+        self._usage_label = QLabel("本次会话：暂无 token 用量")
+        self._usage_label.setObjectName("usageLabel")
+        self.statusBar().addWidget(self._usage_label)
 
     def _log_message(self, message: str) -> None:
         self._log.appendPlainText(message)
+        logger.info(message)  # 同步落一份到文件日志，软件本身崩了也能翻记录复盘
+
+    def _on_usage_changed(self, model: str, prompt_tokens: int, completion_tokens: int) -> None:
+        self._session_prompt_tokens += prompt_tokens
+        self._session_completion_tokens += completion_tokens
+        cost = estimate_cost_cny(model, prompt_tokens, completion_tokens)
+        if cost is None:
+            self._session_has_unpriced_model = True
+        else:
+            self._session_cost_cny += cost
+        self._refresh_usage_label()
+
+    def _refresh_usage_label(self) -> None:
+        total = self._session_prompt_tokens + self._session_completion_tokens
+        text = (
+            f"本次会话 tokens：输入 {self._session_prompt_tokens:,} / "
+            f"输出 {self._session_completion_tokens:,}（共 {total:,}） · "
+            f"预估花费 ¥{self._session_cost_cny:.2f}"
+        )
+        if self._session_has_unpriced_model:
+            text += "（含未知计价模型，费用为部分预估，仅供参考）"
+        self._usage_label.setText(text)
 
     def _on_path_dropped(self, path: Path) -> None:
         self._project_dir = path
@@ -350,7 +456,13 @@ class MainWindow(QMainWindow):
 
         self._adapter = adapter
         engine_label = _ENGINE_LABELS.get(adapter.engine_name, adapter.engine_name)
-        resume_note = self._resume_progress_note(path, units)
+        try:
+            resume_note = self._resume_progress_note(path, units)
+        except Exception:
+            # 断点续传进度只是锦上添花的提示，读取失败（比如上次的 db 文件损坏/被占用）
+            # 不该拦住整个拖拽识别流程——记下日志，提示照常显示，只是不带续译进度。
+            logger.exception("读取续译进度失败：%s", path)
+            resume_note = ""
         self._info_label.setText(
             f"识别到引擎：{engine_label}，扫描到文本约 {len(units)} 条{resume_note}"
         )
@@ -414,6 +526,7 @@ class MainWindow(QMainWindow):
             fallback_model,
         )
         self._extract_glossary_worker.finished_ok.connect(self._on_extract_glossary_done)
+        self._extract_glossary_worker.usage_changed.connect(self._on_usage_changed)
         self._extract_glossary_worker.failed.connect(self._on_failed)
         self._extract_glossary_worker.start()
 
@@ -447,6 +560,7 @@ class MainWindow(QMainWindow):
         self._translate_worker.stage_changed.connect(self._log_message)
         self._translate_worker.progress_changed.connect(self._on_progress_changed)
         self._translate_worker.finished_ok.connect(self._on_translate_done)
+        self._translate_worker.usage_changed.connect(self._on_usage_changed)
         self._translate_worker.failed.connect(self._on_failed)
         self._translate_worker.start()
         self._stop_button.setVisible(True)
@@ -457,8 +571,17 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(completed)
         self._log_message(f"翻译批次 {completed}/{total}")
 
-    def _on_translate_done(self, unit_count: int) -> None:
+    def _on_translate_done(self, unit_count: int, failures: list[tuple[str, str]]) -> None:
         self._log_message(f"翻译完成，共 {unit_count} 条，可以点击下方“注入到游戏”写回。")
+        if failures:
+            self._log_message(
+                f"{len(failures)} 条翻译失败已跳过（保留待译状态，重新点「开始翻译」可续译）："
+            )
+            for source_text, error in failures[:10]:
+                preview = source_text[:30].replace("\n", " ")
+                self._log_message(f"  - {preview!r}: {error}")
+            if len(failures) > 10:
+                self._log_message(f"  ……其余 {len(failures) - 10} 条略")
         self._progress_bar.setRange(0, 1)
         self._progress_bar.setValue(1)
         self._start_button.setEnabled(True)

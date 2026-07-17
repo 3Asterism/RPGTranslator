@@ -144,10 +144,14 @@ async def run_glossary(
     fallback_base_url: str | None = None,
     fallback_model: str | None = None,
     force: bool = False,
+    on_usage: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, str]:
     """抽取术语表候选。断点续传场景下（同一个工程重新点"开始翻译"）术语表大概率已经
     抽取过、存在 db 里了，默认直接复用，不重新调用一遍 LLM——这一步是纯粹的开销，
-    不重新翻译就没有必要重新花 token 抽一遍术语表。传 force=True 才强制重新抽取。"""
+    不重新翻译就没有必要重新花 token 抽一遍术语表。传 force=True 才强制重新抽取。
+
+    on_usage(model, prompt_tokens, completion_tokens) 每次 LLM 调用成功后回调一次，
+    供 GUI 实时统计 token 用量/预估花费，不传就跳过。"""
     with Store(db_path) as store:
         if not force:
             existing = store.get_glossary()
@@ -159,7 +163,7 @@ async def run_glossary(
         configs = _build_llm_configs(
             api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
         )
-        async with LLMClient(configs) as client:
+        async with LLMClient(configs, on_usage=on_usage) as client:
             candidates = await extract_glossary_candidates(client, units)
         store.set_glossary(candidates)
     return candidates
@@ -176,14 +180,21 @@ async def run_translate(
     fallback_base_url: str | None = None,
     fallback_model: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
-) -> list[TextUnit]:
+    on_usage: Callable[[str, int, int], None] | None = None,
+) -> tuple[list[TextUnit], list[tuple[str, str]]]:
     """只翻 status="pending" 的条目——中途停止或意外中断后重新调用，已经翻译过的
     （包括这次停止前刚落盘的那些）不会被重新送去调用 API，这是断点续传在翻译这一层
     的体现（配合 store.upsert_units 不覆盖已翻译进度，见 core/store.py）。
 
-    cancel_check() 每个批次派发前检查一次，返回 True 就不再发起新的翻译请求，但已经
-    发出去、正在等 API 响应的批次会跑完并正常落盘——不浪费已经花出去的 token，只是不再
-    追加新的请求。"""
+    cancel_check() 每个批次派发前检查一次，返回 True 就不再发起新的翻译请求；已经在等
+    响应的请求也会被主动打断，不是傻等它跑完（见 translate_units/_chat_cancellable）。
+
+    on_usage(model, prompt_tokens, completion_tokens) 每次 LLM 调用成功后回调一次，
+    供 GUI 实时统计 token 用量/预估花费，不传就跳过。
+
+    返回 (已翻译的 TextUnit 列表, 失败条目列表)。失败条目（比如被内容审核拒绝、或所有
+    provider 都报错的条目）不会中断整体翻译，保持 status="pending" 供下次重跑续译，
+    详见 translate_units 的说明。"""
     api_key = _require_api_key(api_key)
     with Store(db_path) as store:
         pending = store.list_units(status="pending")
@@ -191,8 +202,8 @@ async def run_translate(
         configs = _build_llm_configs(
             api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
         )
-        async with LLMClient(configs) as client:
-            await translate_units(
+        async with LLMClient(configs, on_usage=on_usage) as client:
+            failures = await translate_units(
                 client,
                 store,
                 pending,
@@ -202,7 +213,7 @@ async def run_translate(
                 cancel_check=cancel_check,
             )
         translated = store.list_units(status="translated")
-    return translated
+    return translated, failures
 
 
 async def run_full(
@@ -218,11 +229,14 @@ async def run_full(
     fallback_api_key: str | None = None,
     fallback_base_url: str | None = None,
     fallback_model: str | None = None,
+    on_usage: Callable[[str, int, int], None] | None = None,
 ) -> list[TextUnit]:
     """extract -> 术语抽取 -> translate -> inject 完整链路。
 
     on_stage(message) 在阶段切换时调用一次；on_progress(completed, total) 在翻译阶段
-    每完成一个去重分组时调用一次。两者都是可选的，GUI 用它们驱动进度条/日志，CLI 不传。
+    每完成一个去重分组时调用一次；on_usage(model, prompt_tokens, completion_tokens) 在
+    每次 LLM 调用成功后调用一次。三者都是可选的，GUI 用它们驱动进度条/日志/花费统计，
+    CLI 不传。
     """
     api_key = _require_api_key(api_key)
     adapter = detect_adapter(project_dir)
@@ -236,7 +250,7 @@ async def run_full(
         configs = _build_llm_configs(
             api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
         )
-        async with LLMClient(configs) as client:
+        async with LLMClient(configs, on_usage=on_usage) as client:
             if on_stage is not None:
                 on_stage("术语抽取中…")
             glossary = await extract_glossary_candidates(client, units)
@@ -245,9 +259,11 @@ async def run_full(
             pending = store.list_units(status="pending")
             if on_stage is not None:
                 on_stage(f"翻译中（共 {len(pending)} 条待译）…")
-            await translate_units(
+            failures = await translate_units(
                 client, store, pending, glossary, concurrency, on_progress=on_progress
             )
+            if on_stage is not None and failures:
+                on_stage(f"{len(failures)} 条翻译失败已跳过（保留待译状态，可重跑续译）")
         all_units = store.list_units()
 
     if on_stage is not None:

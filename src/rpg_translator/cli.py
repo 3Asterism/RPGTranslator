@@ -72,7 +72,7 @@ def translate(
     """调用 DeepSeek 批量翻译数据库中待翻译的 TextUnit。"""
     settings = Settings()
     try:
-        translated = asyncio.run(
+        translated, failures = asyncio.run(
             run_translate(
                 db,
                 get_deepseek_api_key(),
@@ -88,6 +88,10 @@ def translate(
         typer.echo(str(e), err=True)
         raise typer.Exit(code=1) from e
     typer.echo(f"翻译完成：数据库中共有 {len(translated)} 条已翻译文本")
+    if failures:
+        typer.echo(f"{len(failures)} 条翻译失败已跳过（保留待译状态，可重跑续译）：", err=True)
+        for source_text, error in failures[:10]:
+            typer.echo(f"  - {source_text[:40]!r}: {error}", err=True)
 
 
 @app.command()

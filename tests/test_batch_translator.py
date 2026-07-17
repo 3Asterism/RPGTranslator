@@ -318,14 +318,61 @@ async def test_translate_units_falls_back_to_individual_calls_when_batch_parse_f
             assert result.translated_text == "这是一段不符合格式要求的胡乱回复"
 
 
+class _FlakyStub:
+    """含有特定片段的请求永远报错（模拟内容审核拒绝、或所有 provider 都失败后抛出的
+    不可重试错误），其余请求正常返回，用来验证一批里有问题的那一条不会拖累其它条目。"""
+
+    def __init__(self, bad_snippet: str):
+        self.bad_snippet = bad_snippet
+        self.call_count = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        self.call_count += 1
+        if self.bad_snippet in user_prompt:
+            raise RuntimeError("400 Bad Request: data_inspection_failed")
+        return "翻译结果"
+
+
 @pytest.mark.anyio
-async def test_translate_units_cancel_check_stops_new_batches_but_finishes_in_flight(
+async def test_translate_units_skips_failing_job_without_aborting_batch(tmp_path: Path):
+    """回归测试：真实项目里翻译一个含 R18 内容的游戏时，备用 provider（阿里云百炼）会对
+    其中一条文本返回 400 data_inspection_failed（内容审核拒绝），这是不可重试的错误。
+    修复前 asyncio.gather 会让这一条的异常直接冒泡，取消掉同批乃至其它并发批次里正在跑的
+    翻译，导致整个"开始翻译"直接报错退出。修复后应该只跳过这一条（保留 pending 供下次
+    重跑续译），其余条目正常翻译成功。"""
+    stub = _FlakyStub("违禁内容")
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("1", "正常文本A"),
+            _make_unit("2", "包含违禁内容的句子"),
+            _make_unit("3", "正常文本B"),
+        ]
+        store.upsert_units(units)
+
+        failures = await translate_units(
+            stub, store, units, glossary={}, concurrency=4, batch_size=25
+        )
+
+        assert store.get_unit("1").status == "translated"
+        assert store.get_unit("3").status == "translated"
+        assert store.get_unit("2").status == "pending"  # 失败条目保留待译，不影响其它条目
+        assert len(failures) == 1
+        assert failures[0][0] == "包含违禁内容的句子"
+
+
+@pytest.mark.anyio
+async def test_translate_units_cancel_stops_new_batches_and_aborts_in_flight(
     tmp_path: Path,
 ):
-    """模拟点了"停止"按钮：cancel_check() 从某一刻起一直返回 True。已经过了并发闸门、
-    正在等 API 响应的请求要跑完正常落盘（不浪费已经发出去的那次调用），但还在排队、
-    还没真正发请求的批次不应该再打进来。用并发限流卡住大部分请求在队列里，只放行
-    concurrency 个先跑，取消标记在它们跑的过程中才置位，验证排队的那些没有被调用。"""
+    """模拟点了"停止"按钮：cancel_check() 从某一刻起一直返回 True。
+
+    真实场景里（高并发 + 大 batch_size）一次请求可能覆盖几十条文本、耗时数秒到数十秒，
+    如果"停止"只挡新请求、放任已经在等响应的请求自然跑完，用户会感觉点了停止但还在
+    持续烧 token——所以已经过了并发闸门、正在等 API 响应的请求也要被主动打断（cancel
+    掉底层调用），不是傻等它跑完。被打断的条目保留 status="pending"，下次重跑续译，
+    不计入失败。用并发限流卡住 2 个请求先真正发出去，取消标记在它们卡在半路时才置位，
+    验证：1) 排队中的另外 4 个批次不会被发出去；2) 已经在等响应的 2 个也被打断，不会
+    落盘成翻译结果。"""
     release = asyncio.Event()
 
     class _GatedStub:
@@ -359,8 +406,7 @@ async def test_translate_units_cancel_check_stops_new_batches_but_finishes_in_fl
             )
         )
         # 等已经拿到并发名额的 2 个请求真正发出去（call_count 到 2 后它们卡在
-        # release.wait() 上），这时候再置位取消——它们不受影响，但排队中的另外 4 个
-        # 批次接下来轮到自己发请求前会看到取消标记，不再调用
+        # release.wait() 上），这时候再置位取消
         for _ in range(100):
             if stub.call_count >= 2:
                 break
@@ -368,12 +414,14 @@ async def test_translate_units_cancel_check_stops_new_batches_but_finishes_in_fl
         assert stub.call_count == 2
 
         cancelled = True
-        release.set()
-        await task
+        await asyncio.wait_for(task, timeout=2.0)
+        release.set()  # 收尾：让还卡在 release.wait() 上、已被 cancel 的协程能正常退出
 
         assert stub.call_count == 2  # 排队中的 4 个批次没有被发出去
         translated = [u for u in store.list_units() if u.status == "translated"]
-        assert len(translated) == 2
+        assert len(translated) == 0  # 在途的 2 个也被主动打断，没有一个落盘成功
+        pending = [u for u in store.list_units() if u.status == "pending"]
+        assert len(pending) == 6  # 全部保留 pending，可以下次重跑续译
 
 
 @pytest.mark.anyio
