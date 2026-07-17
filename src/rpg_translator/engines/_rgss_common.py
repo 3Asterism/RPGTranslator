@@ -317,3 +317,9 @@ class RGSSAdapterBase(EngineAdapter):
                     )
                     locator_set(root, unit.locator, value)
             write_rvdata2(full_path, root)
+
+        self._after_inject(output_dir, units)
+
+    def _after_inject(self, output_dir: Path, units: list[TextUnit]) -> None:
+        """子类可选覆盖的收尾钩子，写完所有 TextUnit 之后调用一次。
+        默认什么都不做（目前只有 VXAceAdapter 用它挂运行时像素换行补丁）。"""

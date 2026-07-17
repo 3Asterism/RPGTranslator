@@ -94,31 +94,43 @@ SCOPE -- explicitly NOT handled (known gaps, not oversights)
      little translatable text; skipping it keeps this module's
      synthetic-fixture surface smaller without materially reducing
      translation coverage.
-  4. Newer-editor Map "page" layout: WolfTL's C++ Page parser (2024-2026)
-     reads an extra `features` int32 and a conditional `page_transfer` byte
-     after the command list that the older wolftrans/rewolf-trans parsers do
-     not have -- evidence the on-disk Page format itself changed across
-     editor versions. This module targets the older/simpler layout (the one
-     cross-validated by two independent implementations, and the one gated
-     by the format-version marker byte baked into `_MAP_HEADER_PREFIX`).
-     WolfTL also gates LZ4-compressed maps behind that same marker byte, so a
-     newer-format map file will fail loudly here (via the header `verify()`)
-     rather than silently mis-parsing.
-  5. Field-type edge case: WolfTL's Database `Type::ReadDat` has a branch for
-     `unknown1 == STRING_INDICATOR (0x0001D4C0)` that reads one extra string;
-     wolftrans's Ruby parser has no equivalent. This is a rare sentinel value
-     unlikely to appear in an ordinary user-authored database and is not
-     handled here; if parsing raises on a real project's DataBase.dat, this
-     is the first place to look.
+  4. 已解决（M4.9，针对真实 WOLF RPG Editor v3.712 自带示例工程验证——见下方
+     说明）：之前以为是"新版编辑器才有"的 Map/CommonEvent/Database 格式
+     （LZ4 块压缩正文、每种格式各自的版本字节触发压缩，外加 Page 上的
+     `features`/`page_transfer` 字段、地图格式到 v3.5 后每条 Command 末尾的
+     额外字节块）实测下来是**当前版本编辑器保存的所有文件默认都长这样**，
+     不是稀有的新变体。本模块现在两种都支持：版本号低于压缩阈值走旧版
+     "classic" 直接解析；达到阈值则先做 LZ4 解压（见 `ByteReader.unpack_lz4`），
+     对应 WolfTL 的 `FileCoder::Unpack`。
+  5. 字段类型边界情况：WolfTL 的 Database `Type::ReadDat` 有一个分支，当
+     `unknown1 == STRING_INDICATOR (0x0001D4C0)` 时会多读一个字符串；
+     wolftrans 的 Ruby 版本没有对应逻辑。这里也照样搬过来（见
+     `DbType.unknown2`），成本很低，且已经用真实工程的 Type 记录交叉验证过
+     （虽然没有一条命中这个哨兵值，但为了和 WolfTL 保持结构对齐，这个字段
+     该有还是要有）。
 
-GO / NO-GO CALL FOR M4.8
+真实工程验证（M4.9）
+================================
+下载了 WOLF RPG Editor 官方编辑器自带的示例游戏（编辑器自身发行 ZIP 里内置
+的"サンプルゲーム"，https://www.silversecond.com/WolfRPGEditor/ ——即编辑器
+官方自带、未加密、授权明确的工程，不是转发的第三方游戏）实测跑通了一遍
+extract+inject，针对其真实的 Map/CommonEvent/Database 文件。正是这一步测出
+了上面第 4 条：示例工程里**所有**文件都是 LZ4 压缩的（v3.712 编辑器默认就
+这么存），导致旧版"只支持 classic 格式"的解析器在这份示例的所有文件上
+都直接报错，直到补上压缩支持和 v3.5 结构改动才跑通。写回时 LZ4 重新压缩
+**不能保证**复现出与原文件逐字节相同的压缩数据（Python 的 `lz4` 绑定和
+编辑器自带的压缩器对同样的输入可能选择不同但同样合法的 LZ4 分块方式）——
+所以"未翻译时写回逐字节不变"这条保证，对压缩格式文件降级为"解压后内容
+逐字节不变"；具体验证方式见
+`test_wolf_roundtrip_untranslated_inject_is_byte_identical`。示例工程本身
+的 Data 文件夹没有提交进本仓库（编辑器自带示例的再分发权限和"完全自由
+转发"不是一回事），只保留了从中学到的格式知识。
+
+M4.9 的 GO / NO-GO 结论
 =========================
-GO for unencrypted WOLF projects using the older/common Map page layout --
-which is the expected shape of a developer's own editable project directory,
-since WolfPro protection is an opt-in publish-time feature. NO-GO (loud,
-explicit failure, never a silently-empty result) for WolfPro-protected
-releases, for classic-cipher-protected files, and for anything that doesn't
-match the byte layout documented above.
+未加密的 WOLF 工程——不管是 classic 格式还是 LZ4 压缩格式，Map 页面格式
+是 v3.5 前还是后——都 GO。WolfPro 加密发行版、经典 XOR 加密工程依然
+NO-GO（明确报错，绝不悄悄产出空结果）。
 """
 
 from __future__ import annotations
@@ -127,6 +139,8 @@ import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
+
+import lz4.block
 
 CP932 = "cp932"
 UTF8 = "utf-8"
@@ -155,6 +169,9 @@ class ByteReader:
 
     def tell(self) -> int:
         return self._pos
+
+    def seek(self, pos: int) -> None:
+        self._pos = pos
 
     def read(self, size: int) -> bytes:
         end = self._pos + size
@@ -217,6 +234,35 @@ class ByteReader:
             "this usually means the file is WolfPro-protected or otherwise encrypted, which this "
             "adapter does not support (see wolf_binary.py's module docstring)"
         )
+
+    def unpack_lz4(self, start: int) -> None:
+        """把 `start` 之后剩余的缓冲区替换成解压后的内容，对应 WolfTL 的
+        `FileCoder::Unpack(seekBack=true)`：先读一对
+        `[解压后长度:i32][压缩后长度:i32]`，再读这么多字节的 LZ4（裸块格式，
+        不是带 frame 头的格式），解压后拼成 `data[:start] + decompressed`
+        作为新缓冲区——这样调用方之前算好的、相对 `start` 的偏移量（各个
+        头部字段等）都还能直接用，只是背后数据换成了解压后的内容。解压完
+        自动定位回 `start`，调用方可以当没发生过压缩一样继续线性往下读。
+        """
+        self._pos = start
+        dec_size = self.read_int()
+        enc_size = self.read_int()
+        compressed = self.read(enc_size)
+        try:
+            decompressed = lz4.block.decompress(compressed, uncompressed_size=dec_size)
+        except Exception as exc:
+            raise WolfFormatError(f"LZ4 decompression failed at offset {start}: {exc}") from exc
+        self._data = self._data[:start] + decompressed
+        self._pos = start
+
+
+def lz4_pack(payload: bytes) -> bytes:
+    """`ByteReader.unpack_lz4` 的写入侧对应实现：把 `payload` 包装成
+    `[解压后长度:i32][压缩后长度:i32][压缩数据]`，可以直接接在写到 `start`
+    位置的头部后面。不保证能复现原文件逐字节相同的压缩数据（见模块文档
+    "真实工程验证" 一节）——只有解压后的内容能保证逐字节一致。"""
+    compressed = lz4.block.compress(payload, mode="default", store_size=False)
+    return struct.pack("<ii", len(payload), len(compressed)) + compressed
 
 
 class ByteWriter:
@@ -328,9 +374,14 @@ class Command:
     indent: int
     string_args: list[str]
     move_extra: MoveExtra | None = None
+    # 只在地图 "v3.5" 格式下才有的、每条 command 末尾的不透明尾部数据块
+    # （对应 WolfTL 的 `Command::s_v35`，这里改成显式的 `v35` 参数往下传，
+    # 不用全局标志位）——具体含义没有任何参考工具说明过，原样保留以保证
+    # 回填时逐字节还原。
+    v35_unknown: bytes = b""
 
     @classmethod
-    def read(cls, r: ByteReader) -> "Command":
+    def read(cls, r: ByteReader, v35: bool = False) -> "Command":
         size = r.read_byte()
         if size < 1:
             raise WolfFormatError(f"command size byte must be >= 1, got {size}")
@@ -344,9 +395,14 @@ class Command:
             move_extra = MoveExtra.read(r)
         elif terminator != 0:
             raise WolfFormatError(f"unexpected command terminator {terminator:#x}")
-        return cls(cid, args, indent, string_args, move_extra)
+        v35_unknown = b""
+        if v35:
+            v35_size = r.read_byte()
+            if v35_size:
+                v35_unknown = r.read(v35_size)
+        return cls(cid, args, indent, string_args, move_extra, v35_unknown)
 
-    def write(self, w: ByteWriter) -> None:
+    def write(self, w: ByteWriter, v35: bool = False) -> None:
         w.write_byte(len(self.args) + 1)
         w.write_int(self.cid)
         for a in self.args:
@@ -360,6 +416,10 @@ class Command:
             self.move_extra.write(w)
         else:
             w.write_byte(0)
+        if v35:
+            w.write_byte(len(self.v35_unknown))
+            if self.v35_unknown:
+                w.write(self.v35_unknown)
 
 
 def command_text_slots(cmd: Command) -> list[int]:
@@ -381,16 +441,22 @@ def command_text_slots(cmd: Command) -> list[int]:
 # Map (.mps)
 # ---------------------------------------------------------------------------
 
-# 10 reserved zero bytes + literal "WOLFM\0" + 4 reserved zero bytes +
-# int32(0x64) [format-version marker; WolfTL gates LZ4 decompression on this
-# being >= 0x65, i.e. this module only supports the un-gated "classic" value]
-# + byte(0x65). What follows (not included in this fixed prefix) is a
-# length-prefixed string -- an opaque "editor build stamp" that differs
-# between the Japanese and English editor builds in the tools that inspired
-# this port ("なし" vs "No"); rather than hardcoding either literal, this
-# module reads it as a normal string and round-trips it verbatim, which
-# generalizes to any stamp value.
-_MAP_HEADER_PREFIX = bytes(10) + b"WOLFM\x00" + bytes(4) + struct.pack("<i", 0x64) + bytes([0x65])
+# 10 个保留零字节 + 字面量 "WOLFM" + 5 个保留零字节（其中第 16 位是 UTF-8
+# 标记位，和 Database/CommonEvent 的 magic 是同一套约定）。后面紧跟两个
+# 本模块之前误当成固定 magic 字节的真实字段：int32 的 `version` 和单字节
+# `unknown2`。版本号达到 `_MAP_LZ4_VERSION_THRESHOLD` 起，后面全部内容是
+# LZ4 块压缩的（见 `ByteReader.unpack_lz4`）；达到 `_MAP_V35_VERSION_THRESHOLD`
+# 起，头部还会多两个 int（unknown4、layer_cnt），且每条 Command 末尾多一段
+# 不透明数据块（见 Command.v35_unknown）。这些都用真实 WOLF RPG Editor
+# v3.712 示例工程交叉验证过——见模块文档"真实工程验证"一节；那份示例里
+# 所有文件都是压缩的 v3.5 格式，所以这里两种格式都得支持，不能只当稀有情况。
+_MAP_MAGIC = bytes(10) + b"WOLFM" + bytes(5)
+_MAP_UTF8_INDEX = 16
+_MAP_LZ4_VERSION_THRESHOLD = 0x65
+_MAP_V35_VERSION_THRESHOLD = 0x67
+_MAP_DEFAULT_VERSION = 0x64
+_MAP_DEFAULT_UNKNOWN2 = 0x65
+_MAP_DEFAULT_LAYER_COUNT = 3
 _EVENT_MAGIC1 = bytes([0x39, 0x30, 0x00, 0x00])
 _EVENT_MAGIC2 = bytes(4)
 _EVENT_INDICATOR = 0x6F
@@ -398,8 +464,8 @@ _EVENT_FINISH_INDICATOR = 0x66
 _PAGE_INDICATOR = 0x79
 _PAGE_FINISH_INDICATOR = 0x70
 _PAGE_TERMINATOR = 0x7A
-_COMMANDS_TERMINATOR = bytes([0x03, 0x00, 0x00, 0x00])
-_CONDITIONS_SIZE = 1 + 4 * 4 + 4 * 4  # 37 opaque bytes, meaning not documented by any reference tool
+_PAGE_DEFAULT_FEATURES = 3
+_CONDITIONS_SIZE = 1 + 4 + 4 * 4 + 4 * 4  # 37 个不透明字节，具体含义没有任何参考工具说明过
 _MOVEMENT_SIZE = 4
 
 
@@ -420,9 +486,15 @@ class Page:
     shadow_graphic_num: int
     collision_width: int
     collision_height: int
+    # 不管地图版本号是多少都无条件读取——本模块之前一版把 `features` 误建
+    # 模成固定 4 字节 magic（手搭的合成 fixture 里刚好一直是 3，所以没露馅）；
+    # WolfTL 的 C++ 解析器把它当成真正的 int32 读，不看版本号，`page_transfer`
+    # 只有在它 > 3 时才紧跟其后。
+    features: int = _PAGE_DEFAULT_FEATURES
+    page_transfer: int = 0
 
     @classmethod
-    def read(cls, r: ByteReader) -> "Page":
+    def read(cls, r: ByteReader, v35: bool = False) -> "Page":
         unknown1 = r.read_int()
         graphic_name = r.read_string()
         graphic_direction = r.read_byte()
@@ -434,11 +506,12 @@ class Page:
         flags = r.read_byte()
         route_flags = r.read_byte()
         route = [RouteCommand.read(r) for _ in range(r.read_int())]
-        commands = [Command.read(r) for _ in range(r.read_int())]
-        r.verify(_COMMANDS_TERMINATOR)
+        commands = [Command.read(r, v35) for _ in range(r.read_int())]
+        features = r.read_int()
         shadow_graphic_num = r.read_byte()
         collision_width = r.read_byte()
         collision_height = r.read_byte()
+        page_transfer = r.read_byte() if features > 3 else 0
         terminator = r.read_byte()
         if terminator != _PAGE_TERMINATOR:
             raise WolfFormatError(f"page terminator not {_PAGE_TERMINATOR:#x} (got {terminator:#x})")
@@ -458,9 +531,11 @@ class Page:
             shadow_graphic_num,
             collision_width,
             collision_height,
+            features,
+            page_transfer,
         )
 
-    def write(self, w: ByteWriter) -> None:
+    def write(self, w: ByteWriter, v35: bool = False) -> None:
         w.write_int(self.unknown1)
         w.write_string(self.graphic_name)
         w.write_byte(self.graphic_direction)
@@ -476,11 +551,13 @@ class Page:
             rc.write(w)
         w.write_int(len(self.commands))
         for c in self.commands:
-            c.write(w)
-        w.write(_COMMANDS_TERMINATOR)
+            c.write(w, v35)
+        w.write_int(self.features)
         w.write_byte(self.shadow_graphic_num)
         w.write_byte(self.collision_width)
         w.write_byte(self.collision_height)
+        if self.features > 3:
+            w.write_byte(self.page_transfer)
         w.write_byte(_PAGE_TERMINATOR)
 
 
@@ -493,7 +570,7 @@ class Event:
     pages: list[Page]
 
     @classmethod
-    def read(cls, r: ByteReader) -> "Event":
+    def read(cls, r: ByteReader, v35: bool = False) -> "Event":
         r.verify(_EVENT_MAGIC1)
         event_id = r.read_int()
         name = r.read_string()
@@ -505,7 +582,7 @@ class Event:
         while True:
             indicator = r.read_byte()
             if indicator == _PAGE_INDICATOR:
-                pages.append(Page.read(r))
+                pages.append(Page.read(r, v35))
             elif indicator == _PAGE_FINISH_INDICATOR:
                 break
             else:
@@ -516,7 +593,7 @@ class Event:
             )
         return cls(event_id, name, x, y, pages)
 
-    def write(self, w: ByteWriter) -> None:
+    def write(self, w: ByteWriter, v35: bool = False) -> None:
         w.write(_EVENT_MAGIC1)
         w.write_int(self.event_id)
         w.write_string(self.name)
@@ -526,7 +603,7 @@ class Event:
         w.write(_EVENT_MAGIC2)
         for p in self.pages:
             w.write_byte(_PAGE_INDICATOR)
-            p.write(w)
+            p.write(w, v35)
         w.write_byte(_PAGE_FINISH_INDICATOR)
 
 
@@ -537,10 +614,22 @@ class WolfMap:
     height: int
     tiles: bytes
     events: list[Event]
-    # Opaque per-file "editor build stamp" string embedded in the header
-    # (see _MAP_HEADER_PREFIX's comment) -- round-tripped verbatim, content
-    # not interpreted.
+    # 嵌在文件头里的、不透明的每文件"编辑器构建戳"字符串——原样回填，
+    # 内容不做解读。
     header_stamp: str = ""
+    version: int = _MAP_DEFAULT_VERSION
+    unknown2: int = _MAP_DEFAULT_UNKNOWN2
+    unknown4: int = 0  # 只在 version >= _MAP_V35_VERSION_THRESHOLD 时才存在（读/写）
+    layer_cnt: int = _MAP_DEFAULT_LAYER_COUNT
+    is_utf8: bool = False
+    # `tiles` 是否真的存在。只对 UTF-8 文件有意义（也只有 UTF-8 文件才可能是
+    # False）：这类文件在地图真的没有图块数据时，会用一个 `-1` 哨兵值代替
+    # 图块数据块，本模块原样保留这个状态，而不是无脑总是写出图块数据。
+    has_tiles: bool = True
+
+    @property
+    def v35(self) -> bool:
+        return self.version >= _MAP_V35_VERSION_THRESHOLD
 
     @classmethod
     def read(cls, path: Path) -> "WolfMap":
@@ -548,46 +637,93 @@ class WolfMap:
         if not data:
             raise WolfFormatError(f"{path}: empty file")
         # No reference tool models an encryption/protection layer for .mps
-        # files specifically (wolftrans never passes seed indices for Map;
-        # WolfTL's Map-specific branch only ever checks for LZ4 compression,
-        # gated by the format-version marker byte baked into the header
-        # prefix below) -- so there is no encryption pre-check here, unlike
-        # Database/CommonEvents.
-        r = ByteReader(data)  # cp932 only -- see module docstring gap 4
-        r.verify(_MAP_HEADER_PREFIX)
+        # files specifically (wolftrans never passes seed indices for Map) --
+        # so there is no encryption pre-check here, unlike Database/
+        # CommonEvents. LZ4 compression (see below) is not encryption.
+        r = ByteReader(data)
+        is_utf8 = r.verify_magic_utf8_aware(_MAP_MAGIC, _MAP_UTF8_INDEX)
+        version = r.read_int()
+        unknown2 = r.read_byte()
+        if version >= _MAP_LZ4_VERSION_THRESHOLD:
+            r.unpack_lz4(r.tell())
         header_stamp = r.read_string()
         tileset_id = r.read_int()
         width = r.read_int()
         height = r.read_int()
         r.read_int()  # event count -- redundant with len(events); recomputed on write, like wolftrans does
-        tiles = r.read(width * height * 3 * 4)
+        v35 = version >= _MAP_V35_VERSION_THRESHOLD
+        unknown4 = 0
+        layer_cnt = _MAP_DEFAULT_LAYER_COUNT
+        if v35:
+            unknown4 = r.read_int()
+            layer_cnt = r.read_int()
+        has_tiles = True
+        if is_utf8:
+            peek = r.read_int()
+            if peek == -1:
+                has_tiles = False
+            else:
+                r.seek(r.tell() - 4)
+        tiles = r.read(width * height * layer_cnt * 4) if has_tiles else b""
         events: list[Event] = []
         while True:
             indicator = r.read_byte()
             if indicator == _EVENT_INDICATOR:
-                events.append(Event.read(r))
+                events.append(Event.read(r, v35))
             elif indicator == _EVENT_FINISH_INDICATOR:
                 break
             else:
                 raise WolfFormatError(f"{path}: unexpected event indicator {indicator:#x}")
         if not r.eof():
             raise WolfFormatError(f"{path}: file not fully parsed (trailing bytes after last event)")
-        return cls(tileset_id, width, height, tiles, events, header_stamp)
+        return cls(
+            tileset_id,
+            width,
+            height,
+            tiles,
+            events,
+            header_stamp,
+            version,
+            unknown2,
+            unknown4,
+            layer_cnt,
+            is_utf8,
+            has_tiles,
+        )
 
     def write(self, path: Path) -> None:
-        w = ByteWriter()
-        w.write(_MAP_HEADER_PREFIX)
-        w.write_string(self.header_stamp)
-        w.write_int(self.tileset_id)
-        w.write_int(self.width)
-        w.write_int(self.height)
-        w.write_int(len(self.events))
-        w.write(self.tiles)
+        encoding = UTF8 if self.is_utf8 else CP932
+        header = ByteWriter()
+        magic = bytearray(_MAP_MAGIC)
+        if self.is_utf8:
+            magic[_MAP_UTF8_INDEX] = 0x55
+        header.write(bytes(magic))
+        header.write_int(self.version)
+        header.write_byte(self.unknown2)
+
+        body = ByteWriter(encoding=encoding)
+        body.write_string(self.header_stamp)
+        body.write_int(self.tileset_id)
+        body.write_int(self.width)
+        body.write_int(self.height)
+        body.write_int(len(self.events))
+        if self.v35:
+            body.write_int(self.unknown4)
+            body.write_int(self.layer_cnt)
+        if self.is_utf8 and not self.has_tiles:
+            body.write_int(-1)
+        else:
+            body.write(self.tiles)
         for e in self.events:
-            w.write_byte(_EVENT_INDICATOR)
-            e.write(w)
-        w.write_byte(_EVENT_FINISH_INDICATOR)
-        path.write_bytes(w.getvalue())
+            body.write_byte(_EVENT_INDICATOR)
+            e.write(body, self.v35)
+        body.write_byte(_EVENT_FINISH_INDICATOR)
+
+        if self.version >= _MAP_LZ4_VERSION_THRESHOLD:
+            header.write(lz4_pack(body.getvalue()))
+        else:
+            header.write(body.getvalue())
+        path.write_bytes(header.getvalue())
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +733,9 @@ class WolfMap:
 _DAT_MAGIC_CP932 = bytes([0x57, 0x00, 0x00, 0x4F, 0x4C, 0x00, 0x46, 0x4D, 0x00])
 _DAT_UTF8_INDEX = 5
 _DAT_DEFAULT_VERSION = 0xC1
+_DAT_V35_VERSION = 0xC4  # 精确匹配这一个版本值（不是阈值）才触发 LZ4 压缩
 _DAT_TYPE_SEPARATOR = bytes([0xFE, 0xFF, 0xFF, 0xFF])
+_DAT_STRING_INDICATOR = 0x0001D4C0
 
 _FIELD_STRING_START = 0x07D0
 _FIELD_INT_START = 0x03E8
@@ -635,6 +773,10 @@ class DbType:
     description: str
     field_type_list_size: int
     unknown1: int = 0  # per-type value from the .dat file; meaning undocumented by any reference tool
+    # 只在 unknown1 == _DAT_STRING_INDICATOR 这个哨兵值时才存在的额外字符串
+    # 字段（WolfTL 有、wolftrans 没有的分支）；真实工程里没见过命中，但结构
+    # 上必须留着这个位置才能和 WolfTL 对齐。
+    unknown2: str = ""
 
     @classmethod
     def read_project(cls, r: ByteReader) -> "DbType":
@@ -697,6 +839,8 @@ class DbType:
         r.verify(_DAT_TYPE_SEPARATOR)
         self.unknown1 = r.read_int()
         fields_size = r.read_int()
+        if self.unknown1 == _DAT_STRING_INDICATOR:
+            self.unknown2 = r.read_string()
         if fields_size != len(self.fields):
             self.fields = self.fields[:fields_size]
         for f in self.fields:
@@ -714,6 +858,8 @@ class DbType:
         w.write(_DAT_TYPE_SEPARATOR)
         w.write_int(self.unknown1)
         w.write_int(len(self.fields))
+        if self.unknown1 == _DAT_STRING_INDICATOR:
+            w.write_string(self.unknown2)
         for f in self.fields:
             w.write_int(f.index_info)
         w.write_int(len(self.data))
@@ -739,6 +885,8 @@ class WolfDatabase:
         dr.read_byte()  # the "unencrypted" indicator byte, already checked above
         is_utf8 = dr.verify_magic_utf8_aware(_DAT_MAGIC_CP932, _DAT_UTF8_INDEX)
         version = dr.read_byte()
+        if version == _DAT_V35_VERSION:
+            dr.unpack_lz4(dr.tell())
         dat_type_count = dr.read_int()
 
         # The .project file's own strings share the .dat file's encoding, but
@@ -774,18 +922,25 @@ class WolfDatabase:
             t.write_project(pw)
         project_path.write_bytes(pw.getvalue())
 
-        dw = ByteWriter(encoding=encoding)
-        dw.write_byte(0)
+        header = ByteWriter()
+        header.write_byte(0)
         magic = bytearray(_DAT_MAGIC_CP932)
         if self.is_utf8:
             magic[_DAT_UTF8_INDEX] = 0x55
-        dw.write(bytes(magic))
-        dw.write_byte(self.version)
-        dw.write_int(len(self.types))
+        header.write(bytes(magic))
+        header.write_byte(self.version)
+
+        body = ByteWriter(encoding=encoding)
+        body.write_int(len(self.types))
         for t in self.types:
-            t.write_dat(dw)
-        dw.write_byte(self.version)
-        dat_path.write_bytes(dw.getvalue())
+            t.write_dat(body)
+        body.write_byte(self.version)
+
+        if self.version == _DAT_V35_VERSION:
+            header.write(lz4_pack(body.getvalue()))
+        else:
+            header.write(body.getvalue())
+        dat_path.write_bytes(header.getvalue())
 
 
 def translatable_fields(db_type: DbType) -> list[Field]:
@@ -804,6 +959,9 @@ _CE_MAGIC_CP932 = bytes([0x57, 0x00, 0x00, 0x4F, 0x4C, 0x00, 0x46, 0x43, 0x00])
 _CE_UTF8_INDEX = 5
 _CE_DEFAULT_VERSION = 0x8F
 _CE_MIN_TERMINATOR = 0x89
+# 这两个具体版本号（不是阈值区间）触发 LZ4 压缩 + Command 的 v3.5 尾部字段，
+# 对应 WolfTL 的 `CommonEvents::load()`。
+_CE_V35_VERSIONS = frozenset({0x93, 0xCC})
 
 
 @dataclass
@@ -826,7 +984,7 @@ class CommonEvent:
     unknown12: int | None = None
 
     @classmethod
-    def read(cls, r: ByteReader) -> "CommonEvent":
+    def read(cls, r: ByteReader, v35: bool = False) -> "CommonEvent":
         indicator = r.read_byte()
         if indicator != 0x8E:
             raise WolfFormatError(f"CommonEvent header indicator not 0x8E (got {indicator:#x})")
@@ -834,7 +992,7 @@ class CommonEvent:
         unknown1 = r.read_int()
         unknown2 = r.read(7)
         name = r.read_string()
-        commands = [Command.read(r) for _ in range(r.read_int())]
+        commands = [Command.read(r, v35) for _ in range(r.read_int())]
         unknown11 = r.read_string()
         description = r.read_string()
         indicator = r.read_byte()
@@ -880,7 +1038,7 @@ class CommonEvent:
             unknown12,
         )
 
-    def write(self, w: ByteWriter) -> None:
+    def write(self, w: ByteWriter, v35: bool = False) -> None:
         w.write_byte(0x8E)
         w.write_int(self.event_id)
         w.write_int(self.unknown1)
@@ -888,7 +1046,7 @@ class CommonEvent:
         w.write_string(self.name)
         w.write_int(len(self.commands))
         for c in self.commands:
-            c.write(w)
+            c.write(w, v35)
         w.write_string(self.unknown11)
         w.write_string(self.description)
         w.write_byte(0x8F)
@@ -929,6 +1087,10 @@ class WolfCommonEvents:
     terminator: int = _CE_DEFAULT_VERSION
     is_utf8: bool = False
 
+    @property
+    def v35(self) -> bool:
+        return self.version in _CE_V35_VERSIONS
+
     @classmethod
     def read(cls, path: Path) -> "WolfCommonEvents":
         data = path.read_bytes()
@@ -937,7 +1099,10 @@ class WolfCommonEvents:
         r.read_byte()  # the "unencrypted" indicator byte, already checked above
         is_utf8 = r.verify_magic_utf8_aware(_CE_MAGIC_CP932, _CE_UTF8_INDEX)
         version = r.read_byte()
-        events = [CommonEvent.read(r) for _ in range(r.read_int())]
+        v35 = version in _CE_V35_VERSIONS
+        if v35:
+            r.unpack_lz4(r.tell())
+        events = [CommonEvent.read(r, v35) for _ in range(r.read_int())]
         terminator = r.read_byte()
         if terminator < _CE_MIN_TERMINATOR:
             raise WolfFormatError(f"{path}: terminator {terminator:#x} smaller than {_CE_MIN_TERMINATOR:#x}")
@@ -947,18 +1112,25 @@ class WolfCommonEvents:
 
     def write(self, path: Path) -> None:
         encoding = UTF8 if self.is_utf8 else CP932
-        w = ByteWriter(encoding=encoding)
-        w.write_byte(0)
+        header = ByteWriter()
+        header.write_byte(0)
         magic = bytearray(_CE_MAGIC_CP932)
         if self.is_utf8:
             magic[_CE_UTF8_INDEX] = 0x55
-        w.write(bytes(magic))
-        w.write_byte(self.version)
-        w.write_int(len(self.events))
+        header.write(bytes(magic))
+        header.write_byte(self.version)
+
+        body = ByteWriter(encoding=encoding)
+        body.write_int(len(self.events))
         for e in self.events:
-            e.write(w)
-        w.write_byte(self.terminator)
-        path.write_bytes(w.getvalue())
+            e.write(body, self.v35)
+        body.write_byte(self.terminator)
+
+        if self.v35:
+            header.write(lz4_pack(body.getvalue()))
+        else:
+            header.write(body.getvalue())
+        path.write_bytes(header.getvalue())
 
 
 # ---------------------------------------------------------------------------

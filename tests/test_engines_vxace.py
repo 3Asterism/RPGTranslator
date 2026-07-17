@@ -183,3 +183,104 @@ def test_vxace_inject_does_not_mutate_source_project(tmp_path: Path, vxace_proje
 
     after = (vxace_project / "Data" / "Map001.rvdata2").read_bytes()
     assert before == after
+
+
+# ---------------------------------------------------------------------------
+# spec 9.2.b：翻译后往 Scripts.rvdata2 注入运行时像素级换行补丁——
+# M4.9 用真实 VX Ace 工程（RTP + Game.exe + RGSS301.dll 齐全，可以直接跑）
+# 反编译出真实 Window_Base/Window_Message 源码验证过设计（见
+# _vxace_message_patch.py 模块文档），这里用手搭的 Scripts.rvdata2 fixture
+# 测注入这一步本身的行为，不依赖真实工程（真实工程本身没有提交进仓库）。
+# ---------------------------------------------------------------------------
+
+from rpg_translator.engines._vxace_message_patch import RUNTIME_LINE_WRAP_SCRIPT_NAME
+from rpg_translator.engines._vxace_scripts import (
+    _MARSHAL_HEADER,
+    _TAG_ARRAY,
+    _write_long,
+    encode_new_entry,
+    read_scripts,
+)
+
+
+def _write_fake_scripts_file(path: Path, entries: list[tuple[int, str, str]]) -> None:
+    body = _MARSHAL_HEADER + bytes([_TAG_ARRAY]) + _write_long(len(entries))
+    for script_id, name, source in entries:
+        body += encode_new_entry(script_id, name, source)
+    path.write_bytes(body)
+
+
+def test_vxace_after_inject_appends_runtime_patch_when_translated(tmp_path: Path, vxace_project: Path):
+    _write_fake_scripts_file(
+        vxace_project / "Data" / "Scripts.rvdata2",
+        [(1, "Vocab", "module Vocab\nend\n"), (2, "Window_Message", "class Window_Message\nend\n")],
+    )
+
+    adapter = VXAceAdapter()
+    units = adapter.extract(vxace_project)
+    units[0].translated_text = "已翻译"
+
+    output_dir = tmp_path / "output"
+    adapter.inject(vxace_project, units, output_dir)
+
+    entries = read_scripts(output_dir / "Data" / "Scripts.rvdata2")
+    assert len(entries) == 3
+    assert entries[-1].name == RUNTIME_LINE_WRAP_SCRIPT_NAME
+    # 前两个原有脚本必须原样保留，不能因为追加新脚本被重新编码
+    original_entries = read_scripts(vxace_project / "Data" / "Scripts.rvdata2")
+    assert [(e.id, e.name, e.compressed_source) for e in entries[:2]] == [
+        (e.id, e.name, e.compressed_source) for e in original_entries
+    ]
+
+
+def test_vxace_after_inject_skips_patch_when_nothing_translated(tmp_path: Path, vxace_project: Path):
+    """纯预览/未翻译的 inject 不该碰 Scripts.rvdata2——保持 M1/M4 的
+    "未翻译回填逐字节不变" 回归校验成立。"""
+    _write_fake_scripts_file(vxace_project / "Data" / "Scripts.rvdata2", [(1, "Vocab", "module Vocab\nend\n")])
+
+    adapter = VXAceAdapter()
+    units = adapter.extract(vxace_project)  # 一律不设置 translated_text
+
+    output_dir = tmp_path / "output"
+    adapter.inject(vxace_project, units, output_dir)
+
+    original_bytes = (vxace_project / "Data" / "Scripts.rvdata2").read_bytes()
+    output_bytes = (output_dir / "Data" / "Scripts.rvdata2").read_bytes()
+    assert output_bytes == original_bytes
+
+
+def test_vxace_after_inject_skips_patch_when_conflicting_message_system_present(
+    tmp_path: Path, vxace_project: Path
+):
+    """检测到已知第三方消息系统脚本就跳过注入，降级用估算重排方案兜底
+    （spec 9 节的设计决策），不强行覆盖游戏自带的自定义 Window_Message。"""
+    _write_fake_scripts_file(
+        vxace_project / "Data" / "Scripts.rvdata2",
+        [(1, "Vocab", "module Vocab\nend\n"), (2, "YEA-MessageSystem", "class Window_Message\nend\n")],
+    )
+
+    adapter = VXAceAdapter()
+    units = adapter.extract(vxace_project)
+    units[0].translated_text = "已翻译"
+
+    output_dir = tmp_path / "output"
+    adapter.inject(vxace_project, units, output_dir)
+
+    original_bytes = (vxace_project / "Data" / "Scripts.rvdata2").read_bytes()
+    output_bytes = (output_dir / "Data" / "Scripts.rvdata2").read_bytes()
+    assert output_bytes == original_bytes
+
+
+def test_vxace_after_inject_skips_patch_when_no_scripts_file(tmp_path: Path, vxace_project: Path):
+    """连 Scripts.rvdata2 都没有（比如其他测试用的合成 fixture）就什么都不做，
+    不能凭空生出一个原工程没有的文件。"""
+    assert not (vxace_project / "Data" / "Scripts.rvdata2").exists()
+
+    adapter = VXAceAdapter()
+    units = adapter.extract(vxace_project)
+    units[0].translated_text = "已翻译"
+
+    output_dir = tmp_path / "output"
+    adapter.inject(vxace_project, units, output_dir)
+
+    assert not (output_dir / "Data" / "Scripts.rvdata2").exists()

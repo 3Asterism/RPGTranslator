@@ -245,3 +245,154 @@ def test_wolf_map_read_raises_clear_error_on_garbage(tmp_path: Path):
 
     with pytest.raises(WolfFormatError):
         wb.WolfMap.read(path)
+
+
+# ---------------------------------------------------------------------------
+# "v3.5" 格式（LZ4 压缩 + Page features/page_transfer + Command 尾部数据块）
+# —— M4.9 用真实 WOLF RPG Editor v3.712 自带示例工程实测后补上的分支，见
+# wolf_binary.py 模块文档"真实工程验证"一节。真实工程没有提交进仓库，这里
+# 用 conftest.py 的 build_wolf_project_v35() 手搭 fixture 做回归测试。
+# ---------------------------------------------------------------------------
+
+V35_MAP_FILE = "Data/MapData/Map001.mps"
+V35_CE_FILE = "Data/BasicData/CommonEvent.dat"
+V35_DB_FILE = "Data/BasicData/DataBase.dat"
+
+
+def test_wolf_v35_extract_finds_dialogue_across_all_three_file_types(wolf_project_v35: Path):
+    units = WolfAdapter().extract(wolf_project_v35)
+
+    map_unit = _by_locator(units, V35_MAP_FILE, "events/0/pages/0/commands/0/string_args/0")
+    assert map_unit.source_text == "こんにちは、v3.5！"
+
+    ce_unit = _by_locator(units, V35_CE_FILE, "events/0/commands/0/string_args/0")
+    assert ce_unit.source_text == "v3.5 共通イベントのテキスト。"
+
+    db_unit = _by_locator(units, V35_DB_FILE, "types/0/data/0/string_values/0")
+    assert db_unit.source_text == "ハロルド"
+
+
+def test_wolf_v35_map_read_write_is_lossless(wolf_project_v35: Path):
+    """LZ4 重新压缩不保证复现原始压缩字节（见模块文档"真实工程验证"），
+    所以这里比较解压后的结构化内容，而不是原始文件字节。"""
+    original = wb.WolfMap.read(wolf_project_v35 / V35_MAP_FILE)
+
+    out_path = wolf_project_v35.parent / "Map001_rewritten.mps"
+    original.write(out_path)
+    reloaded = wb.WolfMap.read(out_path)
+
+    assert reloaded.version == original.version == 0x67
+    assert reloaded.is_utf8 is True
+    assert reloaded.layer_cnt == 3
+    assert reloaded.tiles == original.tiles
+    page = reloaded.events[0].pages[0]
+    original_page = original.events[0].pages[0]
+    assert page.features == original_page.features == 5
+    assert page.page_transfer == original_page.page_transfer == 7
+    assert [c.string_args for c in page.commands] == [c.string_args for c in original_page.commands]
+    assert page.commands[0].v35_unknown == bytes([9, 9, 9])
+
+
+def test_wolf_v35_page_transfer_absent_when_features_not_greater_than_3():
+    """features <= 3 时 page_transfer 字段不存在于文件里，写回时也不能写出
+    这个字段——否则真实引擎按老格式读这份文件会多读一个字节，后续全部错位。"""
+    page_low = wb.Page(
+        unknown1=0,
+        graphic_name="",
+        graphic_direction=0,
+        graphic_frame=0,
+        graphic_opacity=255,
+        graphic_render_mode=0,
+        conditions=bytes(wb._CONDITIONS_SIZE),
+        movement=bytes(wb._MOVEMENT_SIZE),
+        flags=0,
+        route_flags=0,
+        route=[],
+        commands=[],
+        shadow_graphic_num=0,
+        collision_width=0,
+        collision_height=0,
+        features=3,
+        page_transfer=99,  # 应该被忽略/不写出，因为 features 没有 > 3
+    )
+    w = wb.ByteWriter()
+    page_low.write(w)
+    r = wb.ByteReader(w.getvalue())
+    reloaded = wb.Page.read(r)
+    assert reloaded.features == 3
+    assert reloaded.page_transfer == 0
+    assert r.eof()
+
+
+def test_wolf_v35_common_event_lz4_roundtrip_and_v35_unknown_preserved(wolf_project_v35: Path):
+    original = wb.WolfCommonEvents.read(wolf_project_v35 / V35_CE_FILE)
+    assert original.version == 0x93
+    assert original.v35 is True
+
+    out_path = wolf_project_v35.parent / "CommonEvent_rewritten.dat"
+    original.write(out_path)
+    reloaded = wb.WolfCommonEvents.read(out_path)
+
+    assert reloaded.events[0].commands[0].string_args == ["v3.5 共通イベントのテキスト。"]
+    assert reloaded.events[0].commands[0].v35_unknown == bytes([1, 2])
+
+
+def test_wolf_v35_database_lz4_roundtrip(wolf_project_v35: Path):
+    project_path = wolf_project_v35 / "Data/BasicData/DataBase.project"
+    dat_path = wolf_project_v35 / V35_DB_FILE
+    original = wb.WolfDatabase.read(project_path, dat_path)
+    assert original.version == 0xC4
+
+    out_dir = wolf_project_v35.parent / "db_rewritten"
+    out_dir.mkdir()
+    original.write(out_dir / "DataBase.project", out_dir / "DataBase.dat")
+    reloaded = wb.WolfDatabase.read(out_dir / "DataBase.project", out_dir / "DataBase.dat")
+
+    assert reloaded.types[0].data[0].string_values == ["ハロルド"]
+
+
+def test_wolf_v35_database_type_unknown2_sentinel_roundtrips():
+    """WolfTL 独有、wolftrans 没有的分支：unknown1 命中哨兵值时多一个字符串
+    字段。真实工程里没见过命中，但结构必须留着这个位置。"""
+    field_name = wb.Field(name="名前", type=0, index_info=wb._FIELD_STRING_START + 0)
+    dbtype = wb.DbType(
+        name="Weird",
+        fields=[field_name],
+        data=[wb.DataRecord(name="0", int_values=[], string_values=["x"])],
+        description="",
+        field_type_list_size=1,
+        unknown1=wb._DAT_STRING_INDICATOR,
+        unknown2="哨兵字符串",
+    )
+    w = wb.ByteWriter(encoding=wb.UTF8)
+    dbtype.write_dat(w)
+    r = wb.ByteReader(w.getvalue(), encoding=wb.UTF8)
+    reloaded = wb.DbType(
+        name="Weird", fields=[wb.Field(name="名前")], data=[wb.DataRecord(name="0")], description="",
+        field_type_list_size=1,
+    )
+    reloaded.read_dat(r)
+    assert reloaded.unknown1 == wb._DAT_STRING_INDICATOR
+    assert reloaded.unknown2 == "哨兵字符串"
+    assert reloaded.data[0].string_values == ["x"]
+    assert r.eof()
+
+
+def test_wolf_v35_inject_changes_only_targeted_value(tmp_path: Path, wolf_project_v35: Path):
+    adapter = WolfAdapter()
+    units = adapter.extract(wolf_project_v35)
+
+    target = _by_locator(units, V35_MAP_FILE, "events/0/pages/0/commands/0/string_args/0")
+    target.translated_text = "V35 TRANSLATED"
+
+    output_dir = tmp_path / "output"
+    adapter.inject(wolf_project_v35, units, output_dir)
+
+    translated_map = wb.WolfMap.read(output_dir / V35_MAP_FILE)
+    assert translated_map.events[0].pages[0].commands[0].string_args[0] == "V35 TRANSLATED"
+    assert translated_map.events[0].pages[0].commands[1].string_args[0] == "二行目のテキスト。"
+    # 压缩格式写回不保证逐字节等于原文件（见模块文档），但内容要能正常
+    # 再解析，且未改动的另外两个文件解压内容应保持不变
+    reloaded_ce = wb.WolfCommonEvents.read(output_dir / V35_CE_FILE)
+    original_ce = wb.WolfCommonEvents.read(wolf_project_v35 / V35_CE_FILE)
+    assert reloaded_ce.events[0].commands[0].string_args == original_ce.events[0].commands[0].string_args

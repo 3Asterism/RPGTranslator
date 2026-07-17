@@ -515,6 +515,120 @@ def wolf_project(tmp_path: Path) -> Path:
     return build_wolf_project(tmp_path)
 
 
+def build_wolf_project_v35(root: Path) -> Path:
+    """手搭的 "v3.5" 格式 WOLF RPG Editor 工程——对应 M4.9 用真实 WOLF RPG
+    Editor v3.712 自带示例工程验证后发现的格式（LZ4 块压缩正文、Map 头部
+    多两个 int、Page 的 features/page_transfer、每条 Command 末尾的 v3.5
+    尾部数据块）。真实工程本身没有提交进仓库（见 wolf_binary.py 模块文档
+    "真实工程验证" 一节），所以这份 fixture 是这条格式分支唯一的回归测试
+    依据；专门覆盖 build_wolf_project() 那份经典格式 fixture 不会触发的
+    分支：LZ4 压缩/解压、features > 3 时的 page_transfer 字段、Command 的
+    v35_unknown 尾部字节、Database Type 的 unknown2 哨兵字段。
+    """
+    from rpg_translator.engines import wolf_binary as wb
+
+    project_dir = root / "wolf_project_v35"
+    data_dir = project_dir / "Data"
+    basic_data_dir = data_dir / "BasicData"
+    map_data_dir = data_dir / "MapData"
+    basic_data_dir.mkdir(parents=True, exist_ok=True)
+    map_data_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Data/MapData/Map001.mps (v3.5, LZ4 压缩, UTF-8) -------------------
+    width, height, layer_cnt = 4, 4, 3
+    page = wb.Page(
+        unknown1=0,
+        graphic_name="",
+        graphic_direction=2,
+        graphic_frame=0,
+        graphic_opacity=255,
+        graphic_render_mode=0,
+        conditions=bytes(wb._CONDITIONS_SIZE),
+        movement=bytes(wb._MOVEMENT_SIZE),
+        flags=0,
+        route_flags=0,
+        route=[],
+        commands=[
+            wb.Command(
+                cid=101,
+                args=[0, 0, 0],
+                indent=0,
+                string_args=["こんにちは、v3.5！"],
+                v35_unknown=bytes([9, 9, 9]),
+            ),
+            wb.Command(cid=101, args=[0, 0, 0], indent=0, string_args=["二行目のテキスト。"]),
+        ],
+        shadow_graphic_num=0,
+        collision_width=0,
+        collision_height=0,
+        features=5,  # > 3 -> page_transfer 字段必须存在并且能回填
+        page_transfer=7,
+    )
+    event = wb.Event(event_id=0, name="EV001", x=1, y=1, pages=[page])
+    game_map = wb.WolfMap(
+        tileset_id=1,
+        width=width,
+        height=height,
+        tiles=bytes(width * height * layer_cnt * 4),
+        events=[event],
+        header_stamp="なし",
+        version=0x67,
+        unknown2=0x69,
+        unknown4=3,
+        layer_cnt=layer_cnt,
+        is_utf8=True,
+    )
+    game_map.write(map_data_dir / "Map001.mps")
+
+    # --- Data/BasicData/CommonEvent.dat (v3.5, LZ4 压缩) --------------------
+    common_event = wb.CommonEvent(
+        event_id=0,
+        unknown1=1,
+        unknown2=bytes([1, 2, 3, 4, 5, 6, 7]),
+        name="CE001",
+        commands=[
+            wb.Command(
+                cid=101,
+                args=[0, 0, 0],
+                indent=0,
+                string_args=["v3.5 共通イベントのテキスト。"],
+                v35_unknown=bytes([1, 2]),
+            ),
+        ],
+        unknown11="stamp11",
+        description="v3.5テスト",
+        unknown3=[f"u3-{i}" for i in range(10)],
+        unknown4=[i for i in range(10)],
+        unknown5=[[] for _ in range(10)],
+        unknown6=[[] for _ in range(10)],
+        unknown7=bytes(range(0x1D)),
+        unknown8=["" for _ in range(100)],
+        unknown9="u9",
+    )
+    common_events = wb.WolfCommonEvents(events=[common_event], version=0x93, is_utf8=True)
+    common_events.write(basic_data_dir / "CommonEvent.dat")
+
+    # --- Data/BasicData/DataBase.project + DataBase.dat (v3.5, LZ4 压缩) ---
+    field_name = wb.Field(name="名前", type=0, index_info=wb._FIELD_STRING_START + 0)
+    record = wb.DataRecord(name="0", int_values=[], string_values=["ハロルド"])
+    actors_type = wb.DbType(
+        name="Actors",
+        fields=[field_name],
+        data=[record],
+        description="v3.5アクター定義",
+        field_type_list_size=1,
+    )
+    database = wb.WolfDatabase(types=[actors_type], version=0xC4, is_utf8=True)
+    database.write(basic_data_dir / "DataBase.project", basic_data_dir / "DataBase.dat")
+
+    return project_dir
+
+
+@pytest.fixture
+def wolf_project_v35(tmp_path: Path) -> Path:
+    return build_wolf_project_v35(tmp_path)
+
+
 @pytest.fixture
 def vxace_project(tmp_path: Path) -> Path:
     return build_vxace_project(tmp_path)
