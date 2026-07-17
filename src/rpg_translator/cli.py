@@ -6,6 +6,8 @@ from typing import Annotated
 
 import typer
 
+from rpg_translator.core.pipeline import UnknownEngineError, run_extract, run_inject
+
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -13,12 +15,10 @@ if sys.platform == "win32":
 app = typer.Typer(help="RPG Maker MV/MZ/VX Ace 文本提取/翻译/回填工具（开发调试用 CLI）")
 
 _NOT_IMPLEMENTED_MILESTONE = {
-    "extract": "M1",
-    "inject": "M1",
     "glossary": "M2",
     "translate": "M2",
     "qa": "M3",
-    "run": "M1",
+    "run": "M2",
 }
 
 
@@ -34,7 +34,12 @@ def extract(
     out: Annotated[Path, typer.Option(help="输出的 SQLite 数据库路径")] = Path("units.db"),
 ) -> None:
     """从游戏工程提取文本到 SQLite 数据库。"""
-    _not_implemented("extract")
+    try:
+        units = run_extract(project_dir, out)
+    except UnknownEngineError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    typer.echo(f"提取完成：{len(units)} 条文本，已写入 {out}")
 
 
 @app.command()
@@ -70,7 +75,12 @@ def inject(
     out: Annotated[Path, typer.Option(help="汉化版输出目录")] = Path("output"),
 ) -> None:
     """把翻译结果写回到新的输出目录。"""
-    _not_implemented("inject")
+    try:
+        units = run_inject(project, db, out)
+    except UnknownEngineError as e:
+        typer.echo(str(e), err=True)
+        raise typer.Exit(code=1) from e
+    typer.echo(f"写回完成：{len(units)} 条文本，输出到 {out}")
 
 
 @app.command()
