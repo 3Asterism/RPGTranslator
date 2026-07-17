@@ -1,12 +1,75 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+# PySide6 需要一个平台插件；测试机大多没有真实显示环境，用 offscreen。
+# 必须在任何 PySide6 导入之前设置。
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 _JSON_DUMP_KWARGS: dict[str, Any] = {"ensure_ascii": False, "separators": (",", ":")}
+_qsettings_tmp_dir = tempfile.TemporaryDirectory(prefix="rpg_translator_qsettings_")
+
+
+def _isolate_qsettings_from_real_registry() -> None:
+    """QSettings(org, app) 在 Windows 上默认写系统注册表（NativeFormat）。测试不应该
+    碰用户真实的注册表，这里强制改成 ini 文件格式，路径指到一个临时目录。"""
+    from PySide6.QtCore import QSettings
+
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, _qsettings_tmp_dir.name)
+
+
+_isolate_qsettings_from_real_registry()
+
+
+def _make_in_memory_keyring():
+    """set_deepseek_api_key() 会真的写 Windows 凭据管理器。测试不该碰用户真实的
+    系统凭据存储，这里换成一个纯内存的假 keyring backend。"""
+    from keyring.backend import KeyringBackend
+
+    class _InMemoryKeyring(KeyringBackend):
+        priority = 1  # type: ignore[assignment]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._store: dict[tuple[str, str], str] = {}
+
+        def get_password(self, service: str, username: str) -> str | None:
+            return self._store.get((service, username))
+
+        def set_password(self, service: str, username: str, password: str) -> None:
+            self._store[(service, username)] = password
+
+        def delete_password(self, service: str, username: str) -> None:
+            self._store.pop((service, username), None)
+
+    return _InMemoryKeyring()
+
+
+@pytest.fixture(autouse=True)
+def _fake_keyring_backend():
+    """每个测试都换一个全新的空白假 backend——避免某个测试写入的假凭据
+    （比如 SettingsDialog 测试里存的假 API Key）泄漏到其他测试，把真实
+    .env 里配置的 key 顶掉。"""
+    import keyring
+
+    keyring.set_keyring(_make_in_memory_keyring())
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
 
 
 @pytest.fixture

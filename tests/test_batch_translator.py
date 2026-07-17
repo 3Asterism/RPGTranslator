@@ -107,6 +107,24 @@ async def test_translate_units_respects_concurrency_limit(tmp_path: Path):
 
 
 @pytest.mark.anyio
+async def test_translate_units_reports_progress_via_callback(tmp_path: Path):
+    stub = _StubClient("翻译结果")
+    progress_calls: list[tuple[int, int]] = []
+    with Store(tmp_path / "units.db") as store:
+        units = [_make_unit(str(i), f"文本{i}") for i in range(3)]
+        store.upsert_units(units)
+
+        await translate_units(
+            stub, store, units, glossary={}, concurrency=2,
+            on_progress=lambda done, total: progress_calls.append((done, total)),
+        )
+
+        assert len(progress_calls) == 3
+        assert all(total == 3 for _, total in progress_calls)
+        assert {done for done, _ in progress_calls} == {1, 2, 3}
+
+
+@pytest.mark.anyio
 async def test_translate_units_dedups_same_source_text_to_one_llm_call(tmp_path: Path):
     stub = _StubClient("你好")
     with Store(tmp_path / "units.db") as store:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Callable
 
 from rpg_translator.codec.control_codes import protect, restore
 from rpg_translator.core.ir import TextUnit, compute_source_hash
@@ -32,8 +33,13 @@ async def translate_units(
     units: list[TextUnit],
     glossary: dict[str, str],
     concurrency: int = 4,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
-    """按 source_text 去重分组，相同原文只调用一次 LLM，结果写入翻译记忆表复用。"""
+    """按 source_text 去重分组，相同原文只调用一次 LLM，结果写入翻译记忆表复用。
+
+    on_progress(completed, total) 在每个去重分组翻译完成后调用一次，供 GUI 显示
+    "翻译批次 X/Y" 进度用（见 spec 第 10 节），不传则跳过。
+    """
     system_prompt = _build_system_prompt(glossary)
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -43,7 +49,11 @@ async def translate_units(
             continue
         groups.setdefault(unit.source_text, []).append(unit)
 
+    total = len(groups)
+    completed = 0
+
     async def _translate_group(source_text: str, group: list[TextUnit]) -> None:
+        nonlocal completed
         source_hash = compute_source_hash(source_text)
         cached = store.get_memory(source_hash)
         if cached is not None:
@@ -63,5 +73,9 @@ async def translate_units(
 
         for unit in group:
             store.update_translation(unit.id, translated_text, status="translated")
+
+        completed += 1
+        if on_progress is not None:
+            on_progress(completed, total)
 
     await asyncio.gather(*(_translate_group(text, group) for text, group in groups.items()))

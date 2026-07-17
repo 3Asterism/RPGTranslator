@@ -21,6 +21,9 @@ dev = [
 [project.scripts]
 rpg-translator = "rpg_translator.cli:app"
 
+[project.gui-scripts]
+rpg-translator-gui = "rpg_translator.gui.app:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

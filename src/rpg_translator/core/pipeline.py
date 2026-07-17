@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from rpg_translator.core.ir import TextUnit
 from rpg_translator.core.store import Store
@@ -73,6 +74,7 @@ async def run_translate(
     base_url: str,
     model: str,
     concurrency: int,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> list[TextUnit]:
     api_key = _require_api_key(api_key)
     with Store(db_path) as store:
@@ -80,7 +82,9 @@ async def run_translate(
         glossary = store.get_glossary()
         config = LLMConfig(api_key=api_key, base_url=base_url, model=model)
         async with LLMClient(config) as client:
-            await translate_units(client, store, pending, glossary, concurrency)
+            await translate_units(
+                client, store, pending, glossary, concurrency, on_progress=on_progress
+            )
         translated = store.list_units(status="translated")
     return translated
 
@@ -93,22 +97,40 @@ async def run_full(
     base_url: str,
     model: str,
     concurrency: int,
+    on_stage: Callable[[str], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> list[TextUnit]:
-    """extract -> 术语抽取 -> translate -> inject 完整链路。"""
+    """extract -> 术语抽取 -> translate -> inject 完整链路。
+
+    on_stage(message) 在阶段切换时调用一次；on_progress(completed, total) 在翻译阶段
+    每完成一个去重分组时调用一次。两者都是可选的，GUI 用它们驱动进度条/日志，CLI 不传。
+    """
     api_key = _require_api_key(api_key)
     adapter = detect_adapter(project_dir)
+
+    if on_stage is not None:
+        on_stage("提取中…")
     units = adapter.extract(project_dir)
 
     with Store(db_path) as store:
         store.upsert_units(units)
         config = LLMConfig(api_key=api_key, base_url=base_url, model=model)
         async with LLMClient(config) as client:
+            if on_stage is not None:
+                on_stage("术语抽取中…")
             glossary = await extract_glossary_candidates(client, units)
             store.set_glossary(glossary)
+
             pending = store.list_units(status="pending")
-            await translate_units(client, store, pending, glossary, concurrency)
+            if on_stage is not None:
+                on_stage(f"翻译中（共 {len(pending)} 条待译）…")
+            await translate_units(
+                client, store, pending, glossary, concurrency, on_progress=on_progress
+            )
         all_units = store.list_units()
 
+    if on_stage is not None:
+        on_stage("写回中…")
     adapter.inject(project_dir, all_units, output_dir)
     return all_units
 
