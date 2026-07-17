@@ -48,7 +48,15 @@ def glossary(
     settings = Settings()
     try:
         candidates = asyncio.run(
-            run_glossary(db, get_deepseek_api_key(), settings.deepseek_base_url, settings.deepseek_model)
+            run_glossary(
+                db,
+                get_deepseek_api_key(),
+                settings.deepseek_base_url,
+                settings.deepseek_model,
+                settings.fallback_api_key,
+                settings.fallback_base_url,
+                settings.fallback_model,
+            )
         )
     except MissingApiKeyError as e:
         typer.echo(str(e), err=True)
@@ -71,6 +79,9 @@ def translate(
                 settings.deepseek_base_url,
                 settings.deepseek_model,
                 concurrency,
+                fallback_api_key=settings.fallback_api_key,
+                fallback_base_url=settings.fallback_base_url,
+                fallback_model=settings.fallback_model,
             )
         )
     except MissingApiKeyError as e:
@@ -126,6 +137,9 @@ def run(
                 settings.deepseek_base_url,
                 settings.deepseek_model,
                 concurrency,
+                fallback_api_key=settings.fallback_api_key,
+                fallback_base_url=settings.fallback_base_url,
+                fallback_model=settings.fallback_model,
             )
         )
     except (UnknownEngineError, MissingApiKeyError) as e:

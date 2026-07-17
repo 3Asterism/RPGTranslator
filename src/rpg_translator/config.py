@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     concurrency: int = 4
     output_dir: str = "output"
 
+    # 可选的备用 provider：主 provider（DeepSeek）持续报瞬时错误（429/5xx/连接失败）
+    # 重试用尽后，LLMClient 会换到这一个继续用。不配置就只用主 provider，行为不变。
+    fallback_api_key: str | None = None
+    fallback_base_url: str | None = None
+    fallback_model: str | None = None
+
 
 def get_deepseek_api_key() -> str | None:
     """优先读系统凭据管理器（keyring），本地调试兜底读环境变量 DEEPSEEK_API_KEY。"""

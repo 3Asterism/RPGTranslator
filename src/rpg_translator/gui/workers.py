@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from rpg_translator.config import Settings
 from rpg_translator.core.pipeline import run_extract, run_glossary, run_inject, run_translate
 
 
@@ -34,9 +35,18 @@ class ExtractAndGlossaryWorker(QThread):
 
     def run(self) -> None:
         try:
+            settings = Settings()
             units = run_extract(self._project_dir, self._db_path)
             candidates = asyncio.run(
-                run_glossary(self._db_path, self._api_key, self._base_url, self._model)
+                run_glossary(
+                    self._db_path,
+                    self._api_key,
+                    self._base_url,
+                    self._model,
+                    settings.fallback_api_key,
+                    settings.fallback_base_url,
+                    settings.fallback_model,
+                )
             )
         except Exception as e:
             self.failed.emit(str(e))
@@ -74,6 +84,7 @@ class TranslateAndInjectWorker(QThread):
 
     def run(self) -> None:
         try:
+            settings = Settings()
             self.stage_changed.emit("翻译中…")
             asyncio.run(
                 run_translate(
@@ -83,6 +94,9 @@ class TranslateAndInjectWorker(QThread):
                     self._model,
                     self._concurrency,
                     on_progress=self.progress_changed.emit,
+                    fallback_api_key=settings.fallback_api_key,
+                    fallback_base_url=settings.fallback_base_url,
+                    fallback_model=settings.fallback_model,
                 )
             )
             self.stage_changed.emit("写回中…")

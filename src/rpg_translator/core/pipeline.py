@@ -7,12 +7,13 @@ from rpg_translator.core.ir import TextUnit
 from rpg_translator.core.store import Store
 from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.engines.mv_mz import MVAdapter, MZAdapter
+from rpg_translator.engines.vxace import VXAceAdapter
 from rpg_translator.translate.batch_translator import translate_units
 from rpg_translator.translate.glossary import extract_glossary_candidates
 from rpg_translator.translate.llm_client import LLMClient, LLMConfig
 from rpg_translator.translate.qa import ConflictRow, export_conflicts_csv, find_context_conflicts
 
-REGISTERED_ADAPTERS: list[type[EngineAdapter]] = [MVAdapter, MZAdapter]
+REGISTERED_ADAPTERS: list[type[EngineAdapter]] = [MVAdapter, MZAdapter, VXAceAdapter]
 
 
 class UnknownEngineError(Exception):
@@ -55,14 +56,38 @@ def _require_api_key(api_key: str | None) -> str:
     return api_key
 
 
+def _build_llm_configs(
+    api_key: str,
+    base_url: str,
+    model: str,
+    fallback_api_key: str | None = None,
+    fallback_base_url: str | None = None,
+    fallback_model: str | None = None,
+) -> list[LLMConfig]:
+    configs = [LLMConfig(api_key=api_key, base_url=base_url, model=model)]
+    if fallback_api_key and fallback_base_url and fallback_model:
+        configs.append(
+            LLMConfig(api_key=fallback_api_key, base_url=fallback_base_url, model=fallback_model)
+        )
+    return configs
+
+
 async def run_glossary(
-    db_path: Path, api_key: str | None, base_url: str, model: str
+    db_path: Path,
+    api_key: str | None,
+    base_url: str,
+    model: str,
+    fallback_api_key: str | None = None,
+    fallback_base_url: str | None = None,
+    fallback_model: str | None = None,
 ) -> dict[str, str]:
     api_key = _require_api_key(api_key)
     with Store(db_path) as store:
         units = store.list_units()
-        config = LLMConfig(api_key=api_key, base_url=base_url, model=model)
-        async with LLMClient(config) as client:
+        configs = _build_llm_configs(
+            api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
+        )
+        async with LLMClient(configs) as client:
             candidates = await extract_glossary_candidates(client, units)
         store.set_glossary(candidates)
     return candidates
@@ -75,13 +100,18 @@ async def run_translate(
     model: str,
     concurrency: int,
     on_progress: Callable[[int, int], None] | None = None,
+    fallback_api_key: str | None = None,
+    fallback_base_url: str | None = None,
+    fallback_model: str | None = None,
 ) -> list[TextUnit]:
     api_key = _require_api_key(api_key)
     with Store(db_path) as store:
         pending = store.list_units(status="pending")
         glossary = store.get_glossary()
-        config = LLMConfig(api_key=api_key, base_url=base_url, model=model)
-        async with LLMClient(config) as client:
+        configs = _build_llm_configs(
+            api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
+        )
+        async with LLMClient(configs) as client:
             await translate_units(
                 client, store, pending, glossary, concurrency, on_progress=on_progress
             )
@@ -99,6 +129,9 @@ async def run_full(
     concurrency: int,
     on_stage: Callable[[str], None] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    fallback_api_key: str | None = None,
+    fallback_base_url: str | None = None,
+    fallback_model: str | None = None,
 ) -> list[TextUnit]:
     """extract -> 术语抽取 -> translate -> inject 完整链路。
 
@@ -114,8 +147,10 @@ async def run_full(
 
     with Store(db_path) as store:
         store.upsert_units(units)
-        config = LLMConfig(api_key=api_key, base_url=base_url, model=model)
-        async with LLMClient(config) as client:
+        configs = _build_llm_configs(
+            api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
+        )
+        async with LLMClient(configs) as client:
             if on_stage is not None:
                 on_stage("术语抽取中…")
             glossary = await extract_glossary_candidates(client, units)

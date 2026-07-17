@@ -40,6 +40,22 @@ def test_extract_then_inject_roundtrip_via_cli(tmp_path, mz_project: Path):
     assert (output_dir / "data" / "System.json").is_file()
 
 
+def test_extract_then_inject_roundtrip_via_cli_vxace(tmp_path, vxace_project: Path):
+    db_path = tmp_path / "units.db"
+    output_dir = tmp_path / "output"
+
+    extract_result = runner.invoke(app, ["extract", str(vxace_project), "--out", str(db_path)])
+    assert extract_result.exit_code == 0
+    assert "提取完成" in extract_result.output
+
+    inject_result = runner.invoke(
+        app,
+        ["inject", "--db", str(db_path), "--project", str(vxace_project), "--out", str(output_dir)],
+    )
+    assert inject_result.exit_code == 0
+    assert (output_dir / "Data" / "Actors.rvdata2").is_file()
+
+
 def test_translate_without_api_key_exits_nonzero_with_clear_message(tmp_path, monkeypatch):
     monkeypatch.setattr("rpg_translator.cli.get_deepseek_api_key", lambda: None)
     db_path = tmp_path / "units.db"

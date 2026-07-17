@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Callable
+import re
+from typing import Callable, NamedTuple
 
 from rpg_translator.codec.control_codes import protect, restore
 from rpg_translator.core.ir import TextUnit, compute_source_hash
@@ -18,6 +19,17 @@ _TRANSLATE_SYSTEM_PROMPT_TEMPLATE = (
     "{glossary_section}"
 )
 
+# 一次请求最多打包多少条不同原文一起翻译。几万行文本量级下，一行一请求在时间和 token 成本
+# 上都不现实（每次请求都要重复付一遍 system prompt 的 token），打包成批次是主要的省钱手段，
+# 配合 DeepSeek 的 context caching（system prompt 不变，能吃到缓存折扣）。
+DEFAULT_BATCH_SIZE = 25
+
+_BATCH_INSTRUCTION = (
+    "请把下面编号的文本逐条翻译成简体中文。每条译文必须以 [编号] 开头另起一行，"
+    "编号要和输入的编号一一对应，不要合并、不要跳号、不要输出编号以外的任何解释性文字。"
+)
+_ITEM_MARKER_RE = re.compile(r"^\[(\d+)\]\s*", re.MULTILINE)
+
 
 def _build_system_prompt(glossary: dict[str, str]) -> str:
     if not glossary:
@@ -27,6 +39,50 @@ def _build_system_prompt(glossary: dict[str, str]) -> str:
     return _TRANSLATE_SYSTEM_PROMPT_TEMPLATE.format(glossary_section=glossary_section)
 
 
+class _Job(NamedTuple):
+    source_text: str
+    group: list[TextUnit]
+    protected_text: str
+    mapping: dict[str, str]
+    context: str
+
+
+def _build_single_user_prompt(protected_text: str, context: str) -> str:
+    if context:
+        return f"上下文：\n{context}\n\n待翻译文本：\n{protected_text}"
+    return f"待翻译文本：\n{protected_text}"
+
+
+def _build_batch_user_prompt(items: list[_Job]) -> str:
+    parts = [_BATCH_INSTRUCTION]
+    for i, job in enumerate(items, start=1):
+        if job.context:
+            parts.append(f"[{i}] 上下文：{job.context}\n待翻译：{job.protected_text}")
+        else:
+            parts.append(f"[{i}] 待翻译：{job.protected_text}")
+    return "\n\n".join(parts)
+
+
+def _parse_batch_response(response: str, expected_count: int) -> dict[int, str] | None:
+    matches = list(_ITEM_MARKER_RE.finditer(response))
+    if len(matches) != expected_count:
+        return None
+
+    result: dict[int, str] = {}
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(response)
+        try:
+            index = int(m.group(1))
+        except ValueError:
+            return None
+        result[index] = response[start:end].strip()
+
+    if set(result.keys()) != set(range(1, expected_count + 1)):
+        return None
+    return result
+
+
 async def translate_units(
     client: LLMClient,
     store: Store,
@@ -34,8 +90,10 @@ async def translate_units(
     glossary: dict[str, str],
     concurrency: int = 4,
     on_progress: Callable[[int, int], None] | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> None:
-    """按 source_text 去重分组，相同原文只调用一次 LLM，结果写入翻译记忆表复用。
+    """按 source_text 去重分组，相同原文只调用一次 LLM；多个不同分组打包进同一次请求
+    （见 batch_size），减少大文本量下的请求数和重复的 system prompt token 开销。
 
     on_progress(completed, total) 在每个去重分组翻译完成后调用一次，供 GUI 显示
     "翻译批次 X/Y" 进度用（见 spec 第 10 节），不传则跳过。
@@ -49,33 +107,57 @@ async def translate_units(
             continue
         groups.setdefault(unit.source_text, []).append(unit)
 
-    total = len(groups)
-    completed = 0
-
-    async def _translate_group(source_text: str, group: list[TextUnit]) -> None:
-        nonlocal completed
-        source_hash = compute_source_hash(source_text)
-        cached = store.get_memory(source_hash)
+    jobs: list[_Job] = []
+    cache_hits: list[tuple[list[TextUnit], str]] = []
+    for source_text, group in groups.items():
+        cached = store.get_memory(compute_source_hash(source_text))
         if cached is not None:
-            translated_text = cached
+            cache_hits.append((group, cached))
         else:
             protected_text, mapping = protect(source_text)
-            representative = group[0]
-            if representative.context:
-                user_prompt = f"上下文：\n{representative.context}\n\n待翻译文本：\n{protected_text}"
-            else:
-                user_prompt = f"待翻译文本：\n{protected_text}"
+            jobs.append(_Job(source_text, group, protected_text, mapping, group[0].context))
 
-            async with semaphore:
-                raw_translation = await client.chat(system_prompt, user_prompt)
-            translated_text = restore(raw_translation.strip(), mapping)
-            store.set_memory(source_hash, source_text, translated_text)
+    total = len(jobs) + len(cache_hits)
+    completed = 0
 
+    def _write_result(group: list[TextUnit], translated_text: str) -> None:
+        nonlocal completed
         for unit in group:
             store.update_translation(unit.id, translated_text, status="translated")
-
         completed += 1
         if on_progress is not None:
             on_progress(completed, total)
 
-    await asyncio.gather(*(_translate_group(text, group) for text, group in groups.items()))
+    for group, cached in cache_hits:
+        _write_result(group, cached)
+
+    async def _translate_single_job(job: _Job) -> None:
+        user_prompt = _build_single_user_prompt(job.protected_text, job.context)
+        async with semaphore:
+            raw = await client.chat(system_prompt, user_prompt)
+        translated_text = restore(raw.strip(), job.mapping)
+        store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
+        _write_result(job.group, translated_text)
+
+    async def _translate_batch(batch: list[_Job]) -> None:
+        if len(batch) == 1:
+            await _translate_single_job(batch[0])
+            return
+
+        user_prompt = _build_batch_user_prompt(batch)
+        async with semaphore:
+            raw = await client.chat(system_prompt, user_prompt)
+
+        parsed = _parse_batch_response(raw, len(batch))
+        if parsed is None:
+            # 模型没按格式回，退化成逐条调用，保证正确性（牺牲这一批的省 token 收益）
+            await asyncio.gather(*(_translate_single_job(job) for job in batch))
+            return
+
+        for i, job in enumerate(batch, start=1):
+            translated_text = restore(parsed[i], job.mapping)
+            store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
+            _write_result(job.group, translated_text)
+
+    batches = [jobs[i : i + batch_size] for i in range(0, len(jobs), batch_size)]
+    await asyncio.gather(*(_translate_batch(batch) for batch in batches))

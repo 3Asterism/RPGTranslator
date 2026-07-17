@@ -5,6 +5,7 @@ __pycache__/
 *.db
 dist/
 build/
+*.spec
 *.egg-info/
 output/
 .idea/

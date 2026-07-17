@@ -28,6 +28,17 @@ def test_drop_recognized_mz_project_enables_start_and_shows_engine(qapp, mz_proj
     assert "14" in window._info_label.text()  # mz_project fixture 固定能扫出 14 条
 
 
+def test_drop_recognized_vxace_project_enables_start_and_shows_engine(qapp, vxace_project: Path):
+    window = MainWindow()
+    window._on_path_dropped(vxace_project)
+
+    assert window._start_button.isEnabled() is True
+    assert window._adapter is not None
+    assert window._adapter.engine_name == "vxace"
+    assert "RPG Maker VX Ace" in window._info_label.text()
+    assert "11" in window._info_label.text()  # vxace_project fixture 固定能扫出 11 条
+
+
 def test_drop_unrecognized_dir_keeps_start_disabled(qapp, tmp_path: Path):
     not_a_game = tmp_path / "not_a_game"
     not_a_game.mkdir()
@@ -107,9 +118,10 @@ def test_extract_and_glossary_worker_end_to_end(qapp, tmp_path: Path, mz_project
     worker.failed.connect(errors.append)
 
     worker.start()
-    worker.wait(60_000)
+    finished_in_time = worker.wait(120_000)
     qapp.processEvents()
 
+    assert finished_in_time, "worker 线程 120s 内没跑完（真实 API 调用异常慢，或线程卡住了）"
     assert errors == []
     assert len(results) == 1
     candidates, unit_count = results[0]
@@ -152,9 +164,10 @@ def test_translate_and_inject_worker_end_to_end(qapp, tmp_path: Path, mz_project
     worker.failed.connect(errors.append)
 
     worker.start()
-    worker.wait(120_000)
+    finished_in_time = worker.wait(180_000)
     qapp.processEvents()
 
+    assert finished_in_time, "worker 线程 180s 内没跑完（真实 API 调用异常慢，或线程卡住了）"
     assert errors == []
     assert len(results) == 1
     unit_count, out_dir = results[0]

@@ -228,6 +228,155 @@ def build_mv_project(root: Path) -> Path:
     return project_dir
 
 
+def build_vxace_project(root: Path) -> Path:
+    from rubymarshal.classes import RubyObject
+    from rubymarshal.writer import writes
+
+    def _write_rv(path: Path, obj: Any) -> None:
+        path.write_bytes(writes(obj))
+
+    data_dir = root / "vxace_project" / "Data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    page_list = [
+        RubyObject("RPG::EventCommand", {"@code": 401, "@indent": 0, "@parameters": ["こんにちは、旅人よ。"]}),
+        RubyObject("RPG::EventCommand", {"@code": 401, "@indent": 0, "@parameters": ["この村へようこそ。"]}),
+        RubyObject(
+            "RPG::EventCommand",
+            {"@code": 102, "@indent": 0, "@parameters": [["はい", "いいえ"], 1, 0, 2, 0]},
+        ),
+        RubyObject("RPG::EventCommand", {"@code": 108, "@indent": 0, "@parameters": ["plugin:config=1"]}),
+        RubyObject("RPG::EventCommand", {"@code": 320, "@indent": 0, "@parameters": [1, "勇者"]}),
+        RubyObject("RPG::EventCommand", {"@code": 355, "@indent": 0, "@parameters": ["puts 'ok'"]}),
+        RubyObject("RPG::EventCommand", {"@code": 0, "@indent": 0, "@parameters": []}),
+    ]
+    page = RubyObject(
+        "RPG::Event::Page",
+        {
+            "@condition": RubyObject("RPG::Event::Page::Condition", {}),
+            "@graphic": RubyObject("RPG::Event::Page::Graphic", {}),
+            "@move_type": 0,
+            "@move_speed": 3,
+            "@move_frequency": 3,
+            "@move_route": RubyObject("RPG::MoveRoute", {"@list": [], "@repeat": True}),
+            "@walk_anime": True,
+            "@step_anime": False,
+            "@direction_fix": False,
+            "@through": False,
+            "@priority_type": 1,
+            "@trigger": 0,
+            "@list": page_list,
+        },
+    )
+    event = RubyObject("RPG::Event", {"@id": 1, "@name": "EV001", "@x": 1, "@y": 1, "@pages": [page]})
+    game_map = RubyObject(
+        "RPG::Map",
+        {
+            "@tileset_id": 1,
+            "@width": 5,
+            "@height": 5,
+            "@scroll_type": 0,
+            "@specify_battleback": False,
+            "@battleback1_name": "",
+            "@battleback2_name": "",
+            "@autoplay_bgm": False,
+            "@bgm": RubyObject("RPG::BGM", {}),
+            "@autoplay_bgs": False,
+            "@bgs": RubyObject("RPG::BGS", {}),
+            "@disable_dashing": False,
+            "@encounter_list": [],
+            "@encounter_step": 30,
+            "@parallax_name": "",
+            "@parallax_loop_x": False,
+            "@parallax_loop_y": False,
+            "@parallax_sx": 0,
+            "@parallax_sy": 0,
+            "@parallax_show": True,
+            "@note": "",
+            "@data": [0] * (5 * 5 * 3),
+            "@events": {1: event},
+            "@display_name": "",
+        },
+    )
+    _write_rv(data_dir / "Map001.rvdata2", game_map)
+
+    common_events = [
+        None,
+        RubyObject(
+            "RPG::CommonEvent",
+            {
+                "@id": 1,
+                "@name": "CE001",
+                "@trigger": 0,
+                "@switch_id": 1,
+                "@list": [
+                    RubyObject(
+                        "RPG::EventCommand",
+                        {"@code": 401, "@indent": 0, "@parameters": ["共通イベントのテキストです。"]},
+                    ),
+                    RubyObject(
+                        "RPG::EventCommand", {"@code": 108, "@indent": 0, "@parameters": ["comment only"]}
+                    ),
+                    RubyObject("RPG::EventCommand", {"@code": 0, "@indent": 0, "@parameters": []}),
+                ],
+            },
+        ),
+    ]
+    _write_rv(data_dir / "CommonEvents.rvdata2", common_events)
+
+    actors = [
+        None,
+        RubyObject(
+            "RPG::Actor",
+            {
+                "@id": 1,
+                "@name": "ハロルド",
+                "@nickname": "鍛冶屋",
+                "@class_id": 1,
+                "@note": "<param:1>\n<hidden>",
+                "@description": "村の鍛冶屋。",
+                "@icon_index": 0,
+                "@features": [],
+                "@initial_level": 1,
+                "@max_level": 99,
+                "@character_name": "",
+                "@character_index": 0,
+                "@face_name": "",
+                "@face_index": 0,
+                "@equips": [0, 0, 0, 0, 0],
+            },
+        ),
+        RubyObject(
+            "RPG::Actor",
+            {
+                "@id": 2,
+                "@name": "アリス",
+                "@nickname": "",
+                "@class_id": 2,
+                "@note": "実は主人公の姉。<flag:true>",
+                "@description": "",
+                "@icon_index": 0,
+                "@features": [],
+                "@initial_level": 1,
+                "@max_level": 99,
+                "@character_name": "",
+                "@character_index": 0,
+                "@face_name": "",
+                "@face_index": 0,
+                "@equips": [0, 0, 0, 0, 0],
+            },
+        ),
+    ]
+    _write_rv(data_dir / "Actors.rvdata2", actors)
+
+    return data_dir.parent
+
+
+@pytest.fixture
+def vxace_project(tmp_path: Path) -> Path:
+    return build_vxace_project(tmp_path)
+
+
 @pytest.fixture
 def mz_project(tmp_path: Path) -> Path:
     return build_mz_project(tmp_path)
