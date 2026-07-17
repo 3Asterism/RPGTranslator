@@ -372,6 +372,149 @@ def build_vxace_project(root: Path) -> Path:
     return data_dir.parent
 
 
+def build_wolf_project(root: Path) -> Path:
+    """Hand-built synthetic WOLF RPG Editor project, matching the byte layout
+    documented in rpg_translator.engines.wolf_binary (itself cross-checked
+    against three independent community reverse-engineering efforts -- see
+    that module's docstring). No real WOLF project was available to diff
+    against for this milestone, so this fixture is the only thing
+    tests/test_engines_wolf.py can validate the parser/serializer against;
+    it deliberately exercises: Message/Choices text extraction, a
+    Comment command that must NOT be extracted (mirrors this codebase's
+    existing "skip comment commands" convention), a Move command carrying an
+    embedded route list (to prove that structural path round-trips even
+    though it holds no translatable text), a page-level route list, a
+    CommonEvent with all of its "unknown"/opaque blocks populated with
+    non-trivial (not all-zero) values (to prove they round-trip byte-exact
+    rather than accidentally passing because they were empty), and a
+    Database type exercising the "skip empty string", "skip string
+    containing a newline" and "skip type!=0 string field" extraction
+    heuristics side by side.
+    """
+    from rpg_translator.engines import wolf_binary as wb
+
+    project_dir = root / "wolf_project"
+    data_dir = project_dir / "Data"
+    basic_data_dir = data_dir / "BasicData"
+    map_data_dir = data_dir / "MapData"
+    basic_data_dir.mkdir(parents=True, exist_ok=True)
+    map_data_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Data/MapData/Map001.mps ------------------------------------------
+    width, height = 5, 5
+    move_command = wb.Command(
+        cid=201,
+        args=[0, 0],
+        indent=0,
+        string_args=[],
+        move_extra=wb.MoveExtra(
+            unknown=[1, 2, 3, 4, 5],
+            flags=7,
+            route=[wb.RouteCommand(command_id=1, args=[0])],
+        ),
+    )
+    page = wb.Page(
+        unknown1=0,
+        graphic_name="",
+        graphic_direction=2,
+        graphic_frame=0,
+        graphic_opacity=255,
+        graphic_render_mode=0,
+        conditions=bytes(wb._CONDITIONS_SIZE),
+        movement=bytes(wb._MOVEMENT_SIZE),
+        flags=0,
+        route_flags=0,
+        route=[wb.RouteCommand(command_id=2, args=[3, 4])],
+        commands=[
+            wb.Command(cid=101, args=[0, 0, 0], indent=0, string_args=["こんにちは、旅人よ。"]),
+            wb.Command(cid=101, args=[0, 0, 0], indent=0, string_args=["この村へようこそ。"]),
+            wb.Command(cid=102, args=[1, 0, 2, 0], indent=0, string_args=["はい", "いいえ"]),
+            wb.Command(cid=103, args=[], indent=0, string_args=["plugin:config=1"]),
+            move_command,
+            wb.Command(cid=0, args=[], indent=0, string_args=[]),
+        ],
+        shadow_graphic_num=0,
+        collision_width=0,
+        collision_height=0,
+    )
+    event = wb.Event(event_id=0, name="EV001", x=1, y=1, pages=[page])
+    game_map = wb.WolfMap(
+        tileset_id=1,
+        width=width,
+        height=height,
+        tiles=bytes(width * height * 3 * 4),
+        events=[event],
+        header_stamp="なし",
+    )
+    game_map.write(map_data_dir / "Map001.mps")
+
+    # --- Data/BasicData/CommonEvent.dat ------------------------------------
+    common_event = wb.CommonEvent(
+        event_id=0,
+        unknown1=1,
+        unknown2=bytes([1, 2, 3, 4, 5, 6, 7]),
+        name="CE001",
+        commands=[
+            wb.Command(cid=101, args=[0, 0, 0], indent=0, string_args=["共通イベントのテキストです。"]),
+            wb.Command(cid=103, args=[], indent=0, string_args=["comment only"]),
+            wb.Command(cid=0, args=[], indent=0, string_args=[]),
+        ],
+        unknown11="stamp11",
+        description="テスト用共通イベント",
+        unknown3=[f"u3-{i}" for i in range(10)],
+        unknown4=[i for i in range(10)],
+        unknown5=[[f"u5-{i}-{j}" for j in range(i % 3)] for i in range(10)],
+        unknown6=[[i, i + 1] if i % 2 == 0 else [] for i in range(10)],
+        unknown7=bytes(range(0x1D)),
+        unknown8=[f"u8-{i}" if i < 3 else "" for i in range(100)],
+        unknown9="u9",
+        unknown10="u10",
+        unknown12=42,
+    )
+    common_events = wb.WolfCommonEvents(events=[common_event])
+    common_events.write(basic_data_dir / "CommonEvent.dat")
+
+    # --- Data/BasicData/DataBase.project + DataBase.dat --------------------
+    field_name = wb.Field(name="名前", type=0, index_info=wb._FIELD_STRING_START + 0)
+    field_level = wb.Field(name="レベル", type=0, index_info=wb._FIELD_INT_START + 0)
+    field_desc = wb.Field(name="説明", type=0, index_info=wb._FIELD_STRING_START + 1)
+    field_ref = wb.Field(name="参照名", type=1, index_info=wb._FIELD_STRING_START + 2)
+    fields = [field_name, field_level, field_desc, field_ref]
+
+    record_harold = wb.DataRecord(
+        name="0",
+        int_values=[5],
+        string_values=["ハロルド", "村の鍛冶屋。", "normal"],
+    )
+    record_alice = wb.DataRecord(
+        name="1",
+        int_values=[1],
+        string_values=["アリス", "", "hidden"],  # empty description -> not extracted
+    )
+    record_multiline = wb.DataRecord(
+        name="2",
+        int_values=[10],
+        string_values=["剣士", "1行目\n2行目", "normal"],  # newline -> not extracted
+    )
+
+    actors_type = wb.DbType(
+        name="Actors",
+        fields=fields,
+        data=[record_harold, record_alice, record_multiline],
+        description="アクター定義",
+        field_type_list_size=8,
+    )
+    database = wb.WolfDatabase(types=[actors_type])
+    database.write(basic_data_dir / "DataBase.project", basic_data_dir / "DataBase.dat")
+
+    return project_dir
+
+
+@pytest.fixture
+def wolf_project(tmp_path: Path) -> Path:
+    return build_wolf_project(tmp_path)
+
+
 @pytest.fixture
 def vxace_project(tmp_path: Path) -> Path:
     return build_vxace_project(tmp_path)

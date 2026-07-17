@@ -21,16 +21,16 @@ def test_vxace_not_detected_on_unrelated_dir(tmp_path: Path):
     assert VXAceAdapter.detect(tmp_path) is False
 
 
-def test_vxace_extract_finds_dialogue_and_choices(vxace_project: Path):
+def test_vxace_extract_merges_consecutive_show_text_lines_into_one_unit(vxace_project: Path):
+    """VX Ace 消息框不自动换行且固定 4 行，同一条 Show Text 的连续行要合并成一个
+    段落一起翻译（spec 第 9 节），不能逐行翻译——否则译文长度和原文行数对不上会溢出。"""
     units = VXAceAdapter().extract(vxace_project)
     file_path = "Data/Map001.rvdata2"
     prefix = "@events/1/@pages/0/@list"
 
-    line1 = _by_locator(units, file_path, f"{prefix}/0/@parameters/0")
-    assert line1.source_text == "こんにちは、旅人よ。"
-
-    line2 = _by_locator(units, file_path, f"{prefix}/1/@parameters/0")
-    assert line2.source_text == "この村へようこそ。"
+    message = _by_locator(units, file_path, f"{prefix}/0/@parameters/0")
+    assert message.source_text == "こんにちは、旅人よ。\nこの村へようこそ。"
+    assert message.extra_locators == [f"{prefix}/1/@parameters/0"]
 
     choice0 = _by_locator(units, file_path, f"{prefix}/2/@parameters/0/0")
     choice1 = _by_locator(units, file_path, f"{prefix}/2/@parameters/0/1")
@@ -91,11 +91,13 @@ def test_vxace_extract_skips_empty_fields(vxace_project: Path):
 
 def test_vxace_extract_context_includes_sibling_dialogue(vxace_project: Path):
     units = VXAceAdapter().extract(vxace_project)
-    line1 = _by_locator(
+    message = _by_locator(
         units, "Data/Map001.rvdata2", "@events/1/@pages/0/@list/0/@parameters/0"
     )
-    assert "この村へようこそ。" in line1.context
-    assert line1.source_text not in line1.context
+    # 两行 Show Text 已经合并进 message 自己的 source_text，context 里不该再重复出现；
+    # 但同一页里其他命令（改名）仍然算作 sibling context。
+    assert "勇者" in message.context
+    assert message.source_text not in message.context
 
 
 def _all_rvdata2_files(root: Path) -> list[Path]:
@@ -117,6 +119,35 @@ def test_m4_roundtrip_untranslated_inject_is_byte_identical(tmp_path: Path, vxac
         original_bytes = (vxace_project / rel).read_bytes()
         output_bytes = (output_dir / rel).read_bytes()
         assert output_bytes == original_bytes, f"{rel} differs after untranslated round trip"
+
+
+def test_vxace_inject_rewraps_translated_paragraph_across_original_line_slots(
+    tmp_path: Path, vxace_project: Path
+):
+    """译文按估算宽度重新分行后，要按顺序塞回原来两行 Show Text 各自的 locator——
+    不是简单整段塞进第一行（spec 9.2.a 的简单换行方案）。"""
+    adapter = VXAceAdapter()
+    units = adapter.extract(vxace_project)
+
+    message = _by_locator(
+        units, "Data/Map001.rvdata2", "@events/1/@pages/0/@list/0/@parameters/0"
+    )
+    # 26 个全角字符，超过 DEFAULT_LINE_WIDTH_UNITS=24，必须换到第二行
+    message.translated_text = "你好，旅人啊，欢迎来到这个小小的村庄里居住吧"
+
+    output_dir = tmp_path / "output"
+    adapter.inject(vxace_project, units, output_dir)
+
+    from rpg_translator.codec.rvdata2_codec import read_rvdata2
+
+    translated_map = read_rvdata2(output_dir / "Data" / "Map001.rvdata2")
+    page_list = translated_map.attributes["@events"][1].attributes["@pages"][0].attributes["@list"]
+    line0 = str(page_list[0].attributes["@parameters"][0])
+    line1 = str(page_list[1].attributes["@parameters"][0])
+
+    assert line0 + line1 == message.translated_text
+    assert line0 != message.translated_text  # 确认真的拆成了两行，不是塞进第一行完事
+    assert line1 != ""
 
 
 def test_vxace_inject_changes_only_the_targeted_value(tmp_path: Path, vxace_project: Path):

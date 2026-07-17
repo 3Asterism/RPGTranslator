@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import unicodedata
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -16,6 +17,50 @@ from rpg_translator.core.ir import EngineName, TextUnit, compute_text_unit_id
 from rpg_translator.engines.base import EngineAdapter
 
 _PURE_TAG_NOTE_RE = re.compile(r"^(\s*<[^<>\r\n]+>\s*)+$")
+
+# VX Ace 默认消息框（544px 宽，减去左右留白，默认字号 22）大约能塞下这么多"半角宽度单位"
+# 每行——这是没有真机可测下的估算值，不是精确像素计算，仅用于 spec 9.2.a 的简单重新分行
+# 方案；真要精确必须走 9.2.b 的运行时像素宽度补丁。
+DEFAULT_LINE_WIDTH_UNITS = 24
+
+
+def _char_width(ch: str) -> int:
+    """中日韩全角字符按 2 倍宽度估算，其余（含半角假名、英文数字）按 1 倍。"""
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def rewrap_paragraph(text: str, line_count: int, max_width: int = DEFAULT_LINE_WIDTH_UNITS) -> list[str]:
+    """把 text 按估算宽度贪心重新分行，塞进恰好 line_count 行。
+
+    最后一行如果还装不下剩余文本，宁可超宽（游戏内可能视觉裁切）也不截断丢字——
+    丢译文比溢出更糟，溢出至少玩家还能看到大部分内容。
+    """
+    line_count = max(line_count, 1)
+    chars = list(text.replace("\r\n", "\n").replace("\n", ""))
+
+    lines: list[str] = []
+    current = ""
+    current_width = 0
+    i = 0
+    while i < len(chars):
+        if len(lines) == line_count - 1:
+            current += "".join(chars[i:])
+            break
+        ch = chars[i]
+        w = _char_width(ch)
+        if current and current_width + w > max_width:
+            lines.append(current)
+            current = ""
+            current_width = 0
+            continue
+        current += ch
+        current_width += w
+        i += 1
+    lines.append(current)
+
+    while len(lines) < line_count:
+        lines.append("")
+    return lines
 
 
 def is_pure_tag_note(text: str) -> bool:
@@ -63,22 +108,55 @@ def locator_set(root: Any, locator: str, value: Any) -> None:
 
 
 class PendingUnit:
-    __slots__ = ("locator", "source_text", "context_group")
+    __slots__ = ("locator", "source_text", "context_group", "extra_locators")
 
-    def __init__(self, locator: str, source_text: str, context_group: str):
+    def __init__(
+        self,
+        locator: str,
+        source_text: str,
+        context_group: str,
+        extra_locators: list[str] | None = None,
+    ):
         self.locator = locator
         self.source_text = source_text
         self.context_group = context_group
+        self.extra_locators = extra_locators or []
 
 
 def extract_command_list(
     commands: list[RubyObject], path_prefix: str, group: str
 ) -> list[PendingUnit]:
     found: list[PendingUnit] = []
-    for i, cmd in enumerate(commands):
+    i = 0
+    n = len(commands)
+    while i < n:
+        cmd = commands[i]
         code = cmd.attributes.get("@code")
         params = cmd.attributes.get("@parameters", [])
-        if code in (401, 405):
+        if code == 401:
+            # VX Ace/XP/VX のメッセージ窓は自動改行しない固定 4 行仕様なので、同じ
+            # Show Text 命令が続く行は合体させて 1 段落として翻訳に出す（逐行翻訳しない、
+            # spec 第 9 節）。inject 側で訳文を推定幅で再改行して元の行数に配り直す。
+            run_start = i
+            lines: list[str] = []
+            locators: list[str] = []
+            while i < n:
+                run_cmd = commands[i]
+                if run_cmd.attributes.get("@code") != 401:
+                    break
+                run_params = run_cmd.attributes.get("@parameters", [])
+                lines.append(str(run_params[0]) if run_params else "")
+                locators.append(f"{path_prefix}/{i}/@parameters/0")
+                i += 1
+            source_text = "\n".join(lines)
+            if source_text.strip():
+                found.append(
+                    PendingUnit(locators[0], source_text, group, extra_locators=locators[1:])
+                )
+            continue
+        if code == 405:
+            # Show Scrolling Text はスクロール表示で 4 行固定枠の制限が無いため、
+            # 401 と違い合体させず 1 行ずつ独立した TextUnit のまま扱う。
             if params and str(params[0]):
                 found.append(PendingUnit(f"{path_prefix}/{i}/@parameters/0", str(params[0]), group))
         elif code == 102:
@@ -93,6 +171,7 @@ def extract_command_list(
                 found.append(PendingUnit(f"{path_prefix}/{i}/@parameters/1", str(params[1]), group))
         # code 101 はヘッダーのみで話者名パラメータなし（MZ 独自機能）
         # 108/408 (Comment)・355/655 (Script) はデフォルトで無視（MV/MZ と同じ方針）
+        i += 1
     return found
 
 
@@ -201,6 +280,7 @@ class RGSSAdapterBase(EngineAdapter):
                         locator=p.locator,
                         context=context,
                         source_text=p.source_text,
+                        extra_locators=p.extra_locators,
                     )
                 )
         return units
@@ -216,6 +296,24 @@ class RGSSAdapterBase(EngineAdapter):
             full_path = output_dir / rel_path
             root = read_rvdata2(full_path)
             for unit in file_units:
-                value = unit.translated_text if unit.translated_text is not None else unit.source_text
-                locator_set(root, unit.locator, value)
+                if unit.extra_locators:
+                    slot_locators = [unit.locator, *unit.extra_locators]
+                    if unit.translated_text is not None:
+                        lines = rewrap_paragraph(unit.translated_text, len(slot_locators))
+                    else:
+                        # 还没翻译：原样按原始换行拆回各行，保证未翻译回填和原工程
+                        # 逐字节一致（M1/M4 的回归校验），不能套重新分行逻辑。
+                        lines = unit.source_text.split("\n")
+                        if len(lines) < len(slot_locators):
+                            lines += [""] * (len(slot_locators) - len(lines))
+                        elif len(lines) > len(slot_locators):
+                            extra = "\n".join(lines[len(slot_locators) - 1 :])
+                            lines = lines[: len(slot_locators) - 1] + [extra]
+                    for slot_locator, line in zip(slot_locators, lines):
+                        locator_set(root, slot_locator, line)
+                else:
+                    value = (
+                        unit.translated_text if unit.translated_text is not None else unit.source_text
+                    )
+                    locator_set(root, unit.locator, value)
             write_rvdata2(full_path, root)
