@@ -11,7 +11,7 @@ from rpg_translator.gui.main_window import (
     default_output_dir,
     resolve_dropped_path,
 )
-from rpg_translator.gui.settings_dialog import SettingsDialog
+from rpg_translator.gui.settings_dialog import ENGINE_LOCAL, ENGINE_ONLINE, SettingsDialog
 from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker
 
 
@@ -273,6 +273,46 @@ def test_settings_dialog_base_url_falls_back_to_env_default_when_unset(qapp):
 
     dialog = SettingsDialog()
     assert dialog.base_url == Settings().deepseek_base_url
+
+
+def test_settings_dialog_selecting_online_engine_shows_online_box(qapp):
+    # 注意：用 isHidden() 不用 isVisible()——对话框本身没 show() 过，子控件的
+    # isVisible() 恒为 False（依赖祖先是否可见），isHidden() 才反映 setVisible()
+    # 设置的"显式隐藏"标记，不受父窗口有没有 show() 影响。
+    #
+    # QSettings 在这个测试套件里是跨测试共享的同一个临时 ini 文件（见 conftest.py），
+    # 不会在每个测试前自动清空，所以这里显式选中"在线"而不是依赖"默认就是在线"——
+    # 不然如果先跑了别的把引擎切成本地的测试，这里会因为残留状态而失败。
+    dialog = SettingsDialog()
+    online_index = dialog._engine_combo.findData(ENGINE_ONLINE)
+    dialog._engine_combo.setCurrentIndex(online_index)
+    assert not dialog._online_box.isHidden()
+    assert dialog._local_box.isHidden()
+
+    dialog._on_accept()
+    assert SettingsDialog().engine == ENGINE_ONLINE
+
+
+def test_settings_dialog_persists_local_engine_config(qapp):
+    """本地模型（比如 Ollama 部署的 Sakura）走单独一套配置，切换引擎后要能存住
+    并在重开设置对话框后读回来，跟在线 provider 的字段互不干扰。"""
+    dialog = SettingsDialog()
+    index = dialog._engine_combo.findData(ENGINE_LOCAL)
+    dialog._engine_combo.setCurrentIndex(index)
+    assert not dialog._local_box.isHidden()
+    assert dialog._online_box.isHidden()
+
+    dialog._local_base_url_edit.setText("http://192.168.1.10:11434/v1")
+    dialog._local_model_edit.setText("sakura-galtransl")
+
+    dialog._on_accept()
+
+    reloaded = SettingsDialog()
+    assert reloaded.engine == ENGINE_LOCAL
+    assert reloaded.local_base_url == "http://192.168.1.10:11434/v1"
+    assert reloaded.local_model == "sakura-galtransl"
+    # 在线引擎切走之后 fallback 的说明框应该隐藏，不误导用户以为本地引擎也有故障转移
+    assert reloaded._fallback_box.isHidden()
 
 
 def test_extract_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):

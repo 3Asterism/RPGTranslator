@@ -11,6 +11,7 @@ load_dotenv()
 _KEYRING_SERVICE = "rpg_translator"
 _KEYRING_USERNAME = "deepseek_api_key"
 _KEYRING_FALLBACK_USERNAME = "fallback_api_key"
+_KEYRING_LOCAL_USERNAME = "local_api_key"
 
 
 class Settings(BaseSettings):
@@ -50,3 +51,16 @@ def get_fallback_api_key() -> str | None:
 
 def set_fallback_api_key(key: str) -> None:
     keyring.set_password(_KEYRING_SERVICE, _KEYRING_FALLBACK_USERNAME, key)
+
+
+def get_local_api_key() -> str | None:
+    """本地 provider（比如 Ollama）的 Key，大多数本地服务不校验，留空也能用——
+    这里同样走 keyring，只是给极少数需要认证的本地/内网代理场景留个口子。"""
+    key = keyring.get_password(_KEYRING_SERVICE, _KEYRING_LOCAL_USERNAME)
+    if key:
+        return key
+    return os.environ.get("LOCAL_API_KEY")
+
+
+def set_local_api_key(key: str) -> None:
+    keyring.set_password(_KEYRING_SERVICE, _KEYRING_LOCAL_USERNAME, key)

@@ -182,7 +182,7 @@ class PromptStrategy:
     wrap_control_codes: bool = True
 
 
-_DEFAULT_STRATEGY = PromptStrategy(
+DEFAULT_PROMPT_STRATEGY = PromptStrategy(
     system_prompt=_TRANSLATE_SYSTEM_PROMPT,
     build_single_prompt=_build_single_user_prompt,
     build_batch_prompt=_build_batch_user_prompt,
@@ -200,7 +200,7 @@ async def translate_units(
     cancel_check: Callable[[], bool] | None = None,
     auto_retry_rounds: int = _AUTO_RETRY_ROUNDS,
     retry_wait_seconds: float = _AUTO_RETRY_WAIT_SECONDS,
-    prompt_strategy: PromptStrategy = _DEFAULT_STRATEGY,
+    prompt_strategy: PromptStrategy = DEFAULT_PROMPT_STRATEGY,
 ) -> list[tuple[str, str]]:
     """按 source_text 去重分组，相同原文只调用一次 LLM；多个不同分组打包进同一次请求
     （见 batch_size），减少大文本量下的请求数和重复的 system prompt token 开销。

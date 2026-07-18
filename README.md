@@ -72,6 +72,64 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 
 已打包好的 Windows 版本见 [Releases](../../releases)。
 
+## 配置翻译引擎：在线 API / 本地模型
+
+设置面板（右上角「⚙ 设置」）里第一项「翻译引擎」可以在两者之间切换，选中哪个就用哪个，
+互不干扰、可以随时切回去，各自的配置分开存（在线走 `.env`/系统凭据管理器，本地模型同理）。
+
+### 在线（云端 API，默认）
+
+适合没有独立显卡、或者不想占用本机资源的场景。默认接 DeepSeek，也兼容任何 OpenAI
+`/v1/chat/completions` 协议的服务商（阿里云百炼、SiliconFlow 等）。
+
+在设置面板「在线 Provider」里填：
+- **API Key**：走系统凭据管理器（Windows 凭据管理器 / keyring），不落地明文文件
+- **Base URL**：留空默认 `https://api.deepseek.com`，换其他兼容服务商就填对应地址
+- **模型**：下拉选或者手填（比如切换到更便宜/更贵的档位）
+
+也可以不开 GUI，直接在项目根目录 `.env` 里配置（复制 `.env.example`）：
+
+```
+DEEPSEEK_API_KEY=你的key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
+```
+
+「备用 Provider」（可选）：主 provider 连续报错（限流/5xx）时自动切过去，三个字段都留空
+就是不启用，行为和以前一样。
+
+### 本地模型（比如 Ollama 部署的 Sakura）
+
+适合有独立显卡（实测 12GB 显存能跑得动 7B 量化模型）、想完全离线翻译、或者不想为翻译付
+API 费用的场景。走的是专门适配过 [SakuraLLM/GalTransl](https://github.com/SakuraLLM/SakuraLLM)
+系列模型的 prompt 模板（见 `translate/sakura_prompt.py`），不是把在线那套 prompt 直接
+糊给本地模型——这类小模型是照着固定模板微调的，喂别的格式效果会打折扣。
+
+部署步骤（以 Ollama 为例，Windows/Linux 通用）：
+
+1. 装 [Ollama](https://ollama.com/download)
+2. 下载一个 GalTransl 系列的 GGUF 权重，比如
+   [SakuraLLM/Sakura-GalTransl-7B-v3.7](https://huggingface.co/SakuraLLM/Sakura-GalTransl-7B-v3.7)
+   （12GB 显存推荐 Q5_K_S/Q6_K 量化档位，显存小就用 IQ4_XS）
+3. 写一个 `Modelfile`：
+   ```
+   FROM /path/to/sakura-galtransl-7b-v3.7-q5_k_s.gguf
+   PARAMETER temperature 0.3
+   PARAMETER top_p 0.8
+   PARAMETER num_ctx 4096
+   ```
+4. `ollama create sakura-galtransl -f Modelfile`，然后 `ollama serve`（默认监听
+   `127.0.0.1:11434`，同一局域网内其他机器要访问的话在启动 `ollama serve` 前设置环境变量
+   `OLLAMA_HOST=0.0.0.0:11434`）
+
+在设置面板里把「翻译引擎」切到「本地模型」，「本地 Provider」里填：
+- **Base URL**：比如 `http://127.0.0.1:11434/v1`（同局域网的另一台机器就填它的内网 IP）
+- **模型名**：`ollama create` 时起的名字，比如 `sakura-galtransl`
+- **API Key**：一般留空即可，Ollama 默认不校验这个字段
+
+已知局限：本地小模型批量打包翻译时偶尔会输出行数对不上（自动退化成逐条重试，不会丢译文，
+只是变慢）；人名等专有名词的音译一致性不如在线大模型稳定（没有项目级术语表约束）。
+
 ## CLI（开发调试用，不是给最终用户的主入口）
 
 ```bash

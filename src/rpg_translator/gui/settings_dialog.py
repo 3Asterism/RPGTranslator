@@ -20,14 +20,23 @@ from rpg_translator.config import (
     Settings,
     get_deepseek_api_key,
     get_fallback_api_key,
+    get_local_api_key,
     set_deepseek_api_key,
     set_fallback_api_key,
+    set_local_api_key,
 )
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE
 
 ORG_NAME = "rpg_translator"
 APP_NAME = "rpg_translator"
 _MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"]
+
+# "online"：云端 OpenAI 兼容 provider（DeepSeek 等），走通用 prompt，跟以前行为一致。
+# "local"：本地跑的小模型（比如 Ollama 部署的 SakuraLLM/GalTransl），走专门适配过的
+# prompt 模板和控制码处理（见 translate/sakura_prompt.py），两者不能共用同一套 prompt——
+# 直接把 DeepSeek 那套自由格式怼给本地小模型，效果会打折扣（见适配测试记录）。
+ENGINE_ONLINE = "online"
+ENGINE_LOCAL = "local"
 
 
 class SettingsDialog(QDialog):
@@ -39,6 +48,11 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("设置")
         self._qsettings = QSettings(ORG_NAME, APP_NAME)
 
+        self._engine_combo = QComboBox()
+        self._engine_combo.addItem("在线（云端 API，如 DeepSeek）", ENGINE_ONLINE)
+        self._engine_combo.addItem("本地模型（如 Ollama 部署的 Sakura）", ENGINE_LOCAL)
+        self._engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+
         self._api_key_edit = QLineEdit()
         self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self._api_key_edit.setPlaceholderText("未设置")
@@ -49,6 +63,29 @@ class SettingsDialog(QDialog):
         self._model_combo = QComboBox()
         self._model_combo.setEditable(True)  # 允许填自定义模型名（比如接第三方兼容服务）
         self._model_combo.addItems(_MODELS)
+
+        online_form = QFormLayout()
+        online_form.addRow("DeepSeek API Key", self._api_key_edit)
+        online_form.addRow("Base URL", self._base_url_edit)
+        online_form.addRow("模型", self._model_combo)
+        self._online_box = QGroupBox("在线 Provider")
+        self._online_box.setLayout(online_form)
+
+        # 本地模型走 OpenAI 兼容协议（Ollama 的 /v1 端点就是），API Key 大多数本地
+        # 服务不校验，留空会自动填一个占位值，不强制用户填。
+        self._local_base_url_edit = QLineEdit()
+        self._local_base_url_edit.setPlaceholderText("例如 http://127.0.0.1:11434/v1")
+        self._local_model_edit = QLineEdit()
+        self._local_model_edit.setPlaceholderText("例如 sakura-galtransl")
+        self._local_api_key_edit = QLineEdit()
+        self._local_api_key_edit.setPlaceholderText("一般留空即可，本地服务通常不校验")
+
+        local_form = QFormLayout()
+        local_form.addRow("Base URL", self._local_base_url_edit)
+        local_form.addRow("模型名", self._local_model_edit)
+        local_form.addRow("API Key（可选）", self._local_api_key_edit)
+        self._local_box = QGroupBox("本地 Provider（走 Sakura 专用 prompt 适配）")
+        self._local_box.setLayout(local_form)
 
         self._concurrency_spin = QSpinBox()
         self._concurrency_spin.setRange(1, 32)
@@ -69,9 +106,7 @@ class SettingsDialog(QDialog):
         output_dir_layout.addWidget(browse_button)
 
         form = QFormLayout()
-        form.addRow("DeepSeek API Key", self._api_key_edit)
-        form.addRow("Base URL", self._base_url_edit)
-        form.addRow("模型", self._model_combo)
+        form.addRow("翻译引擎", self._engine_combo)
         form.addRow("并发数", self._concurrency_spin)
         form.addRow("批量大小", self._batch_size_spin)
         form.addRow("输出目录", output_dir_layout)
@@ -90,8 +125,8 @@ class SettingsDialog(QDialog):
         fallback_form.addRow("备用 API Key", self._fallback_api_key_edit)
         fallback_form.addRow("备用 Base URL", self._fallback_base_url_edit)
         fallback_form.addRow("备用模型", self._fallback_model_edit)
-        fallback_box = QGroupBox("备用 Provider（可选，主服务连续出错时自动切换）")
-        fallback_box.setLayout(fallback_form)
+        self._fallback_box = QGroupBox("备用 Provider（可选，主服务连续出错时自动切换，仅在线引擎可用）")
+        self._fallback_box.setLayout(fallback_form)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -101,10 +136,19 @@ class SettingsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
-        layout.addWidget(fallback_box)
+        layout.addWidget(self._online_box)
+        layout.addWidget(self._local_box)
+        layout.addWidget(self._fallback_box)
         layout.addWidget(buttons)
 
         self._load()
+        self._on_engine_changed()
+
+    def _on_engine_changed(self) -> None:
+        is_local = self._engine_combo.currentData() == ENGINE_LOCAL
+        self._local_box.setVisible(is_local)
+        self._online_box.setVisible(not is_local)
+        self._fallback_box.setVisible(not is_local)
 
     def _browse_output_dir(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "选择输出目录", self._output_dir_edit.text())
@@ -133,6 +177,16 @@ class SettingsDialog(QDialog):
 
         self._output_dir_edit.setText(str(self._qsettings.value("output_dir", "output")))
 
+        engine = str(self._qsettings.value("engine", ENGINE_ONLINE))
+        index = self._engine_combo.findData(engine)
+        self._engine_combo.setCurrentIndex(index if index >= 0 else 0)
+
+        self._local_base_url_edit.setText(str(self._qsettings.value("local_base_url", "")))
+        self._local_model_edit.setText(str(self._qsettings.value("local_model", "")))
+        existing_local_key = get_local_api_key()
+        if existing_local_key:
+            self._local_api_key_edit.setText(existing_local_key)
+
         existing_fallback_key = get_fallback_api_key()
         if existing_fallback_key:
             self._fallback_api_key_edit.setText(existing_fallback_key)
@@ -148,11 +202,18 @@ class SettingsDialog(QDialog):
         if fallback_key:
             set_fallback_api_key(fallback_key)
 
+        local_key = self._local_api_key_edit.text().strip()
+        if local_key:
+            set_local_api_key(local_key)
+
         self._qsettings.setValue("base_url", self._base_url_edit.text().strip())
         self._qsettings.setValue("model", self._model_combo.currentText())
         self._qsettings.setValue("concurrency", self._concurrency_spin.value())
         self._qsettings.setValue("batch_size", self._batch_size_spin.value())
         self._qsettings.setValue("output_dir", self._output_dir_edit.text())
+        self._qsettings.setValue("engine", self._engine_combo.currentData())
+        self._qsettings.setValue("local_base_url", self._local_base_url_edit.text().strip())
+        self._qsettings.setValue("local_model", self._local_model_edit.text().strip())
         self._qsettings.setValue("fallback_base_url", self._fallback_base_url_edit.text().strip())
         self._qsettings.setValue("fallback_model", self._fallback_model_edit.text().strip())
         self.accept()
@@ -178,6 +239,18 @@ class SettingsDialog(QDialog):
         return str(self._qsettings.value("output_dir", "output"))
 
     @property
+    def engine(self) -> str:
+        return str(self._qsettings.value("engine", ENGINE_ONLINE))
+
+    @property
+    def local_base_url(self) -> str:
+        return str(self._qsettings.value("local_base_url", ""))
+
+    @property
+    def local_model(self) -> str:
+        return str(self._qsettings.value("local_model", ""))
+
+    @property
     def fallback_base_url(self) -> str | None:
         return str(self._qsettings.value("fallback_base_url", "")) or Settings().fallback_base_url
 
@@ -197,4 +270,14 @@ def resolve_fallback_config(qsettings: QSettings) -> tuple[str | None, str | Non
     api_key = get_fallback_api_key()
     base_url = str(qsettings.value("fallback_base_url", "")) or Settings().fallback_base_url
     model = str(qsettings.value("fallback_model", "")) or Settings().fallback_model
+    return api_key, base_url, model
+
+
+def resolve_local_config(qsettings: QSettings) -> tuple[str, str, str]:
+    """本地 provider 的三个字段：(api_key, base_url, model)。api_key 大多数本地服务
+    不校验，留空时填一个占位值而不是空字符串——LLMClient 要求 Authorization header
+    非空，本地服务实际上不检查这个值。"""
+    api_key = get_local_api_key() or "sk-local"
+    base_url = str(qsettings.value("local_base_url", ""))
+    model = str(qsettings.value("local_model", ""))
     return api_key, base_url, model

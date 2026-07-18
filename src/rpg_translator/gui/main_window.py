@@ -35,14 +35,17 @@ from rpg_translator.core.pipeline import (
 from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.gui.settings_dialog import (
     APP_NAME,
+    ENGINE_LOCAL,
     ORG_NAME,
     SettingsDialog,
     resolve_base_url,
     resolve_fallback_config,
+    resolve_local_config,
 )
 from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker
-from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE
+from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY
 from rpg_translator.translate.pricing import estimate_cost_cny
+from rpg_translator.translate.sakura_prompt import SAKURA_PROMPT_STRATEGY
 
 logger = logging.getLogger(__name__)
 
@@ -517,10 +520,20 @@ class MainWindow(QMainWindow):
     def _on_start_clicked(self) -> None:
         if self._project_dir is None:
             return
-        api_key = get_deepseek_api_key()
-        if not api_key:
-            QMessageBox.warning(self, "未配置 API Key", "请先在设置里配置 DeepSeek API Key。")
-            return
+        qsettings = QSettings(ORG_NAME, APP_NAME)
+        if qsettings.value("engine", "online") == ENGINE_LOCAL:
+            _, local_base_url, local_model = resolve_local_config(qsettings)
+            if not local_base_url or not local_model:
+                QMessageBox.warning(
+                    self, "未配置本地模型",
+                    "请先在设置里配置本地模型的 Base URL 和模型名。",
+                )
+                return
+        else:
+            api_key = get_deepseek_api_key()
+            if not api_key:
+                QMessageBox.warning(self, "未配置 API Key", "请先在设置里配置 DeepSeek API Key。")
+                return
 
         self._db_path = db_path_for_project(self._project_dir)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -549,12 +562,22 @@ class MainWindow(QMainWindow):
         重跑这一步就够）都调用这个方法，避免两处各写一遍起 worker 的逻辑。
         """
         qsettings = QSettings(ORG_NAME, APP_NAME)
-        model = str(qsettings.value("model", "deepseek-v4-flash"))
         concurrency = int(qsettings.value("concurrency", 4))
         batch_size = int(qsettings.value("batch_size", DEFAULT_BATCH_SIZE))
-        base_url = resolve_base_url(qsettings)
-        fallback_api_key, fallback_base_url, fallback_model = resolve_fallback_config(qsettings)
-        api_key = get_deepseek_api_key()
+
+        if qsettings.value("engine", "online") == ENGINE_LOCAL:
+            # 本地模型走专门适配过的 prompt 模板（见 sakura_prompt.py），不走 DeepSeek
+            # 那套自由格式；也不启用备用 provider——故障转移是为云端服务瞬时报错设计
+            # 的，本地服务连不上通常是配置错了，切去 DeepSeek 反而会误导排查方向。
+            api_key, base_url, model = resolve_local_config(qsettings)
+            fallback_api_key = fallback_base_url = fallback_model = None
+            prompt_strategy = SAKURA_PROMPT_STRATEGY
+        else:
+            model = str(qsettings.value("model", "deepseek-v4-flash"))
+            base_url = resolve_base_url(qsettings)
+            fallback_api_key, fallback_base_url, fallback_model = resolve_fallback_config(qsettings)
+            api_key = get_deepseek_api_key()
+            prompt_strategy = DEFAULT_PROMPT_STRATEGY
 
         self._retry_failed_button.setVisible(False)
         self._translate_worker = TranslateWorker(
@@ -567,6 +590,7 @@ class MainWindow(QMainWindow):
             fallback_base_url,
             fallback_model,
             batch_size=batch_size,
+            prompt_strategy=prompt_strategy,
         )
         self._translate_worker.stage_changed.connect(self._log_message)
         self._translate_worker.progress_changed.connect(self._on_progress_changed)

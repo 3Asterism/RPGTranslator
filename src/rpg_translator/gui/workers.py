@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from rpg_translator.core.pipeline import run_extract, run_inject, run_translate
-from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE
+from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY, PromptStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,7 @@ class TranslateWorker(QThread):
         fallback_model: str | None = None,
         parent=None,
         batch_size: int = DEFAULT_BATCH_SIZE,
+        prompt_strategy: PromptStrategy = DEFAULT_PROMPT_STRATEGY,
     ):
         super().__init__(parent)
         self._db_path = db_path
@@ -70,6 +71,7 @@ class TranslateWorker(QThread):
         self._fallback_base_url = fallback_base_url
         self._fallback_model = fallback_model
         self._batch_size = batch_size
+        self._prompt_strategy = prompt_strategy
         # threading.Event 而不是 asyncio.Event：stop() 是主线程（Qt 事件循环）调这个
         # 方法，run() 里的 asyncio 事件循环跑在这个 QThread 自己的线程里，两边不共享
         # 一个 event loop，只有 threading.Event 能安全跨线程 set()。
@@ -98,6 +100,7 @@ class TranslateWorker(QThread):
                     cancel_check=self._cancel_event.is_set,
                     on_usage=self.usage_changed.emit,
                     batch_size=self._batch_size,
+                    prompt_strategy=self._prompt_strategy,
                 )
             )
         except Exception as e:

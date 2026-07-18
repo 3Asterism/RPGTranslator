@@ -12,7 +12,12 @@ from rpg_translator.engines.mv_mz import MVAdapter, MZAdapter
 from rpg_translator.engines.vxace import VXAceAdapter
 from rpg_translator.engines.wolf import WolfAdapter
 from rpg_translator.engines.xp_vx import VXAdapter, XPAdapter
-from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, translate_units
+from rpg_translator.translate.batch_translator import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_PROMPT_STRATEGY,
+    PromptStrategy,
+    translate_units,
+)
 from rpg_translator.translate.llm_client import LLMClient, LLMConfig
 from rpg_translator.translate.qa import ConflictRow, export_conflicts_csv, find_context_conflicts
 
@@ -147,6 +152,7 @@ async def run_translate(
     cancel_check: Callable[[], bool] | None = None,
     on_usage: Callable[[str, int, int], None] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    prompt_strategy: PromptStrategy = DEFAULT_PROMPT_STRATEGY,
 ) -> tuple[list[TextUnit], list[tuple[str, str]]]:
     """只翻 status="pending" 的条目——中途停止或意外中断后重新调用，已经翻译过的
     （包括这次停止前刚落盘的那些）不会被重新送去调用 API，这是断点续传在翻译这一层
@@ -176,6 +182,7 @@ async def run_translate(
                 on_progress=on_progress,
                 cancel_check=cancel_check,
                 batch_size=batch_size,
+                prompt_strategy=prompt_strategy,
             )
         translated = store.list_units(status="translated")
     return translated, failures
