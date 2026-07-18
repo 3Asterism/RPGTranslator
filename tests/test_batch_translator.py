@@ -142,7 +142,7 @@ async def test_translate_units_resume_after_interruption_skips_already_translate
         # 第一轮：模拟进程只跑到第一条就被 kill 掉
         # batch_size=1：这个测试关注的是断点续跑本身，不是批量打包，避免批量解析
         # 失败走 fallback 时多出的一次"打包尝试"调用把调用计数搅浑
-        await translate_units(stub, store, [units[0]], glossary={}, concurrency=4, batch_size=1)
+        await translate_units(stub, store, [units[0]], concurrency=4, batch_size=1)
         assert stub.call_count == 1
         assert store.get_unit("1").status == "translated"
 
@@ -150,7 +150,7 @@ async def test_translate_units_resume_after_interruption_skips_already_translate
         # （store.list_units() 里 unit 1 现在已经是 status=translated）
         all_units_from_store = store.list_units()
         await translate_units(
-            stub, store, all_units_from_store, glossary={}, concurrency=4, batch_size=1
+            stub, store, all_units_from_store, concurrency=4, batch_size=1
         )
 
         # 只有 2、3 是新调用的，1 不应该被重复调用
@@ -168,7 +168,7 @@ async def test_translate_units_respects_concurrency_limit(tmp_path: Path):
         units = [_make_unit(str(i), f"文本{i}") for i in range(8)]
         store.upsert_units(units)
 
-        await translate_units(stub, store, units, glossary={}, concurrency=3, batch_size=1)
+        await translate_units(stub, store, units, concurrency=3, batch_size=1)
 
         assert stub.max_in_flight == 3  # 确实顶到了限流上限，不是巧合地没超过
 
@@ -182,7 +182,7 @@ async def test_translate_units_reports_progress_via_callback(tmp_path: Path):
         store.upsert_units(units)
 
         await translate_units(
-            stub, store, units, glossary={}, concurrency=2,
+            stub, store, units, concurrency=2,
             on_progress=lambda done, total: progress_calls.append((done, total)),
         )
 
@@ -203,7 +203,7 @@ async def test_translate_units_dedups_same_source_text_to_one_llm_call(tmp_path:
         store.upsert_units(units)
 
         # batch_size=1：这个测试关注的是去重分组本身，不是批量打包
-        await translate_units(stub, store, units, glossary={}, concurrency=4, batch_size=1)
+        await translate_units(stub, store, units, concurrency=4, batch_size=1)
 
         assert stub.call_count == 2  # 2 个不同 source_text，各调用一次
         assert store.get_unit("1").translated_text == "你好"
@@ -219,7 +219,7 @@ async def test_translate_units_skips_non_pending_units(tmp_path: Path):
         reviewed.translated_text = "已经人工确认过的翻译"
         store.upsert_units([reviewed])
 
-        await translate_units(stub, store, [reviewed], glossary={}, concurrency=4)
+        await translate_units(stub, store, [reviewed], concurrency=4)
 
         assert stub.call_count == 0
         result = store.get_unit("1")
@@ -237,7 +237,7 @@ async def test_translate_units_reuses_existing_translation_memory(tmp_path: Path
         store.upsert_units([unit])
         store.set_memory(compute_source_hash("こんにちは"), "こんにちは", "缓存里的翻译")
 
-        await translate_units(stub, store, [unit], glossary={}, concurrency=4)
+        await translate_units(stub, store, [unit], concurrency=4)
 
         assert stub.call_count == 0
         assert store.get_unit("1").translated_text == "缓存里的翻译"
@@ -250,7 +250,7 @@ async def test_translate_units_restores_control_codes(tmp_path: Path):
         unit = _make_unit("1", "\\C[1]勇者よ")
         store.upsert_units([unit])
 
-        await translate_units(stub, store, [unit], glossary={}, concurrency=4)
+        await translate_units(stub, store, [unit], concurrency=4)
 
         result = store.get_unit("1")
         assert "\\C[1]" in result.translated_text
@@ -283,7 +283,7 @@ async def test_translate_units_retries_when_control_code_placeholder_dropped(tmp
         store.upsert_units([unit])
 
         failures = await translate_units(
-            stub, store, [unit], glossary={}, concurrency=4, retry_wait_seconds=0
+            stub, store, [unit], concurrency=4, retry_wait_seconds=0
         )
 
         assert failures == []
@@ -291,6 +291,136 @@ async def test_translate_units_retries_when_control_code_placeholder_dropped(tmp
         assert result.status == "translated"
         assert "\\C[1]" in result.translated_text
         assert stub.call_count == 2  # 第一次丢占位符判失败，自动重试轮救回来
+
+
+class _LeaksContextOnceStub:
+    """复现 A/B 测试发现的真实事故：模型第一次回复没有老实只翻「待翻译」那一句，而是
+    把「上下文」也整段翻译/复述进了回复里，真正的译文被埋在最后——用来验证这种
+    跑题回复会被判定为失败并触发自动重试，而不是把一大段不相关内容原样落盘。"""
+
+    def __init__(self):
+        self.call_count = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        self.call_count += 1
+        marker = "待翻译文本（只翻译并只输出这一句）：\n"
+        idx = user_prompt.index(marker) + len(marker)
+        protected_text = user_prompt[idx:]
+        if self.call_count == 1:
+            return (
+                "村长：欢迎来到这个村子，一路上辛苦了吧。\n"
+                "旅人：谢谢款待，这里的风景真美。\n"
+                "村长：前面那栋就是新搬来的邻居家了。\n"
+                "待翻译：" + protected_text
+            )
+        return protected_text
+
+
+@pytest.mark.anyio
+async def test_translate_units_retries_when_translation_leaks_context(tmp_path: Path):
+    stub = _LeaksContextOnceStub()
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit(
+            "1", "わあ、これがイー・ジャンが引っ越す家なんだ", context="村の入り口での会話"
+        )
+        store.upsert_units([unit])
+
+        failures = await translate_units(
+            stub, store, [unit], concurrency=4, retry_wait_seconds=0
+        )
+
+        assert failures == []
+        result = store.get_unit("1")
+        assert result.status == "translated"
+        assert result.translated_text == "わあ、これがイー・ジャンが引っ越す家なんだ"
+        assert stub.call_count == 2  # 第一次夹带上下文判失败，自动重试轮救回来
+
+
+class _RunawayLengthOnceStub:
+    """第一次回复不含"上下文/待翻译"这类标签字样，但长度远超原文——用来验证纯粹的
+    长度异常信号（不依赖标签关键词）也能被识别为跑题回复。"""
+
+    def __init__(self):
+        self.call_count = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        self.call_count += 1
+        marker = "待翻译文本：\n"
+        idx = user_prompt.index(marker) + len(marker)
+        protected_text = user_prompt[idx:]
+        if self.call_count == 1:
+            return "毫不相关的大段无关文字" * 10
+        return f"译文:{protected_text}"
+
+
+@pytest.mark.anyio
+async def test_translate_units_retries_when_translation_is_abnormally_long(tmp_path: Path):
+    stub = _RunawayLengthOnceStub()
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit("1", "こんにちは")
+        store.upsert_units([unit])
+
+        failures = await translate_units(
+            stub, store, [unit], concurrency=4, retry_wait_seconds=0
+        )
+
+        assert failures == []
+        result = store.get_unit("1")
+        assert result.status == "translated"
+        assert result.translated_text == "译文:こんにちは"
+        assert stub.call_count == 2  # 第一次长度异常判失败，自动重试轮救回来
+
+
+class _BatchLeaksContextOnceStub:
+    """批量打包请求按 [编号] 格式正常回复，但其中一条夹带了上下文内容——用来验证
+    只有那一条会退化成单独调用重问，其它已经解析正确的条目不用跟着重来。"""
+
+    def __init__(self, bad_index: int):
+        self.bad_index = bad_index
+        self.batch_calls = 0
+        self.single_calls = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        items = re.findall(r"\[(\d+)\].*?待翻译：(.*?)(?=\n\n\[\d+\]|\Z)", user_prompt, re.S)
+        if items:
+            self.batch_calls += 1
+            lines = []
+            for n, text in items:
+                text = text.strip()
+                if int(n) == self.bad_index:
+                    text = "村长：欢迎来到这个村子。\n旅人：谢谢款待。\n待翻译：" + text
+                lines.append(f"[{n}] 译文:{text}")
+            return "\n".join(lines)
+
+        self.single_calls += 1
+        marker = "待翻译文本：\n"
+        idx = user_prompt.index(marker) + len(marker)
+        return f"译文:{user_prompt[idx:].strip()}"
+
+
+@pytest.mark.anyio
+async def test_translate_units_batch_item_leaks_context_falls_back_to_single_call(
+    tmp_path: Path,
+):
+    stub = _BatchLeaksContextOnceStub(bad_index=2)
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("1", "文本1号"),
+            _make_unit("2", "文本2号"),
+            _make_unit("3", "文本3号"),
+        ]
+        store.upsert_units(units)
+
+        failures = await translate_units(
+            stub, store, units, concurrency=4, batch_size=25
+        )
+
+        assert failures == []
+        assert stub.batch_calls == 1
+        assert stub.single_calls == 1  # 只有第 2 条退化成单独调用
+        assert store.get_unit("1").translated_text == "译文:文本1号"
+        assert store.get_unit("2").translated_text == "译文:文本2号"
+        assert store.get_unit("3").translated_text == "译文:文本3号"
 
 
 class _BatchDropsOnePlaceholderStub:
@@ -334,7 +464,7 @@ async def test_translate_units_batch_item_placeholder_dropped_falls_back_to_sing
         store.upsert_units(units)
 
         failures = await translate_units(
-            stub, store, units, glossary={}, concurrency=4, batch_size=25
+            stub, store, units, concurrency=4, batch_size=25
         )
 
         assert failures == []
@@ -346,16 +476,6 @@ async def test_translate_units_batch_item_placeholder_dropped_falls_back_to_sing
         assert store.get_unit("3").translated_text == "译文:文本3号"
 
 
-@pytest.mark.anyio
-async def test_translate_units_includes_glossary_in_system_prompt(tmp_path: Path):
-    stub = _StubClient("你好")
-    with Store(tmp_path / "units.db") as store:
-        unit = _make_unit("1", "こんにちは")
-        store.upsert_units([unit])
-
-        await translate_units(stub, store, [unit], glossary={"ハロルド": "哈罗德"}, concurrency=4)
-
-        assert "ハロルド -> 哈罗德" in stub.calls[0][0]
 
 
 @pytest.mark.anyio
@@ -365,7 +485,7 @@ async def test_translate_units_batches_multiple_jobs_into_one_request(tmp_path: 
         units = [_make_unit(str(i), f"文本{i}号") for i in range(5)]
         store.upsert_units(units)
 
-        await translate_units(stub, store, units, glossary={}, concurrency=4, batch_size=25)
+        await translate_units(stub, store, units, concurrency=4, batch_size=25)
 
         assert stub.call_count == 1  # 5 条全部打包进了一次请求
         for i in range(5):
@@ -381,7 +501,7 @@ async def test_translate_units_splits_into_multiple_batches_when_exceeding_batch
         units = [_make_unit(str(i), f"文本{i}号") for i in range(5)]
         store.upsert_units(units)
 
-        await translate_units(stub, store, units, glossary={}, concurrency=4, batch_size=2)
+        await translate_units(stub, store, units, concurrency=4, batch_size=2)
 
         # 5 条，batch_size=2 -> 3 批（2+2+1）
         assert stub.call_count == 3
@@ -398,7 +518,7 @@ async def test_translate_units_falls_back_to_individual_calls_when_batch_parse_f
         units = [_make_unit(str(i), f"文本{i}号") for i in range(3)]
         store.upsert_units(units)
 
-        await translate_units(stub, store, units, glossary={}, concurrency=4, batch_size=25)
+        await translate_units(stub, store, units, concurrency=4, batch_size=25)
 
         # 1 次打包尝试（解析失败）+ 3 次逐条重试 = 4 次调用
         assert stub.call_count == 4
@@ -440,7 +560,7 @@ async def test_translate_units_skips_failing_job_without_aborting_batch(tmp_path
         store.upsert_units(units)
 
         failures = await translate_units(
-            stub, store, units, glossary={}, concurrency=4, batch_size=25
+            stub, store, units, concurrency=4, batch_size=25
         )
 
         assert store.get_unit("1").status == "translated"
@@ -473,7 +593,7 @@ async def test_translate_units_auto_retries_transient_failure_until_success(tmp_
         store.upsert_units([unit])
 
         failures = await translate_units(
-            stub, store, [unit], glossary={}, concurrency=4, batch_size=1,
+            stub, store, [unit], concurrency=4, batch_size=1,
             retry_wait_seconds=0,
         )
 
@@ -492,7 +612,7 @@ async def test_translate_units_auto_retry_does_not_double_count_progress(tmp_pat
         store.upsert_units([unit])
 
         await translate_units(
-            stub, store, [unit], glossary={}, concurrency=4, batch_size=1,
+            stub, store, [unit], concurrency=4, batch_size=1,
             retry_wait_seconds=0,
             on_progress=lambda done, total: progress_calls.append((done, total)),
         )
@@ -508,7 +628,7 @@ async def test_translate_units_auto_retry_exhausted_still_fails(tmp_path: Path):
         store.upsert_units([unit])
 
         failures = await translate_units(
-            stub, store, [unit], glossary={}, concurrency=4, batch_size=1,
+            stub, store, [unit], concurrency=4, batch_size=1,
             retry_wait_seconds=0, auto_retry_rounds=2,
         )
 
@@ -532,7 +652,7 @@ async def test_translate_units_cancel_stops_auto_retry(tmp_path: Path):
 
         task = asyncio.create_task(
             translate_units(
-                stub, store, [unit], glossary={}, concurrency=4, batch_size=1,
+                stub, store, [unit], concurrency=4, batch_size=1,
                 retry_wait_seconds=10,  # 故意设大：真的被打断而不是等满才会快速返回
                 cancel_check=_cancel_check,
             )
@@ -590,7 +710,6 @@ async def test_translate_units_cancel_stops_new_batches_and_aborts_in_flight(
                 stub,
                 store,
                 units,
-                glossary={},
                 concurrency=2,
                 batch_size=1,
                 cancel_check=_cancel_check,
@@ -630,7 +749,7 @@ async def test_translate_units_against_real_provider(tmp_path: Path):
             api_key=api_key, base_url=settings.deepseek_base_url, model=settings.deepseek_model
         )
         async with LLMClient(config) as client:
-            await translate_units(client, store, [unit], glossary={}, concurrency=2)
+            await translate_units(client, store, [unit], concurrency=2)
 
         result = store.get_unit("1")
         assert result.status == "translated"
@@ -672,7 +791,7 @@ async def test_translate_units_batching_works_against_real_provider(tmp_path: Pa
                 return await original_chat(system_prompt, user_prompt)
 
             client.chat = _counting_chat
-            await translate_units(client, store, units, glossary={}, concurrency=4, batch_size=10)
+            await translate_units(client, store, units, concurrency=4, batch_size=10)
 
         assert call_count == 1, (
             f"期望 5 条一次性打包成 1 次请求，实际调用了 {call_count} 次"
