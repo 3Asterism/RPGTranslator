@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QSettings
+import httpx
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -10,6 +12,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -29,7 +32,24 @@ from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE
 
 ORG_NAME = "rpg_translator"
 APP_NAME = "rpg_translator"
-_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"]
+_MODELS = [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    # 百炼（DashScope，https://dashscope.aliyuncs.com/compatible-mode/v1）——实测均
+    # 连通，qwen3-32b 这类混合思考模型默认开思考模式，非流式调用必须显式传
+    # enable_thinking=false 否则 400，llm_client.py 已经对所有请求强制带这个参数。
+    "qwen3.7-plus",
+    "qwen-plus-2025-07-28",
+    "qwen-max",
+    "qwen-mt-flash",
+    "qwen3.6-plus",
+    "qwen3-32b",
+    "qwen3.5-35b-a3b",
+    # 硅基流动（SiliconFlow，https://api.siliconflow.cn/v1）——实测均连通。
+    "deepseek-ai/DeepSeek-V3.2",
+    "Qwen/Qwen3.5-35B-A3B",
+    "Qwen/Qwen3.5-27B",
+]
 
 # "online"：云端 OpenAI 兼容 provider（DeepSeek 等），走通用 prompt，跟以前行为一致。
 # "local"：本地跑的小模型（比如 Ollama 部署的 SakuraLLM/GalTransl），走专门适配过的
@@ -47,6 +67,10 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self._qsettings = QSettings(ORG_NAME, APP_NAME)
+        # 测试用注入点：换成 httpx.MockTransport 就能在不碰真实网络的情况下验证
+        # _check_connectivity 的请求/判断逻辑（同 llm_client.LLMClient 的 transports 参数）。
+        # 留空（默认）就是走真实网络。
+        self._connectivity_transport: httpx.BaseTransport | None = None
 
         self._engine_combo = QComboBox()
         self._engine_combo.addItem("在线（云端 API，如 DeepSeek）", ENGINE_ONLINE)
@@ -63,6 +87,10 @@ class SettingsDialog(QDialog):
         self._model_combo = QComboBox()
         self._model_combo.setEditable(True)  # 允许填自定义模型名（比如接第三方兼容服务）
         self._model_combo.addItems(_MODELS)
+        # _MODELS 现在有十来个条目（多个 provider 的模型都塞在同一个下拉里），不限制
+        # 弹出高度的话在小屏幕上会把下拉框撑到超出窗口/屏幕；封顶显示条目数，超出的
+        # 部分交给下拉框自带的滚动条。
+        self._model_combo.setMaxVisibleItems(8)
 
         online_form = QFormLayout()
         online_form.addRow("DeepSeek API Key", self._api_key_edit)
@@ -193,7 +221,56 @@ class SettingsDialog(QDialog):
         self._fallback_base_url_edit.setText(str(self._qsettings.value("fallback_base_url", "")))
         self._fallback_model_edit.setText(str(self._qsettings.value("fallback_model", "")))
 
+    # /models 是 OpenAI 兼容协议里最轻量的探活端点：不花 token、不需要 key 一定正确
+    # 就能拿到响应（key 不对也会收到 401，那也说明服务本身是通的）——只用来确认"连得上
+    # 这个地址"，不判断 key/模型名是否真的可用，那些错误留给真正翻译时的报错反馈。
+    _CONNECTIVITY_TIMEOUT_SECONDS = 8.0
+
+    def _check_connectivity(self) -> tuple[bool, str]:
+        engine = self._engine_combo.currentData()
+        if engine == ENGINE_LOCAL:
+            base_url = self._local_base_url_edit.text().strip()
+            if not base_url:
+                return False, "本地 Provider 的 Base URL 不能为空。"
+            api_key = self._local_api_key_edit.text().strip() or "sk-local"
+        else:
+            base_url = self._base_url_edit.text().strip() or Settings().deepseek_base_url
+            api_key = self._api_key_edit.text().strip()
+            if not api_key:
+                return False, "在线 Provider 需要填写 API Key。"
+
+        url = base_url.rstrip("/") + "/models"
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            with httpx.Client(
+                timeout=self._CONNECTIVITY_TIMEOUT_SECONDS, transport=self._connectivity_transport
+            ) as http:
+                resp = http.get(url, headers={"Authorization": f"Bearer {api_key}"})
+        except httpx.HTTPError as e:
+            return False, f"连不上 {base_url}：{e}"
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # >=500 不当作"连通"：本机走系统代理（比如 Clash）时，代理本身能正常应答，
+        # 但代理连不上局域网里的目标地址（比如 Ollama 用了错的端口/IP）会回一个
+        # 502/504——这种情况客户端收到的确实是一个完整的 HTTP 响应，但真正要连的
+        # 那个地址其实没通，不能算检查通过（实测踩过这个坑：错端口在有代理时会被
+        # 误判成"连得上"）。4xx（比如 401 key 错）说明请求确实到了目标服务，只是
+        # key/参数不对，这种算连通，交给真正翻译时的报错反馈。
+        if resp.status_code >= 500:
+            return False, f"{base_url} 返回了错误状态码 {resp.status_code}，目标服务可能没启动或地址不对。"
+        return True, ""
+
     def _on_accept(self) -> None:
+        ok, error = self._check_connectivity()
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "连接测试失败",
+                f"{error}\n\n设置未保存，请检查地址/网络，或确认服务已启动后重试。",
+            )
+            return
+
         api_key = self._api_key_edit.text().strip()
         if api_key:
             set_deepseek_api_key(api_key)

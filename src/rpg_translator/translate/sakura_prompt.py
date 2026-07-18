@@ -80,4 +80,11 @@ SAKURA_PROMPT_STRATEGY = PromptStrategy(
     # \C[1] 这类反斜杠控制码保留非常稳（8/8 次原样保留）——直接让控制码原样
     # 透传给模型，见 batch_translator.PromptStrategy.wrap_control_codes 的说明。
     wrap_control_codes=False,
+    # SakuraLLM 官方推荐的采样参数（README：temperature=0.1, top_p=0.3,
+    # repetition_penalty=1）。不显式传的话吃的是部署方 Modelfile 里的默认值——
+    # 实测局域网测试机上部署的 sakura-galtransl:latest 的 Modelfile 里烤的是
+    # temperature=0.3/top_p=0.8，比官方推荐更"热"，会增加批量翻译输出跑偏
+    # （夹带上下文、行数错位）的概率，进而触发 batch_translator._bisect_batch
+    # 的重试开销。这里在请求体里显式覆盖，不依赖具体部署环境有没有配对。
+    extra_body={"temperature": 0.1, "top_p": 0.3},
 )
