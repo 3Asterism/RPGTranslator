@@ -36,9 +36,9 @@ def _sakura_reachable() -> bool:
         return False
 
 
-def _make_job(source_text: str, context: str = "") -> Job:
+def _make_job(source_text: str, context: str = "", context_group: str = "") -> Job:
     protected_text, mapping = protect(source_text)
-    return Job(source_text, [], protected_text, mapping, context)
+    return Job(source_text, [], protected_text, mapping, context, context_group)
 
 
 def test_build_single_prompt_without_context_has_empty_history():

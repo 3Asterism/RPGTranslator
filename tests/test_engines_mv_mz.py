@@ -93,11 +93,16 @@ def test_mz_extract_common_events(mz_project: Path):
     assert unit.source_text == "共通イベントのテキストです。"
 
 
-def test_mz_extract_context_includes_sibling_dialogue(mz_project: Path):
+def test_mz_extract_groups_sibling_dialogue_into_same_context_group(mz_project: Path):
+    """不再把兄弟台词整段拼进 context（页面越长开销越是平方级）——改成给同一页面的
+    条目打上相同的 context_group，交给 batch_translator 打包进同一次请求整体翻译，
+    上下文靠"同一次请求里的其它行"自然获得（调研见 CLAUDE.md）。"""
     units = MZAdapter().extract(mz_project)
     line1 = _by_locator(units, "data/Map001.json", "events/1/pages/0/list/1/parameters/0")
-    assert "この村へようこそ。" in line1.context
-    assert line1.source_text not in line1.context
+    line2 = _by_locator(units, "data/Map001.json", "events/1/pages/0/list/2/parameters/0")
+    assert line1.context == ""
+    assert line1.context_group
+    assert line1.context_group == line2.context_group
 
 
 def test_mz_extract_database_name_nickname_and_profile(mz_project: Path):

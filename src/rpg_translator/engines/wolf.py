@@ -50,20 +50,16 @@ def _relative(path: Path, project_dir: Path) -> str:
     return path.relative_to(project_dir).as_posix()
 
 
-def _texts_with_sibling_context(
-    commands: list[Command], locator_prefix: str
-) -> list[tuple[str, str, str]]:
-    """(locator, text, context) triples, where context is every other
-    translatable line in the same command list joined with newlines --
-    mirrors _rgss_common.py's/mv_mz.py's "sibling dialogue" context
-    convention (same Show-Text-message-window grouping idea, just derived
-    from WOLF's own command list instead of an RPG Maker page's @list)."""
-    entries = [(loc, text) for loc, text in iter_command_texts(commands, locator_prefix) if text.strip()]
-    result: list[tuple[str, str, str]] = []
-    for loc, text in entries:
-        context = "\n".join(t for other_loc, t in entries if other_loc != loc)
-        result.append((loc, text, context))
-    return result
+def _nonempty_texts(commands: list[Command], locator_prefix: str) -> list[tuple[str, str]]:
+    """(locator, text) pairs for every non-empty translatable line in the command list.
+
+    Used to no longer be paired with a "sibling dialogue" context string (every other
+    line in the same command list joined with newlines) -- that made per-line context
+    grow quadratically with command-list length. Callers now tag each unit with a
+    context_group id instead, so batch_translator.py can pack the whole command list
+    into one request (paragraph in, paragraph out) and let the model pick up context
+    from co-located lines rather than a duplicated context field (see CLAUDE.md)."""
+    return [(loc, text) for loc, text in iter_command_texts(commands, locator_prefix) if text.strip()]
 
 
 class WolfAdapter(EngineAdapter):
@@ -90,14 +86,16 @@ class WolfAdapter(EngineAdapter):
             for event_idx, event in enumerate(game_map.events):
                 for page_idx, page in enumerate(event.pages):
                     prefix = f"events/{event_idx}/pages/{page_idx}/commands"
-                    for locator, text, context in _texts_with_sibling_context(page.commands, prefix):
+                    context_group = f"{rel_path}:{prefix}"
+                    for locator, text in _nonempty_texts(page.commands, prefix):
                         units.append(
                             TextUnit(
                                 id=compute_text_unit_id(_ENGINE, rel_path, locator),
                                 engine=_ENGINE,
                                 file_path=rel_path,
                                 locator=locator,
-                                context=context,
+                                context="",
+                                context_group=context_group,
                                 source_text=text,
                             )
                         )
@@ -112,15 +110,16 @@ class WolfAdapter(EngineAdapter):
         common_events = WolfCommonEvents.read(ce_path)
         for event_idx, event in enumerate(common_events.events):
             prefix = f"events/{event_idx}/commands"
-            for locator, text, context in _texts_with_sibling_context(event.commands, prefix):
-                full_context = f"通用事件：{event.name}" + (f"\n{context}" if context else "")
+            context_group = f"{rel_path}:{prefix}"
+            for locator, text in _nonempty_texts(event.commands, prefix):
                 units.append(
                     TextUnit(
                         id=compute_text_unit_id(_ENGINE, rel_path, locator),
                         engine=_ENGINE,
                         file_path=rel_path,
                         locator=locator,
-                        context=full_context,
+                        context=f"通用事件：{event.name}",
+                        context_group=context_group,
                         source_text=text,
                     )
                 )

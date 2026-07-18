@@ -15,6 +15,13 @@ class TextUnit(BaseModel):
     file_path: str
     locator: str
     context: str
+    # 同一事件页面/命令列表的分组 id（比如 "www/data/Map001.json:events/3/pages/0"），
+    # 用来让 batch_translator 把同一段连续台词打包进同一次请求整体翻译（段落进段落出），
+    # 上下文靠"同一次请求里的其它行"自然获得，不用再把兄弟台词整段拼进 context 字段
+    # （原来的做法在长事件页面上是平方级 token 开销，见 CLAUDE.md 的调研记录）。数据库
+    # 字段这类没有自然顺序、不需要打包的条目留空字符串，batch_translator 会把它们当
+    # 一个统一的"无分组"批次，退化成原来纯按 batch_size 切块的行为。
+    context_group: str = ""
     source_text: str
     control_code_map: dict[str, str] = {}
     translated_text: str | None = None
