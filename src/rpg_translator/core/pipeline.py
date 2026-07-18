@@ -13,7 +13,6 @@ from rpg_translator.engines.vxace import VXAceAdapter
 from rpg_translator.engines.wolf import WolfAdapter
 from rpg_translator.engines.xp_vx import VXAdapter, XPAdapter
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, translate_units
-from rpg_translator.translate.glossary import extract_glossary_candidates
 from rpg_translator.translate.llm_client import LLMClient, LLMConfig
 from rpg_translator.translate.qa import ConflictRow, export_conflicts_csv, find_context_conflicts
 
@@ -135,40 +134,6 @@ def _build_llm_configs(
     return configs
 
 
-async def run_glossary(
-    db_path: Path,
-    api_key: str | None,
-    base_url: str,
-    model: str,
-    fallback_api_key: str | None = None,
-    fallback_base_url: str | None = None,
-    fallback_model: str | None = None,
-    force: bool = False,
-    on_usage: Callable[[str, int, int], None] | None = None,
-) -> dict[str, str]:
-    """抽取术语表候选。断点续传场景下（同一个工程重新点"开始翻译"）术语表大概率已经
-    抽取过、存在 db 里了，默认直接复用，不重新调用一遍 LLM——这一步是纯粹的开销，
-    不重新翻译就没有必要重新花 token 抽一遍术语表。传 force=True 才强制重新抽取。
-
-    on_usage(model, prompt_tokens, completion_tokens) 每次 LLM 调用成功后回调一次，
-    供 GUI 实时统计 token 用量/预估花费，不传就跳过。"""
-    with Store(db_path) as store:
-        if not force:
-            existing = store.get_glossary()
-            if existing:
-                return existing
-
-        api_key = _require_api_key(api_key)
-        units = store.list_units()
-        configs = _build_llm_configs(
-            api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
-        )
-        async with LLMClient(configs, on_usage=on_usage) as client:
-            candidates = await extract_glossary_candidates(client, units)
-        store.set_glossary(candidates)
-    return candidates
-
-
 async def run_translate(
     db_path: Path,
     api_key: str | None,
@@ -199,7 +164,6 @@ async def run_translate(
     api_key = _require_api_key(api_key)
     with Store(db_path) as store:
         pending = store.list_units(status="pending")
-        glossary = store.get_glossary()
         configs = _build_llm_configs(
             api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
         )
@@ -208,7 +172,6 @@ async def run_translate(
                 client,
                 store,
                 pending,
-                glossary,
                 concurrency,
                 on_progress=on_progress,
                 cancel_check=cancel_check,
@@ -234,7 +197,7 @@ async def run_full(
     on_usage: Callable[[str, int, int], None] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> list[TextUnit]:
-    """extract -> 术语抽取 -> translate -> inject 完整链路。
+    """extract -> translate -> inject 完整链路。
 
     on_stage(message) 在阶段切换时调用一次；on_progress(completed, total) 在翻译阶段
     每完成一个去重分组时调用一次；on_usage(model, prompt_tokens, completion_tokens) 在
@@ -254,11 +217,6 @@ async def run_full(
             api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
         )
         async with LLMClient(configs, on_usage=on_usage) as client:
-            if on_stage is not None:
-                on_stage("术语抽取中…")
-            glossary = await extract_glossary_candidates(client, units)
-            store.set_glossary(glossary)
-
             pending = store.list_units(status="pending")
             if on_stage is not None:
                 on_stage(f"翻译中（共 {len(pending)} 条待译）…")
@@ -266,7 +224,6 @@ async def run_full(
                 client,
                 store,
                 pending,
-                glossary,
                 concurrency,
                 on_progress=on_progress,
                 batch_size=batch_size,
@@ -300,13 +257,11 @@ def export_translation_package(db_path: Path, game_name: str, dest_dir: Path) ->
     一遍翻译 API，省他们的 token 也省时间。"""
     with Store(db_path) as store:
         units = store.list_units()
-        glossary = store.get_glossary()
 
     translated = [u for u in units if u.translated_text is not None]
     package = {
         "format_version": _PACKAGE_FORMAT_VERSION,
         "game_name": game_name,
-        "glossary": glossary,
         "units": [
             {
                 "id": u.id,
@@ -336,10 +291,6 @@ def import_translation_package(db_path: Path, package_path: Path) -> tuple[int, 
     imported = 0
     skipped = 0
     with Store(db_path) as store:
-        glossary = data.get("glossary")
-        if glossary:
-            store.set_glossary(glossary)
-
         for entry in data.get("units", []):
             local_unit = store.get_unit(entry["id"])
             if local_unit is None or local_unit.source_text != entry["source_text"]:

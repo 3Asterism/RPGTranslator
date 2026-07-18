@@ -38,7 +38,7 @@ def test_upsert_is_idempotent_update(tmp_path: Path):
 
 def test_upsert_preserves_translated_progress_when_source_text_unchanged(tmp_path: Path):
     """断点续传的关键行为：GUI 每次点"开始翻译"都会重新跑一遍 extract 再 upsert_units
-    （见 gui/workers.py ExtractAndGlossaryWorker），extract 出来的 TextUnit 永远是全新的
+    （见 gui/workers.py ExtractWorker），extract 出来的 TextUnit 永远是全新的
     status="pending"/translated_text=None。如果 upsert 无条件覆盖，已经翻译好、意外中断
     前落盘的进度会在下一次重新打开软件时被直接抹掉，等于强迫用户重翻一遍、白白多花
     API token。只要原文没变，已有的翻译结果和状态必须原样保留。"""
@@ -109,17 +109,6 @@ def test_translation_memory_roundtrip(tmp_path: Path):
 
         store.set_memory(source_hash, source_text, "你好呀")
         assert store.get_memory(source_hash) == "你好呀"
-
-
-def test_glossary_roundtrip_and_update(tmp_path: Path):
-    with Store(tmp_path / "units.db") as store:
-        assert store.get_glossary() == {}
-
-        store.set_glossary({"ハロルド": "哈罗德", "村": "村庄"})
-        assert store.get_glossary() == {"ハロルド": "哈罗德", "村": "村庄"}
-
-        store.set_glossary({"ハロルド": "哈洛德"})
-        assert store.get_glossary() == {"ハロルド": "哈洛德", "村": "村庄"}
 
 
 def test_data_persists_across_store_reopen(tmp_path: Path):

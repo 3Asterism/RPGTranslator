@@ -45,7 +45,7 @@ def _normalize_base_url(base_url: str) -> str:
 class LLMClient:
     """OpenAI 兼容协议的聊天补全客户端（面向 DeepSeek，也兼容其他同协议服务商）。
 
-    system prompt（术语表 + 固定指令）放前面、user prompt（本批次待译文本）放后面，
+    system prompt（固定翻译规则）放前面、user prompt（本批次待译文本）放后面，
     方便复用同一份 system prompt 时吃到 DeepSeek 的 context caching 折扣。
 
     支持传入多个 LLMConfig 做故障转移：某个 provider 连续报瞬时错误（429/5xx/连接

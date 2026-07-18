@@ -10,6 +10,7 @@ _PRICING_PER_MILLION_CNY: dict[str, tuple[float, float]] = {
     "deepseek-v4-pro": (12.0, 24.0),
     "qwen3.6-flash": (1.3, 7.5),
     "qwen/qwen3.6-27b": (3.0, 18.0),
+    "qwen/qwen3.5-35b-a3b": (0.4, 3.2),
 }
 
 

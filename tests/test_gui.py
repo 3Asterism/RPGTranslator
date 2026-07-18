@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from rpg_translator.config import Settings, get_deepseek_api_key
-from rpg_translator.gui.glossary_dialog import GlossaryDialog
 from rpg_translator.gui.main_window import (
     MainWindow,
     db_path_for_project,
@@ -13,7 +12,7 @@ from rpg_translator.gui.main_window import (
     resolve_dropped_path,
 )
 from rpg_translator.gui.settings_dialog import SettingsDialog
-from rpg_translator.gui.workers import ExtractAndGlossaryWorker, InjectWorker, TranslateWorker
+from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker
 
 
 def test_main_window_constructs_with_start_disabled(qapp):
@@ -276,54 +275,25 @@ def test_settings_dialog_base_url_falls_back_to_env_default_when_unset(qapp):
     assert dialog.base_url == Settings().deepseek_base_url
 
 
-def test_glossary_dialog_edited_glossary_reflects_table_edits(qapp, tmp_path: Path):
-    dialog = GlossaryDialog(tmp_path / "units.db", {"ハロルド": "哈罗德"})
-    assert dialog.edited_glossary() == {"ハロルド": "哈罗德"}
-
-    dialog._table.item(0, 1).setText("哈洛德")
-    assert dialog.edited_glossary() == {"ハロルド": "哈洛德"}
-
-
-def test_glossary_dialog_accept_saves_to_store(qapp, tmp_path: Path):
-    from rpg_translator.core.store import Store
-
-    db_path = tmp_path / "units.db"
-    dialog = GlossaryDialog(db_path, {"ハロルド": "哈罗德"})
-    dialog._on_accept()
-
-    with Store(db_path) as store:
-        assert store.get_glossary() == {"ハロルド": "哈罗德"}
-
-
-def test_extract_and_glossary_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):
-    """真实跑一遍 ExtractAndGlossaryWorker 这个 QThread：验证跨线程 Signal 真的能
-    把 (candidates, unit_count) 传回主线程，而不是只测同步的 pipeline 函数本身。"""
-    api_key = get_deepseek_api_key()
-    if not api_key:
-        pytest.skip("本地未配置 DEEPSEEK_API_KEY，跳过真实 API 调用测试")
-
-    settings = Settings()
+def test_extract_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):
+    """真实跑一遍 ExtractWorker 这个 QThread：验证跨线程 Signal 真的能把 unit_count
+    传回主线程，而不是只测同步的 pipeline 函数本身。纯本地操作，不需要 API Key。"""
     db_path = tmp_path / "units.db"
 
-    results: list[tuple[dict, int]] = []
+    results: list[int] = []
     errors: list[str] = []
 
-    worker = ExtractAndGlossaryWorker(
-        mz_project, db_path, api_key, settings.deepseek_base_url, settings.deepseek_model
-    )
-    worker.finished_ok.connect(lambda candidates, count: results.append((candidates, count)))
+    worker = ExtractWorker(mz_project, db_path)
+    worker.finished_ok.connect(results.append)
     worker.failed.connect(errors.append)
 
     worker.start()
-    finished_in_time = worker.wait(120_000)
+    finished_in_time = worker.wait(10_000)
     qapp.processEvents()
 
-    assert finished_in_time, "worker 线程 120s 内没跑完（真实 API 调用异常慢，或线程卡住了）"
+    assert finished_in_time, "worker 线程 10s 内没跑完（线程卡住了）"
     assert errors == []
-    assert len(results) == 1
-    candidates, unit_count = results[0]
-    assert unit_count == 14
-    assert isinstance(candidates, dict)
+    assert results == [14]
     assert db_path.is_file()
 
 

@@ -13,7 +13,6 @@ from rpg_translator.core.pipeline import (
     UnknownEngineError,
     run_extract,
     run_full,
-    run_glossary,
     run_inject,
     run_qa,
     run_translate,
@@ -39,30 +38,6 @@ def extract(
         typer.echo(str(e), err=True)
         raise typer.Exit(code=1) from e
     typer.echo(f"提取完成：{len(units)} 条文本，已写入 {out}")
-
-
-@app.command()
-def glossary(
-    db: Annotated[Path, typer.Option(help="SQLite 数据库路径")] = Path("units.db"),
-) -> None:
-    """抽取术语表候选并存入数据库。"""
-    settings = Settings()
-    try:
-        candidates = asyncio.run(
-            run_glossary(
-                db,
-                get_deepseek_api_key(),
-                settings.deepseek_base_url,
-                settings.deepseek_model,
-                settings.fallback_api_key,
-                settings.fallback_base_url,
-                settings.fallback_model,
-            )
-        )
-    except MissingApiKeyError as e:
-        typer.echo(str(e), err=True)
-        raise typer.Exit(code=1) from e
-    typer.echo(f"术语抽取完成：{len(candidates)} 条候选，已写入 {db}")
 
 
 @app.command()
@@ -137,7 +112,7 @@ def run(
         int, typer.Option(help="一次请求打包翻译多少条不同文本，调大能减少请求总数")
     ] = DEFAULT_BATCH_SIZE,
 ) -> None:
-    """一键跑完整链路：extract -> 术语抽取 -> translate -> inject。"""
+    """一键跑完整链路：extract -> translate -> inject。"""
     settings = Settings()
     try:
         units = asyncio.run(

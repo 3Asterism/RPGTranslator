@@ -7,71 +7,36 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
-from rpg_translator.core.pipeline import run_extract, run_glossary, run_inject, run_translate
+from rpg_translator.core.pipeline import run_extract, run_inject, run_translate
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE
 
 logger = logging.getLogger(__name__)
 
 
-class ExtractAndGlossaryWorker(QThread):
-    """extract + 术语候选抽取。完成后交回主线程弹术语表确认框——批量翻译前必须
-    经用户确认/编辑术语表才能继续（见 spec 第 10 节），所以这一步和翻译分成两个线程。
+class ExtractWorker(QThread):
+    """从游戏工程提取文本到数据库。不需要 API Key，纯本地操作，跑在后台线程只是为了
+    不卡住 UI（大工程提取可能有明显耗时）。"""
 
-    fallback_* 三个参数由 main_window.py 统一解析好再传进来（GUI 设置里填了就用
-    GUI 的，没填就退回 .env 默认值），worker 自己不碰 Settings()，避免两处各解析
-    一遍导致 GUI 配置和实际生效的值对不上。
-    """
-
-    finished_ok = Signal(dict, int)  # (glossary candidates, unit count)
-    usage_changed = Signal(str, int, int)  # (model, prompt_tokens, completion_tokens)
+    finished_ok = Signal(int)  # unit count
     failed = Signal(str)
 
-    def __init__(
-        self,
-        project_dir: Path,
-        db_path: Path,
-        api_key: str,
-        base_url: str,
-        model: str,
-        fallback_api_key: str | None = None,
-        fallback_base_url: str | None = None,
-        fallback_model: str | None = None,
-        parent=None,
-    ):
+    def __init__(self, project_dir: Path, db_path: Path, parent=None):
         super().__init__(parent)
         self._project_dir = project_dir
         self._db_path = db_path
-        self._api_key = api_key
-        self._base_url = base_url
-        self._model = model
-        self._fallback_api_key = fallback_api_key
-        self._fallback_base_url = fallback_base_url
-        self._fallback_model = fallback_model
 
     def run(self) -> None:
         try:
             units = run_extract(self._project_dir, self._db_path)
-            candidates = asyncio.run(
-                run_glossary(
-                    self._db_path,
-                    self._api_key,
-                    self._base_url,
-                    self._model,
-                    self._fallback_api_key,
-                    self._fallback_base_url,
-                    self._fallback_model,
-                    on_usage=self.usage_changed.emit,
-                )
-            )
         except Exception as e:
-            logger.exception("提取/术语抽取失败")
+            logger.exception("提取失败")
             self.failed.emit(str(e))
             return
-        self.finished_ok.emit(candidates, len(units))
+        self.finished_ok.emit(len(units))
 
 
 class TranslateWorker(QThread):
-    """用户确认术语表之后跑：translate。只负责翻译，结果落盘到 db_path（units.db），
+    """提取完成之后跑：translate。只负责翻译，结果落盘到 db_path（units.db），
     不碰游戏工程本身——和 inject 分开跑，是为了 inject 那一步（写文件、可能因为杀软/
     权限/磁盘问题失败）出错时，翻译结果已经稳稳存在 db 里，不用重新调用 API 重翻一遍。
     """

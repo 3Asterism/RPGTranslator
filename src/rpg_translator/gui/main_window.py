@@ -33,7 +33,6 @@ from rpg_translator.core.pipeline import (
     switch_language,
 )
 from rpg_translator.engines.base import EngineAdapter
-from rpg_translator.gui.glossary_dialog import GlossaryDialog
 from rpg_translator.gui.settings_dialog import (
     APP_NAME,
     ORG_NAME,
@@ -41,7 +40,7 @@ from rpg_translator.gui.settings_dialog import (
     resolve_base_url,
     resolve_fallback_config,
 )
-from rpg_translator.gui.workers import ExtractAndGlossaryWorker, InjectWorker, TranslateWorker
+from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE
 from rpg_translator.translate.pricing import estimate_cost_cny
 
@@ -284,7 +283,7 @@ class MainWindow(QMainWindow):
         self._adapter: EngineAdapter | None = None
         self._db_path: Path | None = None
         self._output_dir: str | None = None
-        self._extract_glossary_worker: ExtractAndGlossaryWorker | None = None
+        self._extract_worker: ExtractWorker | None = None
         self._translate_worker: TranslateWorker | None = None
         self._inject_worker: InjectWorker | None = None
 
@@ -345,7 +344,7 @@ class MainWindow(QMainWindow):
         self._log.setReadOnly(True)
         self._log.setMinimumHeight(160)
 
-        translate_box = QGroupBox("2. 翻译（提取术语表确认后台跑，结果先存本地，不动游戏文件）")
+        translate_box = QGroupBox("2. 翻译（后台跑，结果先存本地，不动游戏文件）")
         translate_layout = QVBoxLayout(translate_box)
         translate_layout.addLayout(start_row)
         translate_layout.addWidget(self._progress_bar)
@@ -523,11 +522,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未配置 API Key", "请先在设置里配置 DeepSeek API Key。")
             return
 
-        qsettings = QSettings(ORG_NAME, APP_NAME)
-        model = str(qsettings.value("model", "deepseek-v4-flash"))
-        base_url = resolve_base_url(qsettings)
-        fallback_api_key, fallback_base_url, fallback_model = resolve_fallback_config(qsettings)
-
         self._db_path = db_path_for_project(self._project_dir)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -539,37 +533,20 @@ class MainWindow(QMainWindow):
         self._progress_bar.setRange(0, 0)  # 不确定进度，先用忙碌样式
         self._log_message("提取中…")
 
-        self._extract_glossary_worker = ExtractAndGlossaryWorker(
-            self._project_dir,
-            self._db_path,
-            api_key,
-            base_url,
-            model,
-            fallback_api_key,
-            fallback_base_url,
-            fallback_model,
-        )
-        self._extract_glossary_worker.finished_ok.connect(self._on_extract_glossary_done)
-        self._extract_glossary_worker.usage_changed.connect(self._on_usage_changed)
-        self._extract_glossary_worker.failed.connect(self._on_failed)
-        self._extract_glossary_worker.start()
+        self._extract_worker = ExtractWorker(self._project_dir, self._db_path)
+        self._extract_worker.finished_ok.connect(self._on_extract_done)
+        self._extract_worker.failed.connect(self._on_failed)
+        self._extract_worker.start()
 
-    def _on_extract_glossary_done(self, candidates: dict, unit_count: int) -> None:
-        self._log_message(f"术语抽取完成：{len(candidates)} 条候选")
+    def _on_extract_done(self, unit_count: int) -> None:
+        self._log_message(f"提取完成：{unit_count} 条文本")
         self._progress_bar.setRange(0, 100)
-
-        dialog = GlossaryDialog(self._db_path, candidates, self)
-        if dialog.exec() != GlossaryDialog.DialogCode.Accepted:
-            self._log_message("已取消。")
-            self._reset_after_translate()
-            return
-
         self._start_translate_worker()
 
     def _start_translate_worker(self) -> None:
         """起一个 TranslateWorker 翻译 db 里当前的 pending 条目——只翻译，不重新走
-        提取/术语抽取。首次翻译（提取+术语确认后）和「重试失败项」（失败条目还是
-        pending，直接重跑这一步就够）都调用这个方法，避免两处各写一遍起 worker 的逻辑。
+        提取。首次翻译（提取完成后）和「重试失败项」（失败条目还是 pending，直接
+        重跑这一步就够）都调用这个方法，避免两处各写一遍起 worker 的逻辑。
         """
         qsettings = QSettings(ORG_NAME, APP_NAME)
         model = str(qsettings.value("model", "deepseek-v4-flash"))
@@ -627,7 +604,7 @@ class MainWindow(QMainWindow):
 
     def _on_retry_failed_clicked(self) -> None:
         """失败条目还保留着 status="pending"，直接重跑翻译这一步就够——不用再走一遍
-        提取/术语抽取（术语表已经在 db 里，工程文本也没变）。"""
+        提取（工程文本也没变）。"""
         self._log_message("重试失败项…")
         self._start_translate_worker()
 

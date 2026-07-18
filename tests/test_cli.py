@@ -12,7 +12,7 @@ runner = CliRunner()
 def test_help_lists_all_subcommands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for command in ["extract", "glossary", "translate", "qa", "inject", "run"]:
+    for command in ["extract", "translate", "qa", "inject", "run"]:
         assert command in result.output
 
 
@@ -64,7 +64,7 @@ def test_translate_without_api_key_exits_nonzero_with_clear_message(tmp_path, mo
     assert "未配置 DeepSeek API Key" in result.output
 
 
-def test_glossary_and_translate_full_cli_flow_against_real_provider(tmp_path, mz_project: Path):
+def test_translate_full_cli_flow_against_real_provider(tmp_path, mz_project: Path):
     if not get_deepseek_api_key():
         pytest.skip("本地未配置 DEEPSEEK_API_KEY，跳过真实 API 调用测试")
 
@@ -73,10 +73,6 @@ def test_glossary_and_translate_full_cli_flow_against_real_provider(tmp_path, mz
 
     extract_result = runner.invoke(app, ["extract", str(mz_project), "--out", str(db_path)])
     assert extract_result.exit_code == 0
-
-    glossary_result = runner.invoke(app, ["glossary", "--db", str(db_path)])
-    assert glossary_result.exit_code == 0
-    assert "术语抽取完成" in glossary_result.output
 
     translate_result = runner.invoke(
         app, ["translate", "--db", str(db_path), "--concurrency", "4"]

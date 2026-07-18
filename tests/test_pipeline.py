@@ -11,7 +11,6 @@ from rpg_translator.core.pipeline import (
     has_language_variant,
     import_translation_package,
     run_extract,
-    run_glossary,
     run_inject,
     switch_language,
 )
@@ -38,30 +37,6 @@ def test_detect_adapter_raises_on_unrecognized_dir(tmp_path: Path):
         detect_adapter(tmp_path)
 
 
-@pytest.mark.anyio
-async def test_run_glossary_reuses_existing_glossary_without_calling_api(tmp_path: Path):
-    """断点续传场景：术语表已经抽取过、存在 db 里了，重新点"开始翻译"不应该
-    再花一次 token 重新抽一遍——api_key=None 也不该报错，因为根本不需要真的调用。"""
-    db_path = tmp_path / "units.db"
-    with Store(db_path) as store:
-        store.set_glossary({"ハロルド": "哈罗德"})
-
-    result = await run_glossary(db_path, api_key=None, base_url="unused", model="unused")
-    assert result == {"ハロルド": "哈罗德"}
-
-
-@pytest.mark.anyio
-async def test_run_glossary_force_still_requires_api_key(tmp_path: Path):
-    from rpg_translator.core.pipeline import MissingApiKeyError
-
-    db_path = tmp_path / "units.db"
-    with Store(db_path) as store:
-        store.set_glossary({"ハロルド": "哈罗德"})
-
-    with pytest.raises(MissingApiKeyError):
-        await run_glossary(db_path, api_key=None, base_url="unused", model="unused", force=True)
-
-
 def test_export_and_import_translation_package_round_trip(tmp_path: Path, mz_project: Path):
     """导出的翻译包在另一份（这里用同一个 fixture 模拟"同版本游戏"）全新 db 上
     导入，应该精确套上已翻译的内容——这是"分享给拿到同一个游戏的人"这个功能的
@@ -72,7 +47,6 @@ def test_export_and_import_translation_package_round_trip(tmp_path: Path, mz_pro
         units = store.list_units()
         for unit in units:
             store.update_translation(unit.id, f"[译]{unit.source_text}", status="translated")
-        store.set_glossary({"ハロルド": "哈罗德"})
 
     dest_dir = tmp_path / "share"
     package_path = export_translation_package(db_path, "TestGame", dest_dir)
@@ -88,7 +62,6 @@ def test_export_and_import_translation_package_round_trip(tmp_path: Path, mz_pro
     assert imported == len(units)
 
     with Store(other_db_path) as store:
-        assert store.get_glossary() == {"ハロルド": "哈罗德"}
         for unit in store.list_units():
             assert unit.status == "translated"
             assert unit.translated_text == f"[译]{unit.source_text}"
