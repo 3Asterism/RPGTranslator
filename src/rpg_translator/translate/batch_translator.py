@@ -22,7 +22,11 @@ _TRANSLATE_SYSTEM_PROMPT_TEMPLATE = (
 # 一次请求最多打包多少条不同原文一起翻译。几万行文本量级下，一行一请求在时间和 token 成本
 # 上都不现实（每次请求都要重复付一遍 system prompt 的 token），打包成批次是主要的省钱手段，
 # 配合 DeepSeek 的 context caching（system prompt 不变，能吃到缓存折扣）。
-DEFAULT_BATCH_SIZE = 25
+#
+# 这个值也是控制请求数（进而是撞上 provider RPM 限流概率）的主要杠杆：同样翻 550 条，
+# 25 条/请求要发 22 次请求，50 条/请求只要 11 次——请求数减半，压力也减半。真撞上限流
+# 时靠 llm_client.py 的共享冷却兜底，但从源头减少请求数比事后退避更省时间。
+DEFAULT_BATCH_SIZE = 50
 
 _BATCH_INSTRUCTION = (
     "请把下面编号的文本逐条翻译成简体中文。每条译文必须以 [编号] 开头另起一行，"
@@ -102,6 +106,14 @@ def _build_batch_user_prompt(items: list[_Job]) -> str:
         else:
             parts.append(f"[{i}] 待翻译：{job.protected_text}")
     return "\n\n".join(parts)
+
+
+def _has_all_placeholders(raw: str, mapping: dict[str, str]) -> bool:
+    """protect() 把控制码换成了模型看不懂内容、只需要原样保留位置的 ⟦CCn⟧ 占位符——
+    模型不该、也没法把控制码本身翻错，唯一还可能出错的是把某个占位符整个漏掉（小
+    模型实测出现过，见 llm 选型记录）。restore() 只会替换文本里存在的占位符，
+    漏掉的会悄悄从译文里消失且不报错，所以这里在 restore 之前显式校验一遍完整性。"""
+    return all(token in raw for token in mapping)
 
 
 def _parse_batch_response(response: str, expected_count: int) -> dict[int, str] | None:
@@ -221,7 +233,13 @@ async def translate_units(
             except Exception as e:  # noqa: BLE001 - 单条失败只跳过，不拖累其它条目
                 _record_failure(job, e, count_progress)
                 return
-        translated_text = restore(raw.strip(), job.mapping)
+        stripped = raw.strip()
+        if not _has_all_placeholders(stripped, job.mapping):
+            # 模型漏掉了控制码占位符——按失败处理而不是原样写入残缺译文，让自动
+            # 重试轮有机会重新问一次模型（见 translate_units 的 auto_retry_rounds）。
+            _record_failure(job, RuntimeError("译文丢失控制码占位符，已跳过"), count_progress)
+            return
+        translated_text = restore(stripped, job.mapping)
         store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
         _write_result(job.group, translated_text, count_progress)
 
@@ -253,10 +271,21 @@ async def translate_units(
             await asyncio.gather(*(_translate_single_job(job, count_progress) for job in batch))
             return
 
+        placeholder_fallback_jobs: list[_Job] = []
         for i, job in enumerate(batch, start=1):
+            if not _has_all_placeholders(parsed[i], job.mapping):
+                # 批量回复整体格式没问题，但这一条自己漏了控制码占位符——只把这一条
+                # 退化成单独调用重问，其它条目已经解析正确的不用跟着陪葬。
+                placeholder_fallback_jobs.append(job)
+                continue
             translated_text = restore(parsed[i], job.mapping)
             store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
             _write_result(job.group, translated_text, count_progress)
+
+        if placeholder_fallback_jobs:
+            await asyncio.gather(
+                *(_translate_single_job(job, count_progress) for job in placeholder_fallback_jobs)
+            )
 
     batches = [jobs[i : i + batch_size] for i in range(0, len(jobs), batch_size)]
     await asyncio.gather(*(_translate_batch(batch) for batch in batches))

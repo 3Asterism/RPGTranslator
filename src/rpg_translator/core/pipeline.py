@@ -12,7 +12,7 @@ from rpg_translator.engines.mv_mz import MVAdapter, MZAdapter
 from rpg_translator.engines.vxace import VXAceAdapter
 from rpg_translator.engines.wolf import WolfAdapter
 from rpg_translator.engines.xp_vx import VXAdapter, XPAdapter
-from rpg_translator.translate.batch_translator import translate_units
+from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, translate_units
 from rpg_translator.translate.glossary import extract_glossary_candidates
 from rpg_translator.translate.llm_client import LLMClient, LLMConfig
 from rpg_translator.translate.qa import ConflictRow, export_conflicts_csv, find_context_conflicts
@@ -181,6 +181,7 @@ async def run_translate(
     fallback_model: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
     on_usage: Callable[[str, int, int], None] | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> tuple[list[TextUnit], list[tuple[str, str]]]:
     """只翻 status="pending" 的条目——中途停止或意外中断后重新调用，已经翻译过的
     （包括这次停止前刚落盘的那些）不会被重新送去调用 API，这是断点续传在翻译这一层
@@ -211,6 +212,7 @@ async def run_translate(
                 concurrency,
                 on_progress=on_progress,
                 cancel_check=cancel_check,
+                batch_size=batch_size,
             )
         translated = store.list_units(status="translated")
     return translated, failures
@@ -230,6 +232,7 @@ async def run_full(
     fallback_base_url: str | None = None,
     fallback_model: str | None = None,
     on_usage: Callable[[str, int, int], None] | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> list[TextUnit]:
     """extract -> 术语抽取 -> translate -> inject 完整链路。
 
@@ -260,7 +263,13 @@ async def run_full(
             if on_stage is not None:
                 on_stage(f"翻译中（共 {len(pending)} 条待译）…")
             failures = await translate_units(
-                client, store, pending, glossary, concurrency, on_progress=on_progress
+                client,
+                store,
+                pending,
+                glossary,
+                concurrency,
+                on_progress=on_progress,
+                batch_size=batch_size,
             )
             if on_stage is not None and failures:
                 on_stage(f"{len(failures)} 条翻译失败已跳过（保留待译状态，可重跑续译）")

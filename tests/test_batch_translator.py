@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import pytest
@@ -254,6 +255,95 @@ async def test_translate_units_restores_control_codes(tmp_path: Path):
         result = store.get_unit("1")
         assert "\\C[1]" in result.translated_text
         assert "⟦CC" not in result.translated_text
+
+
+class _DropsPlaceholderOnceStub:
+    """第一次调用把 protect() 打的所有 ⟦CCn⟧ 占位符漏掉（复现小模型实测出现的丢控制
+    码问题），之后老实原样回填——用来验证漏占位符会被判定为失败并触发自动重试，
+    而不是把缺了控制码的残缺译文原样落盘。"""
+
+    def __init__(self):
+        self.call_count = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        self.call_count += 1
+        marker = "待翻译文本：\n"
+        idx = user_prompt.index(marker) + len(marker)
+        protected_text = user_prompt[idx:]
+        if self.call_count == 1:
+            return re.sub(r"⟦CC\d+⟧", "", protected_text)
+        return f"TRANSLATED[{protected_text}]"
+
+
+@pytest.mark.anyio
+async def test_translate_units_retries_when_control_code_placeholder_dropped(tmp_path: Path):
+    stub = _DropsPlaceholderOnceStub()
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit("1", "\\C[1]勇者よ")
+        store.upsert_units([unit])
+
+        failures = await translate_units(
+            stub, store, [unit], glossary={}, concurrency=4, retry_wait_seconds=0
+        )
+
+        assert failures == []
+        result = store.get_unit("1")
+        assert result.status == "translated"
+        assert "\\C[1]" in result.translated_text
+        assert stub.call_count == 2  # 第一次丢占位符判失败，自动重试轮救回来
+
+
+class _BatchDropsOnePlaceholderStub:
+    """批量打包请求按 [编号] 格式正常回复，但其中一条把控制码占位符漏掉——用来验证
+    只有那一条会退化成单独调用重问，其它已经解析正确的条目不用跟着重来。"""
+
+    def __init__(self, bad_index: int):
+        self.bad_index = bad_index
+        self.batch_calls = 0
+        self.single_calls = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        items = re.findall(r"\[(\d+)\].*?待翻译：(.*?)(?=\n\n\[\d+\]|\Z)", user_prompt, re.S)
+        if items:
+            self.batch_calls += 1
+            lines = []
+            for n, text in items:
+                text = text.strip()
+                if int(n) == self.bad_index:
+                    text = re.sub(r"⟦CC\d+⟧", "", text)
+                lines.append(f"[{n}] 译文:{text}")
+            return "\n".join(lines)
+
+        self.single_calls += 1
+        marker = "待翻译文本：\n"
+        idx = user_prompt.index(marker) + len(marker)
+        return f"译文:{user_prompt[idx:].strip()}"
+
+
+@pytest.mark.anyio
+async def test_translate_units_batch_item_placeholder_dropped_falls_back_to_single_call(
+    tmp_path: Path,
+):
+    stub = _BatchDropsOnePlaceholderStub(bad_index=2)
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("1", "文本1号"),
+            _make_unit("2", "\\C[1]文本2号"),
+            _make_unit("3", "文本3号"),
+        ]
+        store.upsert_units(units)
+
+        failures = await translate_units(
+            stub, store, units, glossary={}, concurrency=4, batch_size=25
+        )
+
+        assert failures == []
+        assert stub.batch_calls == 1
+        assert stub.single_calls == 1  # 只有第 2 条退化成单独调用
+        assert store.get_unit("1").translated_text == "译文:文本1号"
+        assert "\\C[1]" in store.get_unit("2").translated_text
+        assert "⟦CC" not in store.get_unit("2").translated_text
+        assert store.get_unit("3").translated_text == "译文:文本3号"
 
 
 @pytest.mark.anyio

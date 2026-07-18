@@ -18,6 +18,7 @@ from rpg_translator.core.pipeline import (
     run_qa,
     run_translate,
 )
+from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -68,6 +69,9 @@ def glossary(
 def translate(
     db: Annotated[Path, typer.Option(help="SQLite 数据库路径")] = Path("units.db"),
     concurrency: Annotated[int, typer.Option(help="并发请求数")] = 8,
+    batch_size: Annotated[
+        int, typer.Option(help="一次请求打包翻译多少条不同文本，调大能减少请求总数")
+    ] = DEFAULT_BATCH_SIZE,
 ) -> None:
     """调用 DeepSeek 批量翻译数据库中待翻译的 TextUnit。"""
     settings = Settings()
@@ -82,6 +86,7 @@ def translate(
                 fallback_api_key=settings.fallback_api_key,
                 fallback_base_url=settings.fallback_base_url,
                 fallback_model=settings.fallback_model,
+                batch_size=batch_size,
             )
         )
     except MissingApiKeyError as e:
@@ -128,6 +133,9 @@ def run(
     out: Annotated[Path, typer.Option(help="汉化版输出目录")] = Path("output"),
     db: Annotated[Path, typer.Option(help="SQLite 数据库路径")] = Path("units.db"),
     concurrency: Annotated[int, typer.Option(help="并发请求数")] = 8,
+    batch_size: Annotated[
+        int, typer.Option(help="一次请求打包翻译多少条不同文本，调大能减少请求总数")
+    ] = DEFAULT_BATCH_SIZE,
 ) -> None:
     """一键跑完整链路：extract -> 术语抽取 -> translate -> inject。"""
     settings = Settings()
@@ -144,6 +152,7 @@ def run(
                 fallback_api_key=settings.fallback_api_key,
                 fallback_base_url=settings.fallback_base_url,
                 fallback_model=settings.fallback_model,
+                batch_size=batch_size,
             )
         )
     except (UnknownEngineError, MissingApiKeyError) as e:

@@ -42,6 +42,7 @@ from rpg_translator.gui.settings_dialog import (
     resolve_fallback_config,
 )
 from rpg_translator.gui.workers import ExtractAndGlossaryWorker, InjectWorker, TranslateWorker
+from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE
 from rpg_translator.translate.pricing import estimate_cost_cny
 
 logger = logging.getLogger(__name__)
@@ -573,6 +574,7 @@ class MainWindow(QMainWindow):
         qsettings = QSettings(ORG_NAME, APP_NAME)
         model = str(qsettings.value("model", "deepseek-v4-flash"))
         concurrency = int(qsettings.value("concurrency", 4))
+        batch_size = int(qsettings.value("batch_size", DEFAULT_BATCH_SIZE))
         base_url = resolve_base_url(qsettings)
         fallback_api_key, fallback_base_url, fallback_model = resolve_fallback_config(qsettings)
         api_key = get_deepseek_api_key()
@@ -587,6 +589,7 @@ class MainWindow(QMainWindow):
             fallback_api_key,
             fallback_base_url,
             fallback_model,
+            batch_size=batch_size,
         )
         self._translate_worker.stage_changed.connect(self._log_message)
         self._translate_worker.progress_changed.connect(self._on_progress_changed)

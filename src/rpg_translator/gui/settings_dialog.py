@@ -23,6 +23,7 @@ from rpg_translator.config import (
     set_deepseek_api_key,
     set_fallback_api_key,
 )
+from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE
 
 ORG_NAME = "rpg_translator"
 APP_NAME = "rpg_translator"
@@ -52,6 +53,14 @@ class SettingsDialog(QDialog):
         self._concurrency_spin = QSpinBox()
         self._concurrency_spin.setRange(1, 32)
 
+        self._batch_size_spin = QSpinBox()
+        self._batch_size_spin.setRange(1, 200)
+        self._batch_size_spin.setToolTip(
+            "一次请求打包翻译多少条不同文本。调大能减少请求总数、降低撞上服务商限流的"
+            "概率，但太大可能让模型回复格式出错（出错会自动退化成逐条重试，不会丢译文，"
+            "只是变慢）。"
+        )
+
         self._output_dir_edit = QLineEdit()
         browse_button = QPushButton("浏览…")
         browse_button.clicked.connect(self._browse_output_dir)
@@ -64,6 +73,7 @@ class SettingsDialog(QDialog):
         form.addRow("Base URL", self._base_url_edit)
         form.addRow("模型", self._model_combo)
         form.addRow("并发数", self._concurrency_spin)
+        form.addRow("批量大小", self._batch_size_spin)
         form.addRow("输出目录", output_dir_layout)
 
         # 备用 provider：主 provider 连续报瞬时错误（429/5xx/连接失败）重试用尽后自动切过来
@@ -118,6 +128,9 @@ class SettingsDialog(QDialog):
         concurrency = int(self._qsettings.value("concurrency", 4))
         self._concurrency_spin.setValue(concurrency)
 
+        batch_size = int(self._qsettings.value("batch_size", DEFAULT_BATCH_SIZE))
+        self._batch_size_spin.setValue(batch_size)
+
         self._output_dir_edit.setText(str(self._qsettings.value("output_dir", "output")))
 
         existing_fallback_key = get_fallback_api_key()
@@ -138,6 +151,7 @@ class SettingsDialog(QDialog):
         self._qsettings.setValue("base_url", self._base_url_edit.text().strip())
         self._qsettings.setValue("model", self._model_combo.currentText())
         self._qsettings.setValue("concurrency", self._concurrency_spin.value())
+        self._qsettings.setValue("batch_size", self._batch_size_spin.value())
         self._qsettings.setValue("output_dir", self._output_dir_edit.text())
         self._qsettings.setValue("fallback_base_url", self._fallback_base_url_edit.text().strip())
         self._qsettings.setValue("fallback_model", self._fallback_model_edit.text().strip())
@@ -154,6 +168,10 @@ class SettingsDialog(QDialog):
     @property
     def concurrency(self) -> int:
         return int(self._qsettings.value("concurrency", 4))
+
+    @property
+    def batch_size(self) -> int:
+        return int(self._qsettings.value("batch_size", DEFAULT_BATCH_SIZE))
 
     @property
     def output_dir(self) -> str:

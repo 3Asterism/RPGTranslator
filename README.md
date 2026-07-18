@@ -37,7 +37,9 @@
 - **QA 一致性扫描**：同一原文在不同语境下可能需要不同译法的情况，单独导出成待复核列表
 - **原文/译文一键切换**：翻译效果有问题时先切回原文核对，不用重新跑一遍注入
 - **翻译包分享**：导出成一份轻量 `.rpgtrans.json`，同一版本游戏的其他人可以直接导入复用，不用重新花 API 额度
-- **并发限流 + 批量打包请求**：省时间也省 token（配合 DeepSeek 的 prompt caching）
+- **并发限流 + 批量打包请求**：省时间也省 token（配合 DeepSeek 的 prompt caching），批量大小可在设置面板调整
+- **限流自适应退避**：撞到 429 时同一 provider 上所有并发请求共享一个冷却窗口（优先读 `Retry-After`，
+  否则按连续命中次数指数退避），避免各自独立重试反复冲撞同一个限流窗口
 
 ## 快速开始
 
@@ -76,7 +78,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 ```bash
 rpg-translator extract   <项目目录> --out units.db
 rpg-translator glossary  --db units.db
-rpg-translator translate --db units.db --concurrency 8
+rpg-translator translate --db units.db --concurrency 8 --batch-size 50
 rpg-translator qa        --db units.db --export conflicts.csv
 rpg-translator inject    --db units.db --project <项目目录> --out <输出目录>
 rpg-translator run       <项目目录> --out <输出目录>

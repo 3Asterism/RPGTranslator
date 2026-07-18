@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import time
+
 import httpx
 import pytest
 
 from rpg_translator.config import Settings, get_deepseek_api_key
+from rpg_translator.translate import llm_client as llm_client_module
 from rpg_translator.translate.llm_client import LLMClient, LLMConfig, _normalize_base_url
 
 
@@ -221,3 +225,103 @@ async def test_chat_real_failover_from_broken_key_to_working_provider():
         result = await client.chat("你是一个只输出单个词的翻译助手。", "把「こんにちは」翻译成简体中文。")
 
     assert result.strip()
+
+
+def _rate_limited_response(retry_after: str | None = None) -> httpx.Response:
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return httpx.Response(429, headers=headers, json={"error": "rate limited"})
+
+
+@pytest.mark.anyio
+async def test_chat_honors_retry_after_header_instead_of_generic_backoff():
+    """429 带 Retry-After 时应该按这个头等待，而不是走 5xx/连接失败那套小步指数退避——
+    backoff_base_seconds 故意设得很大，如果冷却机制没生效、退回到用了通用退避，
+    这个测试会因为超时/耗时过长而失败。"""
+    call_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return _rate_limited_response("0.05") if call_count == 1 else _success_response("成功了")
+
+    config = LLMConfig(api_key="x", base_url="https://a.test", model="m")
+    client = LLMClient(
+        config, backoff_base_seconds=5.0, transports=[httpx.MockTransport(handler)]
+    )
+    try:
+        start = time.monotonic()
+        result = await asyncio.wait_for(client.chat("sys", "user"), timeout=2.0)
+        elapsed = time.monotonic() - start
+    finally:
+        await client.aclose()
+
+    assert result == "成功了"
+    assert call_count == 2
+    assert elapsed < 1.0  # 远小于 backoff_base_seconds=5.0，证明走的是 Retry-After 冷却
+
+
+@pytest.mark.anyio
+async def test_chat_rate_limit_cooldown_shared_across_concurrent_calls():
+    """核心场景：批量翻译时很多并发任务共用同一个 LLMClient。其中一个请求撞到 429
+    之后，另一个此刻才发起的全新调用（不是同一次 chat() 内部的重试）也应该先等
+    共享冷却过去，不能立刻打进去再撞一次限流——这是"聚合退避"而不是"各自重试"的
+    关键验证点。"""
+    call_times: list[float] = []
+    first_429_seen = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        call_times.append(time.monotonic())
+        if len(call_times) == 1:
+            first_429_seen.set()
+            return _rate_limited_response("0.15")
+        return _success_response("成功了")
+
+    config = LLMConfig(api_key="x", base_url="https://a.test", model="m")
+    client = LLMClient(
+        config, max_retries_per_provider=2, transports=[httpx.MockTransport(handler)]
+    )
+    try:
+        task1 = asyncio.ensure_future(client.chat("sys", "user1"))
+        await asyncio.wait_for(first_429_seen.wait(), timeout=1.0)
+        # task2 是全新的一次 chat() 调用（模拟另一个并发任务），故意在 task1 还在
+        # 冷却等待期间才发起
+        task2 = asyncio.ensure_future(client.chat("sys", "user2"))
+
+        result1 = await asyncio.wait_for(task1, timeout=2.0)
+        result2 = await asyncio.wait_for(task2, timeout=2.0)
+    finally:
+        await client.aclose()
+
+    assert result1 == "成功了"
+    assert result2 == "成功了"
+    # 3 次请求：初始 429 + task1 的重试 + task2 自己的首次尝试——两个"冷却之后"的
+    # 调用都不能省，关键约束是时机：谁都不能在冷却截止之前抢先打进去撞一次限流。
+    assert len(call_times) == 3
+    cooldown_deadline = call_times[0] + 0.15
+    assert all(t >= cooldown_deadline - 0.02 for t in call_times[1:])
+
+
+@pytest.mark.anyio
+async def test_chat_uses_default_cooldown_when_retry_after_missing(monkeypatch):
+    monkeypatch.setattr(llm_client_module, "_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS", 0.05)
+    monkeypatch.setattr(llm_client_module, "_MAX_RATE_LIMIT_COOLDOWN_SECONDS", 0.2)
+    call_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return _rate_limited_response() if call_count == 1 else _success_response("成功了")
+
+    config = LLMConfig(api_key="x", base_url="https://a.test", model="m")
+    client = LLMClient(
+        config, backoff_base_seconds=5.0, transports=[httpx.MockTransport(handler)]
+    )
+    try:
+        start = time.monotonic()
+        result = await asyncio.wait_for(client.chat("sys", "user"), timeout=2.0)
+        elapsed = time.monotonic() - start
+    finally:
+        await client.aclose()
+
+    assert result == "成功了"
+    assert elapsed < 1.0
