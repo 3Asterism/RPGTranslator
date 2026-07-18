@@ -305,6 +305,7 @@ class MainWindow(QMainWindow):
         self._extract_worker: ExtractWorker | None = None
         self._translate_worker: TranslateWorker | None = None
         self._inject_worker: InjectWorker | None = None
+        self._WORKER_STOP_TIMEOUT_MS = 5000
 
         # log_message/stage_changed 信号来自后台线程，两个 provider 都报错时高并发
         # 下每个批次的每次重试/限流冷却/换 provider 都各发一条（见 llm_client.py 的
@@ -603,6 +604,15 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "未配置 API Key", "请先在设置里配置 DeepSeek API Key。")
                 return
 
+        if not self._ensure_worker_stopped(self._extract_worker) or not self._ensure_worker_stopped(
+            self._translate_worker
+        ):
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还在收尾上一次任务，请稍等几秒再点一次「开始翻译」。",
+            )
+            return
+
         self._db_path = db_path_for_project(self._project_dir)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -614,7 +624,6 @@ class MainWindow(QMainWindow):
         self._progress_bar.setRange(0, 0)  # 不确定进度，先用忙碌样式
         self._log_message("提取中…")
 
-        self._ensure_worker_stopped(self._extract_worker)
         self._extract_worker = ExtractWorker(self._project_dir, self._db_path)
         self._extract_worker.finished_ok.connect(self._on_extract_done)
         self._extract_worker.failed.connect(self._on_failed)
@@ -630,6 +639,13 @@ class MainWindow(QMainWindow):
         提取。首次翻译（提取完成后）和「重试失败项」（失败条目还是 pending，直接
         重跑这一步就够）都调用这个方法，避免两处各写一遍起 worker 的逻辑。
         """
+        if not self._ensure_worker_stopped(self._translate_worker):
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还在收尾上一次翻译，请稍等几秒再试。",
+            )
+            return
+
         qsettings = QSettings(ORG_NAME, APP_NAME)
         concurrency = int(qsettings.value("concurrency", 4))
         batch_size = int(qsettings.value("batch_size", DEFAULT_BATCH_SIZE))
@@ -660,7 +676,6 @@ class MainWindow(QMainWindow):
         self._last_eta_update_time = -1.0
         self._last_sample_time = -1.0
         self._eta_label.setText("翻译速度：统计中…")
-        self._ensure_worker_stopped(self._translate_worker)
         self._translate_worker = TranslateWorker(
             self._db_path,
             api_key,
@@ -764,16 +779,26 @@ class MainWindow(QMainWindow):
         self._log_message("重试失败项…")
         self._start_translate_worker()
 
-    def _ensure_worker_stopped(self, worker: QThread | None) -> None:
+    def _ensure_worker_stopped(self, worker: QThread | None) -> bool:
         """在把 self._xxx_worker 指向一个新线程、丢掉旧引用之前，确保旧线程真的已经
         跑完。正常按钮状态下旧线程在这里必然已经结束（isRunning() 为 False，wait()
         立即返回），这里只是加一道保险：一旦这个前提在某次时序下不成立，旧 QThread
         对象在引用被覆盖的瞬间因为 Python 侧引用计数归零而被销毁——PySide 里销毁一个
         仍在运行的 QThread 会在 C++ 层直接 qFatal/abort，表现为整个程序无预兆闪退，
         既不会弹「出错」对话框，也不会被 logging_setup.py 的 sys.excepthook 记录
-        （那只能捕获 Python 异常，接不住 native abort）。"""
-        if worker is not None and worker.isRunning():
-            worker.wait(5000)
+        （那只能捕获 Python 异常，接不住 native abort）。
+
+        返回 True 表示旧线程已确认停止，可以放心创建新的；返回 False 表示等了
+        _WORKER_STOP_TIMEOUT_MS 还没等到（比如两个 provider 都报错时，取消后要
+        清理的在途批次/自动重试格外多，真跑完可能超过这个时间），调用方这时候
+        绝不能仍然覆盖引用去起新线程——那样等于在旧线程还活着的时候把它销毁，
+        正是上面说的那种 native abort。宁可让用户看到"再等等"的提示，也不能
+        在没确认清楚的情况下硬着头皮继续。"""
+        if worker is None:
+            return True
+        if worker.isRunning():
+            worker.wait(self._WORKER_STOP_TIMEOUT_MS)
+        return not worker.isRunning()
 
     def _on_stop_clicked(self) -> None:
         if self._translate_worker is None:
@@ -833,13 +858,19 @@ class MainWindow(QMainWindow):
             return
         output_dir = Path(output_dir_text)
 
+        if not self._ensure_worker_stopped(self._inject_worker):
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还在收尾上一次写回，请稍等几秒再试。",
+            )
+            return
+
         qsettings = QSettings(ORG_NAME, APP_NAME)
         qsettings.setValue("output_dir", output_dir_text)
 
         self._inject_button.setEnabled(False)
         self._log_message("写回中…")
 
-        self._ensure_worker_stopped(self._inject_worker)
         self._inject_worker = InjectWorker(self._project_dir, self._db_path, output_dir)
         self._inject_worker.finished_ok.connect(self._on_inject_done)
         self._inject_worker.failed.connect(self._on_inject_failed)
