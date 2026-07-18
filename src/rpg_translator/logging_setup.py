@@ -6,7 +6,34 @@ import sys
 import threading
 from pathlib import Path
 
+from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+_QT_LEVELS = {
+    QtMsgType.QtDebugMsg: logging.DEBUG,
+    QtMsgType.QtInfoMsg: logging.INFO,
+    QtMsgType.QtWarningMsg: logging.WARNING,
+    QtMsgType.QtCriticalMsg: logging.ERROR,
+    QtMsgType.QtFatalMsg: logging.CRITICAL,
+}
+
+
+def _qt_message_handler(msg_type, context, message) -> None:
+    """Qt/C++ 层面的警告和致命错误（比如"QThread: Destroyed while thread is still
+    running"这类线程生命周期误用）默认只走 Qt 自己的消息机制，不经过 Python 的
+    logging/sys.excepthook——PyInstaller --noconsole 打包后又没有控制台能显示，
+    出这类问题时应用日志和崩溃对话框都是空的，只会看到程序无声消失。这里接管 Qt
+    的消息输出，统一记进同一份日志，QtFatalMsg 出现即代表 Qt 马上要 abort()，这行
+    日志很可能是崩溃前最后能留下的线索。"""
+    logging.getLogger("qt").log(
+        _QT_LEVELS.get(msg_type, logging.WARNING),
+        "%s (%s:%s, %s)",
+        message,
+        context.file,
+        context.line,
+        context.function,
+    )
 
 
 def _base_dir() -> Path:
@@ -44,6 +71,7 @@ def setup_logging() -> Path:
 
     sys.excepthook = _make_excepthook(log_file)
     threading.excepthook = _log_thread_exception
+    qInstallMessageHandler(_qt_message_handler)
 
     logging.getLogger(__name__).info("日志初始化完成：%s", log_file)
     return log_file
