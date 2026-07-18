@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, NamedTuple
 
 from rpg_translator.codec.control_codes import extract_codes, protect, restore
@@ -73,9 +73,13 @@ async def _interruptible_sleep(seconds: float, cancelled: Callable[[], bool]) ->
 
 
 async def _chat_cancellable(
-    client: LLMClient, system_prompt: str, user_prompt: str, cancelled: Callable[[], bool]
+    client: LLMClient,
+    system_prompt: str,
+    user_prompt: str,
+    cancelled: Callable[[], bool],
+    extra_body: dict | None = None,
 ) -> str:
-    task = asyncio.ensure_future(client.chat(system_prompt, user_prompt))
+    task = asyncio.ensure_future(client.chat(system_prompt, user_prompt, extra_body))
     while not task.done():
         if cancelled():
             task.cancel()
@@ -185,6 +189,14 @@ class PromptStrategy:
     # （_has_all_placeholders 对空 mapping 永远返回 True）和 restore()（空 mapping
     # 下是恒等操作）自动退化成"不做任何事"，不需要额外分支。
     wrap_control_codes: bool = True
+    # 随请求体一起发给 provider 的采样参数覆盖（temperature/top_p 等，OpenAI 兼容
+    # 字段名）。不同 provider 的合理默认值差别很大：DeepSeek 之类通用云端模型没有
+    # 已知需要偏离默认值的证据，留空不覆盖；专门微调过的本地小模型（见
+    # sakura_prompt.py）有官方推荐的低温度设置，不覆盖的话吃的是模型部署时
+    # Modelfile 里的默认值——那个值不一定等于官方推荐（实测部署环境里是
+    # temperature=0.3/top_p=0.8，官方推荐 0.1/0.3），温度越高越容易触发批量格式
+    # 跑偏/夹带上下文这类需要重试的问题。
+    extra_body: dict = field(default_factory=dict)
 
 
 DEFAULT_PROMPT_STRATEGY = PromptStrategy(
@@ -228,6 +240,7 @@ async def translate_units(
     auto_retry_rounds: int = _AUTO_RETRY_ROUNDS,
     retry_wait_seconds: float = _AUTO_RETRY_WAIT_SECONDS,
     prompt_strategy: PromptStrategy = DEFAULT_PROMPT_STRATEGY,
+    on_log: Callable[[str], None] | None = None,
 ) -> list[tuple[str, str]]:
     """按 source_text 去重分组，相同原文只调用一次 LLM；多个不同分组打包进同一次请求
     （见 batch_size），减少大文本量下的请求数和重复的 system prompt token 开销。同一个
@@ -237,6 +250,10 @@ async def translate_units(
 
     on_progress(completed, total) 在每个去重分组处理完（无论成功还是失败）后调用一次，
     供 GUI 显示"翻译批次 X/Y" 进度用（见 spec 第 10 节），不传则跳过。
+
+    on_log(message) 在单条/整批请求失败、批次退化拆分、自动重试轮开始时各调用一次，
+    供 GUI 在日志框里实时展示这些中间状态（不然进度条卡住时用户分不清是真卡住了还是
+    正在退避重试），不传则跳过。
 
     cancel_check() 在每个批次真正发请求前检查一次：返回 True 就跳过这个批次，不发起
     新的 API 调用（对应用户点了"停止"或者软件被要求中断）。已经在缓存命中路径写完的
@@ -309,6 +326,9 @@ async def translate_units(
     def _record_failure(job: Job, error: BaseException, count_progress: bool = True) -> None:
         nonlocal completed
         failures.append((job.source_text, str(error)))
+        if on_log is not None:
+            preview = job.source_text if len(job.source_text) <= 20 else job.source_text[:20] + "…"
+            on_log(f"翻译失败，已跳过：{preview!r} - {error}")
         if count_progress:
             completed += 1
             if on_progress is not None:
@@ -329,7 +349,9 @@ async def translate_units(
             if _cancelled():
                 return
             try:
-                raw = await _chat_cancellable(client, system_prompt, user_prompt, _cancelled)
+                raw = await _chat_cancellable(
+                    client, system_prompt, user_prompt, _cancelled, prompt_strategy.extra_body
+                )
             except _StopRequested:
                 return  # 被停止打断，保留 pending，不计入失败，下次重跑续译
             except Exception as e:  # noqa: BLE001 - 单条失败只跳过，不拖累其它条目
@@ -350,6 +372,19 @@ async def translate_units(
         store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
         _write_result(job.group, translated_text, count_progress)
 
+    async def _bisect_batch(batch: list[Job], count_progress: bool) -> None:
+        # 整批请求失败/解析失败时的退化路径：二分成两半各自重新走 _translate_batch，
+        # 而不是直接拆成 len(batch) 次单条调用——多数情况下问题只集中在其中一部分
+        # （批里某一条被内容审核拒绝导致打包请求整体报错；或者模型偶尔多吐/漏吐了
+        # 一行导致行数对不齐），另一半下一轮还能整批过，不用全部陪葬成单条请求。
+        # 递归二分到剩一条时 _translate_batch 会自然退化成 _translate_single_job，
+        # 真正有问题的条目照样能被单独定位、单独重试。
+        mid = len(batch) // 2
+        await asyncio.gather(
+            _translate_batch(batch[:mid], count_progress),
+            _translate_batch(batch[mid:], count_progress),
+        )
+
     async def _translate_batch(batch: list[Job], count_progress: bool = True) -> None:
         if len(batch) == 1:
             await _translate_single_job(batch[0], count_progress)
@@ -360,22 +395,22 @@ async def translate_units(
             if _cancelled():
                 return
             try:
-                raw = await _chat_cancellable(client, system_prompt, user_prompt, _cancelled)
+                raw = await _chat_cancellable(
+                    client, system_prompt, user_prompt, _cancelled, prompt_strategy.extra_body
+                )
             except _StopRequested:
                 return  # 被停止打断，整批保留 pending，不计入失败，下次重跑续译
-            except Exception:
-                # 整批请求失败（比如批里某一条被内容审核拒绝，导致打包请求整体报错），
-                # 退化成逐条调用——批里没问题的条目仍然能各自成功，只有真正有问题的
-                # 那一条会在 _translate_single_job 里被单独记录为失败并跳过。
-                await asyncio.gather(
-                    *(_translate_single_job(job, count_progress) for job in batch)
-                )
+            except Exception as e:
+                if on_log is not None:
+                    on_log(f"批次请求失败（{len(batch)} 条），拆分重试：{e}")
+                await _bisect_batch(batch, count_progress)
                 return
 
         parsed = prompt_strategy.parse_batch_response(raw, len(batch))
         if parsed is None:
-            # 模型没按格式回，退化成逐条调用，保证正确性（牺牲这一批的省 token 收益）
-            await asyncio.gather(*(_translate_single_job(job, count_progress) for job in batch))
+            if on_log is not None:
+                on_log(f"批次回复解析失败（{len(batch)} 条），拆分重试")
+            await _bisect_batch(batch, count_progress)
             return
 
         fallback_jobs: list[Job] = []
@@ -402,9 +437,11 @@ async def translate_units(
     await asyncio.gather(*(_translate_batch(batch) for batch in batches))
 
     jobs_by_source = {job.source_text: job for job in jobs}
-    for _ in range(auto_retry_rounds):
+    for round_idx in range(auto_retry_rounds):
         if not failures or _cancelled():
             break
+        if on_log is not None:
+            on_log(f"第 {round_idx + 1}/{auto_retry_rounds} 轮自动重试：{len(failures)} 条待重试")
         await _interruptible_sleep(retry_wait_seconds, _cancelled)
         if _cancelled():
             break
