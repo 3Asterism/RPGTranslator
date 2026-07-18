@@ -104,6 +104,11 @@ QLabel#infoLabel {
     color: #626b7d;
     padding: 2px 2px;
 }
+QLabel#windowTitleLabel {
+    color: #1f2430;
+    font-size: 16px;
+    font-weight: 700;
+}
 QPushButton {
     background: #5468e0;
     color: white;
@@ -289,6 +294,18 @@ class MainWindow(QMainWindow):
         self._session_cost_cny = 0.0
         self._session_has_unpriced_model = False
 
+        self._title_label = QLabel("RPG Maker 汉化工具")
+        self._title_label.setObjectName("windowTitleLabel")
+
+        self._settings_button = QPushButton("⚙ 设置")
+        self._settings_button.setObjectName("secondaryButton")
+        self._settings_button.clicked.connect(self._open_settings)
+
+        header_row = QHBoxLayout()
+        header_row.addWidget(self._title_label)
+        header_row.addStretch(1)
+        header_row.addWidget(self._settings_button)
+
         self._drop_area = DropArea()
         self._drop_area.path_dropped.connect(self._on_path_dropped)
 
@@ -309,9 +326,15 @@ class MainWindow(QMainWindow):
         self._stop_button.setVisible(False)
         self._stop_button.clicked.connect(self._on_stop_clicked)
 
+        self._retry_failed_button = QPushButton("重试失败项")
+        self._retry_failed_button.setObjectName("secondaryButton")
+        self._retry_failed_button.setVisible(False)
+        self._retry_failed_button.clicked.connect(self._on_retry_failed_clicked)
+
         start_row = QHBoxLayout()
         start_row.addWidget(self._start_button)
         start_row.addWidget(self._stop_button)
+        start_row.addWidget(self._retry_failed_button)
         start_row.addStretch(1)
 
         self._progress_bar = QProgressBar()
@@ -398,14 +421,12 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setSpacing(14)
         layout.setContentsMargins(18, 18, 18, 18)
+        layout.addLayout(header_row)
         layout.addWidget(project_box)
         layout.addWidget(translate_box, stretch=1)
         layout.addWidget(inject_box)
         layout.addWidget(share_box)
         self.setCentralWidget(central)
-
-        settings_action = self.menuBar().addAction("设置")
-        settings_action.triggered.connect(self._open_settings)
 
         self._usage_label = QLabel("本次会话：暂无 token 用量")
         self._usage_label.setObjectName("usageLabel")
@@ -469,6 +490,7 @@ class MainWindow(QMainWindow):
         self._start_button.setEnabled(True)
         self._inject_button.setEnabled(False)
         self._open_output_button.setVisible(False)
+        self._retry_failed_button.setVisible(False)
         if not self._output_dir_edit.text().strip():
             self._output_dir_edit.setText(str(default_output_dir(path)))
 
@@ -512,6 +534,7 @@ class MainWindow(QMainWindow):
         self._stop_button.setVisible(False)
         self._inject_button.setEnabled(False)
         self._open_output_button.setVisible(False)
+        self._retry_failed_button.setVisible(False)
         self._progress_bar.setRange(0, 0)  # 不确定进度，先用忙碌样式
         self._log_message("提取中…")
 
@@ -540,6 +563,13 @@ class MainWindow(QMainWindow):
             self._reset_after_translate()
             return
 
+        self._start_translate_worker()
+
+    def _start_translate_worker(self) -> None:
+        """起一个 TranslateWorker 翻译 db 里当前的 pending 条目——只翻译，不重新走
+        提取/术语抽取。首次翻译（提取+术语确认后）和「重试失败项」（失败条目还是
+        pending，直接重跑这一步就够）都调用这个方法，避免两处各写一遍起 worker 的逻辑。
+        """
         qsettings = QSettings(ORG_NAME, APP_NAME)
         model = str(qsettings.value("model", "deepseek-v4-flash"))
         concurrency = int(qsettings.value("concurrency", 4))
@@ -547,6 +577,7 @@ class MainWindow(QMainWindow):
         fallback_api_key, fallback_base_url, fallback_model = resolve_fallback_config(qsettings)
         api_key = get_deepseek_api_key()
 
+        self._retry_failed_button.setVisible(False)
         self._translate_worker = TranslateWorker(
             self._db_path,
             api_key,
@@ -563,6 +594,7 @@ class MainWindow(QMainWindow):
         self._translate_worker.usage_changed.connect(self._on_usage_changed)
         self._translate_worker.failed.connect(self._on_failed)
         self._translate_worker.start()
+        self._start_button.setEnabled(False)
         self._stop_button.setVisible(True)
         self._stop_button.setEnabled(True)
 
@@ -575,7 +607,8 @@ class MainWindow(QMainWindow):
         self._log_message(f"翻译完成，共 {unit_count} 条，可以点击下方“注入到游戏”写回。")
         if failures:
             self._log_message(
-                f"{len(failures)} 条翻译失败已跳过（保留待译状态，重新点「开始翻译」可续译）："
+                f"{len(failures)} 条翻译失败已跳过（保留待译状态，点「重试失败项」"
+                "或重新点「开始翻译」可续译）："
             )
             for source_text, error in failures[:10]:
                 preview = source_text[:30].replace("\n", " ")
@@ -587,6 +620,13 @@ class MainWindow(QMainWindow):
         self._start_button.setEnabled(True)
         self._inject_button.setEnabled(True)
         self._stop_button.setVisible(False)
+        self._retry_failed_button.setVisible(bool(failures))
+
+    def _on_retry_failed_clicked(self) -> None:
+        """失败条目还保留着 status="pending"，直接重跑翻译这一步就够——不用再走一遍
+        提取/术语抽取（术语表已经在 db 里，工程文本也没变）。"""
+        self._log_message("重试失败项…")
+        self._start_translate_worker()
 
     def _on_stop_clicked(self) -> None:
         if self._translate_worker is None:
@@ -748,6 +788,7 @@ class MainWindow(QMainWindow):
     def _reset_after_translate(self) -> None:
         self._start_button.setEnabled(self._adapter is not None)
         self._stop_button.setVisible(False)
+        self._retry_failed_button.setVisible(False)
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
 

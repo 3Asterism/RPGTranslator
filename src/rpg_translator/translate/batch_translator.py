@@ -50,6 +50,22 @@ class _StopRequested(Exception):
 # 期间还在继续消耗 token。
 _CANCEL_POLL_INTERVAL = 0.2
 
+# 一轮 pending 批次跑完后，仍失败的条目（比如当时所有 provider 恰好都在限流/抖动）
+# 原地自动重试的轮数和轮间等待——LLMClient.chat 内部已经对单次调用做过重试+故障
+# 转移，这里的失败是用尽底层手段后的结果，多等几秒再整体重跑一次，用来应对"过一会
+# 就恢复"的瞬时性问题，不是无意义的立即重试。
+_AUTO_RETRY_ROUNDS = 2
+_AUTO_RETRY_WAIT_SECONDS = 5.0
+
+
+async def _interruptible_sleep(seconds: float, cancelled: Callable[[], bool]) -> None:
+    """可被 cancel_check 打断的等待：不用户点了停止还要傻等满这几秒才响应。"""
+    remaining = seconds
+    while remaining > 0 and not cancelled():
+        step = min(_CANCEL_POLL_INTERVAL, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+
 
 async def _chat_cancellable(
     client: LLMClient, system_prompt: str, user_prompt: str, cancelled: Callable[[], bool]
@@ -117,6 +133,8 @@ async def translate_units(
     on_progress: Callable[[int, int], None] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     cancel_check: Callable[[], bool] | None = None,
+    auto_retry_rounds: int = _AUTO_RETRY_ROUNDS,
+    retry_wait_seconds: float = _AUTO_RETRY_WAIT_SECONDS,
 ) -> list[tuple[str, str]]:
     """按 source_text 去重分组，相同原文只调用一次 LLM；多个不同分组打包进同一次请求
     （见 batch_size），减少大文本量下的请求数和重复的 system prompt token 开销。
@@ -132,7 +150,13 @@ async def translate_units(
     单条 LLM 调用即使重试完所有 provider 依然失败（比如某条文本被内容审核拒绝、返回
     不可重试的 4xx），也只跳过那一条——保持 status="pending" 供下次重跑续译，不会像
     asyncio.gather 默认行为那样一条报错就取消掉同批甚至其它并发批次里已经在跑的翻译。
-    返回值是失败条目的 (source_text, 错误信息) 列表，供调用方汇报"N 条被跳过"。
+
+    第一轮跑完所有 pending 分组后，仍失败的条目会原地自动重试最多 _AUTO_RETRY_ROUNDS
+    轮、轮间隔 _AUTO_RETRY_WAIT_SECONDS 秒（应对"当时所有 provider 恰好都在限流/抖动，
+    隔几秒会恢复"的场景）；重试轮不会重复计入 on_progress 的 completed 计数。点了停止
+    会在轮次之间的等待、以及每轮发请求前被检查到，不会傻等完剩余轮次。
+
+    返回值是最终仍失败条目的 (source_text, 错误信息) 列表，供调用方汇报"N 条被跳过"。
     """
     system_prompt = _build_system_prompt(glossary)
     semaphore = asyncio.Semaphore(concurrency)
@@ -157,20 +181,24 @@ async def translate_units(
     completed = 0
     failures: list[tuple[str, str]] = []
 
-    def _write_result(group: list[TextUnit], translated_text: str) -> None:
+    def _write_result(
+        group: list[TextUnit], translated_text: str, count_progress: bool = True
+    ) -> None:
         nonlocal completed
         for unit in group:
             store.update_translation(unit.id, translated_text, status="translated")
-        completed += 1
-        if on_progress is not None:
-            on_progress(completed, total)
+        if count_progress:
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, total)
 
-    def _record_failure(job: _Job, error: BaseException) -> None:
+    def _record_failure(job: _Job, error: BaseException, count_progress: bool = True) -> None:
         nonlocal completed
         failures.append((job.source_text, str(error)))
-        completed += 1
-        if on_progress is not None:
-            on_progress(completed, total)
+        if count_progress:
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, total)
 
     for group, cached in cache_hits:
         _write_result(group, cached)
@@ -178,7 +206,7 @@ async def translate_units(
     def _cancelled() -> bool:
         return cancel_check is not None and cancel_check()
 
-    async def _translate_single_job(job: _Job) -> None:
+    async def _translate_single_job(job: _Job, count_progress: bool = True) -> None:
         user_prompt = _build_single_user_prompt(job.protected_text, job.context)
         async with semaphore:
             # 取消检查放在拿到并发名额之后、真正发请求之前：还在排队等名额的批次，
@@ -191,15 +219,15 @@ async def translate_units(
             except _StopRequested:
                 return  # 被停止打断，保留 pending，不计入失败，下次重跑续译
             except Exception as e:  # noqa: BLE001 - 单条失败只跳过，不拖累其它条目
-                _record_failure(job, e)
+                _record_failure(job, e, count_progress)
                 return
         translated_text = restore(raw.strip(), job.mapping)
         store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
-        _write_result(job.group, translated_text)
+        _write_result(job.group, translated_text, count_progress)
 
-    async def _translate_batch(batch: list[_Job]) -> None:
+    async def _translate_batch(batch: list[_Job], count_progress: bool = True) -> None:
         if len(batch) == 1:
-            await _translate_single_job(batch[0])
+            await _translate_single_job(batch[0], count_progress)
             return
 
         user_prompt = _build_batch_user_prompt(batch)
@@ -214,20 +242,39 @@ async def translate_units(
                 # 整批请求失败（比如批里某一条被内容审核拒绝，导致打包请求整体报错），
                 # 退化成逐条调用——批里没问题的条目仍然能各自成功，只有真正有问题的
                 # 那一条会在 _translate_single_job 里被单独记录为失败并跳过。
-                await asyncio.gather(*(_translate_single_job(job) for job in batch))
+                await asyncio.gather(
+                    *(_translate_single_job(job, count_progress) for job in batch)
+                )
                 return
 
         parsed = _parse_batch_response(raw, len(batch))
         if parsed is None:
             # 模型没按格式回，退化成逐条调用，保证正确性（牺牲这一批的省 token 收益）
-            await asyncio.gather(*(_translate_single_job(job) for job in batch))
+            await asyncio.gather(*(_translate_single_job(job, count_progress) for job in batch))
             return
 
         for i, job in enumerate(batch, start=1):
             translated_text = restore(parsed[i], job.mapping)
             store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
-            _write_result(job.group, translated_text)
+            _write_result(job.group, translated_text, count_progress)
 
     batches = [jobs[i : i + batch_size] for i in range(0, len(jobs), batch_size)]
     await asyncio.gather(*(_translate_batch(batch) for batch in batches))
+
+    jobs_by_source = {job.source_text: job for job in jobs}
+    for _ in range(auto_retry_rounds):
+        if not failures or _cancelled():
+            break
+        await _interruptible_sleep(retry_wait_seconds, _cancelled)
+        if _cancelled():
+            break
+        retry_jobs = [jobs_by_source[source_text] for source_text, _error in failures]
+        failures.clear()
+        retry_batches = [
+            retry_jobs[i : i + batch_size] for i in range(0, len(retry_jobs), batch_size)
+        ]
+        await asyncio.gather(
+            *(_translate_batch(batch, count_progress=False) for batch in retry_batches)
+        )
+
     return failures

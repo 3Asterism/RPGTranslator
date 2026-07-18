@@ -360,6 +360,107 @@ async def test_translate_units_skips_failing_job_without_aborting_batch(tmp_path
         assert failures[0][0] == "包含违禁内容的句子"
 
 
+class _FlakyThenSucceedsStub:
+    """前几次调用报错、之后成功——模拟"当时所有 provider 都在限流/抖动，
+    过几秒会恢复"的场景，用来验证自动重试轮确实能把最终失败的条目救回来。"""
+
+    def __init__(self, fail_times: int):
+        self.fail_times = fail_times
+        self.call_count = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        self.call_count += 1
+        if self.call_count <= self.fail_times:
+            raise RuntimeError("503 Service Unavailable")
+        return "翻译结果"
+
+
+@pytest.mark.anyio
+async def test_translate_units_auto_retries_transient_failure_until_success(tmp_path: Path):
+    stub = _FlakyThenSucceedsStub(fail_times=1)
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit("1", "こんにちは")
+        store.upsert_units([unit])
+
+        failures = await translate_units(
+            stub, store, [unit], glossary={}, concurrency=4, batch_size=1,
+            retry_wait_seconds=0,
+        )
+
+        assert failures == []
+        assert store.get_unit("1").status == "translated"
+        assert stub.call_count == 2  # 第一轮失败 + 自动重试第一轮成功
+
+
+@pytest.mark.anyio
+async def test_translate_units_auto_retry_does_not_double_count_progress(tmp_path: Path):
+    """重试轮成功/失败都不应该让 completed 超过 total——不然 GUI 进度条会跑飞。"""
+    stub = _FlakyThenSucceedsStub(fail_times=1)
+    progress_calls: list[tuple[int, int]] = []
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit("1", "こんにちは")
+        store.upsert_units([unit])
+
+        await translate_units(
+            stub, store, [unit], glossary={}, concurrency=4, batch_size=1,
+            retry_wait_seconds=0,
+            on_progress=lambda done, total: progress_calls.append((done, total)),
+        )
+
+        assert progress_calls == [(1, 1)]  # 重试轮成功不再重复触发 on_progress
+
+
+@pytest.mark.anyio
+async def test_translate_units_auto_retry_exhausted_still_fails(tmp_path: Path):
+    stub = _FlakyStub("こんにちは")  # 永远失败，模拟内容审核拒绝这类不可恢复的错误
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit("1", "こんにちは")
+        store.upsert_units([unit])
+
+        failures = await translate_units(
+            stub, store, [unit], glossary={}, concurrency=4, batch_size=1,
+            retry_wait_seconds=0, auto_retry_rounds=2,
+        )
+
+        assert len(failures) == 1
+        assert store.get_unit("1").status == "pending"
+        assert stub.call_count == 3  # 1 次初始 + 2 轮自动重试，全部失败
+
+
+@pytest.mark.anyio
+async def test_translate_units_cancel_stops_auto_retry(tmp_path: Path):
+    """点了停止之后，自动重试轮不应该再发起新请求，也不应该傻等满重试间隔。"""
+    stub = _FlakyStub("こんにちは")
+    cancelled = False
+
+    def _cancel_check() -> bool:
+        return cancelled
+
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit("1", "こんにちは")
+        store.upsert_units([unit])
+
+        task = asyncio.create_task(
+            translate_units(
+                stub, store, [unit], glossary={}, concurrency=4, batch_size=1,
+                retry_wait_seconds=10,  # 故意设大：真的被打断而不是等满才会快速返回
+                cancel_check=_cancel_check,
+            )
+        )
+        for _ in range(200):
+            if stub.call_count >= 1:
+                break
+            await asyncio.sleep(0.01)
+        assert stub.call_count == 1
+        cancelled = True
+
+        failures = await asyncio.wait_for(task, timeout=2.0)
+
+        assert stub.call_count == 1  # 没有发起自动重试的请求
+        assert len(failures) == 1  # 第一轮的失败仍如实报告
+        assert store.get_unit("1").status == "pending"
+
+
 @pytest.mark.anyio
 async def test_translate_units_cancel_stops_new_batches_and_aborts_in_flight(
     tmp_path: Path,
