@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+import httpx
 import pytest
+from PySide6.QtWidgets import QDialog, QMessageBox
 
 from rpg_translator.config import Settings, get_deepseek_api_key
 from rpg_translator.gui.main_window import (
     MainWindow,
+    _format_duration,
     db_path_for_project,
     default_output_dir,
     resolve_dropped_path,
@@ -15,10 +19,91 @@ from rpg_translator.gui.settings_dialog import ENGINE_LOCAL, ENGINE_ONLINE, Sett
 from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker
 
 
+def _mock_transport(status_code: int = 200) -> httpx.MockTransport:
+    """假的 httpx transport，不碰真实网络——注入 SettingsDialog._connectivity_transport，
+    用来在测试里模拟"服务端有响应"（不管 2xx 还是 401，只要收到响应就算连通）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code)
+
+    return httpx.MockTransport(handler)
+
+
+def _unreachable_transport() -> httpx.MockTransport:
+    """模拟连接失败（DNS/连接拒绝这类传输层错误），不是收到了错误状态码的响应。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    return httpx.MockTransport(handler)
+
+
 def test_main_window_constructs_with_start_disabled(qapp):
     window = MainWindow()
     assert window._start_button.isEnabled() is False
     assert window._adapter is None
+
+
+def test_format_duration_formats_seconds_minutes_hours():
+    assert _format_duration(30) == "30 秒"
+    assert _format_duration(90) == "2 分钟"
+    assert _format_duration(7200) == "2 小时"
+    assert _format_duration(4860) == "1 小时 21 分钟"  # 1.35 小时该拆成"时+分"而不是一个小数
+    assert _format_duration(-5) == "0 秒"  # 时钟/取整误差导致的负数不应该显示成负的
+
+
+def test_main_window_compute_eta_text_before_enough_samples_shows_placeholder(qapp):
+    """样本不够（还没攒够至少 2 个进度点）或者一条都没翻完时，不硬算一个不靠谱的速度。"""
+    window = MainWindow()
+    assert window._compute_eta_text(0, 100, time.monotonic()) == "翻译速度：统计中…"
+
+    window._progress_samples.append((time.monotonic(), 1))
+    assert window._compute_eta_text(1, 100, time.monotonic()) == "翻译速度：统计中…"
+
+
+def test_main_window_compute_eta_text_computes_speed_and_remaining(qapp):
+    window = MainWindow()
+    window._progress_samples.append((0.0, 0))
+    window._progress_samples.append((10.0, 5))  # 10 秒完成 5 批 -> 0.5 批/秒 -> 30 批/分钟
+
+    text = window._compute_eta_text(5, 100, 10.0)
+
+    assert "30.0 批/分钟" in text
+    assert "还剩 95 批" in text
+    # 剩余 95 批 / 0.5 批/秒 = 190 秒 ≈ 3 分钟
+    assert "3 分钟" in text
+
+
+def test_main_window_compute_eta_text_all_done_has_no_remaining_text(qapp):
+    window = MainWindow()
+    window._progress_samples.append((0.0, 0))
+    window._progress_samples.append((10.0, 100))
+
+    text = window._compute_eta_text(100, 100, 10.0)
+
+    assert "批/分钟" in text
+    assert "还剩" not in text
+
+
+def test_main_window_on_progress_changed_updates_eta_label(qapp):
+    window = MainWindow()
+    window._on_progress_changed(0, 10)
+    assert window._eta_label.text() == "翻译速度：统计中…"
+    assert len(window._progress_samples) == 1
+
+
+def test_main_window_on_progress_changed_bursts_do_not_inflate_sample_count(qapp):
+    """按事件页面分组打包后，一次请求解析完会在同一个同步循环里背靠背连续 emit
+    几十个 on_progress（见 batch_translator._translate_batch）——这些调用之间真实
+    耗时几乎为 0。如果每次都存一个样本，deque(maxlen=20) 会被这一个瞬间的爆发
+    全部填满，"最老样本到现在"的时间差趋近于 0，算出来的速度会离谱地飙到几千/上万
+    批每分钟（实测复现过 11004.4 批/分钟）。取样本身要按最小时间间隔节流，同一次
+    爆发只应该落进 1 个样本点。"""
+    window = MainWindow()
+    for i in range(1, 51):
+        window._on_progress_changed(i, 100)
+
+    assert len(window._progress_samples) <= 2
 
 
 def test_drop_recognized_mz_project_enables_start_and_shows_engine(qapp, mz_project: Path):
@@ -239,6 +324,7 @@ def test_settings_dialog_persists_model_concurrency_output_dir(qapp):
     dialog._concurrency_spin.setValue(16)
     dialog._output_dir_edit.setText("my_output")
     dialog._api_key_edit.setText("test-key-not-real")
+    dialog._connectivity_transport = _mock_transport()
 
     dialog._on_accept()
 
@@ -258,6 +344,8 @@ def test_settings_dialog_persists_base_url_and_fallback_provider(qapp):
     dialog._fallback_api_key_edit.setText("fallback-key-not-real")
     dialog._fallback_base_url_edit.setText("https://dashscope.aliyuncs.com/compatible-mode/v1")
     dialog._fallback_model_edit.setText("qwen-plus")
+    dialog._api_key_edit.setText("test-key-not-real")
+    dialog._connectivity_transport = _mock_transport()
 
     dialog._on_accept()
 
@@ -289,6 +377,8 @@ def test_settings_dialog_selecting_online_engine_shows_online_box(qapp):
     assert not dialog._online_box.isHidden()
     assert dialog._local_box.isHidden()
 
+    dialog._api_key_edit.setText("test-key-not-real")
+    dialog._connectivity_transport = _mock_transport()
     dialog._on_accept()
     assert SettingsDialog().engine == ENGINE_ONLINE
 
@@ -304,6 +394,7 @@ def test_settings_dialog_persists_local_engine_config(qapp):
 
     dialog._local_base_url_edit.setText("http://192.168.1.10:11434/v1")
     dialog._local_model_edit.setText("sakura-galtransl")
+    dialog._connectivity_transport = _mock_transport()
 
     dialog._on_accept()
 
@@ -313,6 +404,95 @@ def test_settings_dialog_persists_local_engine_config(qapp):
     assert reloaded.local_model == "sakura-galtransl"
     # 在线引擎切走之后 fallback 的说明框应该隐藏，不误导用户以为本地引擎也有故障转移
     assert reloaded._fallback_box.isHidden()
+
+
+def _select_online_engine(dialog: SettingsDialog) -> None:
+    # QSettings 跨测试共享同一个临时 ini（见 conftest.py），显式选中"在线"而不是依赖
+    # 默认值，避免被前面把引擎切成本地的测试污染。
+    dialog._engine_combo.setCurrentIndex(dialog._engine_combo.findData(ENGINE_ONLINE))
+
+
+def test_settings_dialog_check_connectivity_succeeds_when_server_responds(qapp):
+    """只要服务端有响应就算"连得上"，哪怕是 401（key 错）也不算连通性失败——
+    key/模型名对不对是另一回事，留给真正翻译时的报错反馈。"""
+    dialog = SettingsDialog()
+    _select_online_engine(dialog)
+    dialog._api_key_edit.setText("wrong-key")
+    dialog._connectivity_transport = _mock_transport(status_code=401)
+
+    ok, error = dialog._check_connectivity()
+
+    assert ok is True
+    assert error == ""
+
+
+def test_settings_dialog_check_connectivity_fails_on_5xx_response(qapp):
+    """502/504 这类网关错误不算"连通"——本机走系统代理时，代理能正常应答但连不上
+    局域网里真正的目标地址会回这个，客户端确实收到了响应，但要连的地址其实没通。"""
+    dialog = SettingsDialog()
+    _select_online_engine(dialog)
+    dialog._api_key_edit.setText("test-key")
+    dialog._connectivity_transport = _mock_transport(status_code=502)
+
+    ok, error = dialog._check_connectivity()
+
+    assert ok is False
+    assert "502" in error
+
+
+def test_settings_dialog_check_connectivity_fails_on_transport_error(qapp):
+    dialog = SettingsDialog()
+    _select_online_engine(dialog)
+    dialog._api_key_edit.setText("test-key")
+    dialog._connectivity_transport = _unreachable_transport()
+
+    ok, error = dialog._check_connectivity()
+
+    assert ok is False
+    assert error  # 带上了具体的错误信息，不是空字符串
+
+
+def test_settings_dialog_check_connectivity_fails_when_online_api_key_empty(qapp):
+    dialog = SettingsDialog()
+    _select_online_engine(dialog)
+    dialog._api_key_edit.setText("")
+    dialog._connectivity_transport = _mock_transport()
+
+    ok, error = dialog._check_connectivity()
+
+    assert ok is False
+    assert "API Key" in error
+
+
+def test_settings_dialog_check_connectivity_fails_when_local_base_url_empty(qapp):
+    dialog = SettingsDialog()
+    index = dialog._engine_combo.findData(ENGINE_LOCAL)
+    dialog._engine_combo.setCurrentIndex(index)
+    dialog._local_base_url_edit.setText("")
+    dialog._connectivity_transport = _mock_transport()
+
+    ok, error = dialog._check_connectivity()
+
+    assert ok is False
+    assert "Base URL" in error
+
+
+def test_settings_dialog_on_accept_does_not_save_when_connectivity_check_fails(
+    qapp, monkeypatch
+):
+    """连通性检查没过时，_on_accept 不应该落盘设置——不能悄悄存下一个连不上的配置。"""
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)  # 测试环境没人点掉弹窗
+
+    baseline = SettingsDialog().concurrency
+    dialog = SettingsDialog()
+    dialog._api_key_edit.setText("test-key")
+    dialog._concurrency_spin.setValue(baseline + 1)
+    dialog._connectivity_transport = _unreachable_transport()
+
+    dialog._on_accept()
+
+    assert dialog.result() != int(QDialog.DialogCode.Accepted)
+    assert SettingsDialog().concurrency == baseline
 
 
 def test_extract_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):
