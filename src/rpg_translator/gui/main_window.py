@@ -169,10 +169,12 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
     background: #f4f6f9;
     color: #9aa1b2;
 }
-QComboBox::drop-down {
-    border: none;
-    width: 24px;
-}
+/* 不自定义 QComboBox::drop-down/::down-arrow——QSS 一旦碰了 ::drop-down，Qt 就不
+   再画原生箭头，之前这里定义了 ::drop-down 却没配套画箭头，导致所有下拉框（包括
+   原来的"模型"选择框）看起来都不像能点开。试过用 QSS 边框三角形技巧补一个箭头，
+   但 Qt 的 QSS 盒模型不支持透明边框拼三角形（会渲染成一个实心色块），不是真正的
+   三角形——与其加图片资源文件，不如干脆不碰这两个子控件，让 Qt 画各平台原生的
+   下拉箭头，零资源依赖、保证渲染正确。 */
 QComboBox QAbstractItemView {
     background: #ffffff;
     color: #1f2430;
