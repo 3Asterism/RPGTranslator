@@ -1,6 +1,6 @@
 [project]
 name = "rpg_translator"
-version = "0.5.1"
+version = "0.5.5"
 description = "RPG Maker MV/MZ/VX Ace 文本提取/翻译/回填工具"
 requires-python = ">=3.11"
 dependencies = [
