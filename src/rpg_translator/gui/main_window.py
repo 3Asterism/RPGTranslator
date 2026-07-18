@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QUrl, Signal
@@ -236,6 +238,18 @@ def default_output_dir(project_dir: Path) -> Path:
     return project_dir.parent / f"{project_dir.name}_汉化"
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f} 秒"
+    total_minutes = round(seconds / 60)
+    if total_minutes < 60:
+        return f"{total_minutes} 分钟"
+    hours, minutes = divmod(total_minutes, 60)
+    # "1.3 小时" 得自己心算才知道是多少分钟，直接拆成"小时+分钟"更直观。
+    return f"{hours} 小时 {minutes} 分钟" if minutes else f"{hours} 小时"
+
+
 class DropArea(QFrame):
     """接受拖入游戏文件夹或 Game.exe（拖 exe 时自动定位到其所在目录）。"""
 
@@ -299,6 +313,27 @@ class MainWindow(QMainWindow):
         self._session_cost_cny = 0.0
         self._session_has_unpriced_model = False
 
+        # 翻译速度/剩余时间预估：只在当前这一次 TranslateWorker 运行期间有意义，每次
+        # 重新起 worker（首次翻译、重试失败项）都要清空，不能带着上一轮的速度残留。
+        # 用最近一小段窗口内的样本算速度（而不是从头到尾的总平均），是因为翻译请求是
+        # 一批一批完成的（见 batch_translator.py），进度是一阵一阵跳的，用最近窗口能
+        # 更快反映"最近是不是变快/变慢了"（比如撞到限流退避），比全程平均更贴近实时。
+        self._progress_samples: deque[tuple[float, int]] = deque(maxlen=20)
+        # 见 _on_progress_changed 的节流注释；-1 保证 worker 起来后第一条进度必然打印。
+        self._last_progress_log_time: float = -1.0
+        # 速度/ETA 文本单独节流：显示这一步按更长的间隔重算一次，避免跟着每次进度
+        # 信号刷新（人眼跟不上）。
+        self._last_eta_update_time: float = -1.0
+        # 样本本身也要按真实时间间隔采集，不能每次进度信号来了就存一个——现在翻译是
+        # 按事件页面分组打包提交的（见 batch_translator.py），一次请求解析完，几十条
+        # 台词的 on_progress 会在同一个同步循环里背靠背连续触发，这些样本时间戳几乎
+        # 相同。如果这几十个样本恰好把 deque(maxlen=20) 的窗口填满，"最老样本到现在"
+        # 的 elapsed 会趋近于 0，而 completed 差值却是几十，算出来的速度会离谱地飙到
+        # 几千甚至上万批/分钟（实测复现过 11004.4 批/分钟）。按最小时间间隔取样能
+        # 保证同一批请求内部的连续触发只记一个点，窗口跨度反映的是真实请求节奏。
+        self._last_sample_time: float = -1.0
+        self._SAMPLE_MIN_INTERVAL_SECONDS = 1.0
+
         self._title_label = QLabel("RPG Maker 汉化工具")
         self._title_label.setObjectName("windowTitleLabel")
 
@@ -345,14 +380,24 @@ class MainWindow(QMainWindow):
         self._progress_bar = QProgressBar()
         self._progress_bar.setRange(0, 100)
 
+        self._eta_label = QLabel("")
+        self._eta_label.setObjectName("etaLabel")
+
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMinimumHeight(160)
+        # 大工程翻译动辄几万条，每条都往这里 append 一行会让文档 + 撤销历史无限膨胀
+        # （QPlainTextEdit 默认开着撤销栈，只读控件用不上撤销），实测这是导致长时间
+        # 翻译后原生崩溃（ucrtbase fastfail，Python 异常接不住）的主因之一，见
+        # _on_progress_changed 的节流注释。这里做兜底：只读控件关掉撤销，行数封顶。
+        self._log.setUndoRedoEnabled(False)
+        self._log.setMaximumBlockCount(5000)
 
         translate_box = QGroupBox("2. 翻译（后台跑，结果先存本地，不动游戏文件）")
         translate_layout = QVBoxLayout(translate_box)
         translate_layout.addLayout(start_row)
         translate_layout.addWidget(self._progress_bar)
+        translate_layout.addWidget(self._eta_label)
         translate_layout.addWidget(self._log)
 
         self._load_translated_button = QPushButton("选择已翻译工程…")
@@ -574,14 +619,25 @@ class MainWindow(QMainWindow):
             api_key, base_url, model = resolve_local_config(qsettings)
             fallback_api_key = fallback_base_url = fallback_model = None
             prompt_strategy = SAKURA_PROMPT_STRATEGY
+            # 本地量化小模型处理一批几十条的请求天然比云端 API 慢（实测局域网测试机
+            # 上一批 20 行在并发负载下就要 15+ 秒），共用云端那套 60 秒超时容易在
+            # 批次较大或并发排队时误触发超时重试，反而更慢——给本地引擎一个更宽松
+            # 的超时。
+            timeout = 180.0
         else:
             model = str(qsettings.value("model", "deepseek-v4-flash"))
             base_url = resolve_base_url(qsettings)
             fallback_api_key, fallback_base_url, fallback_model = resolve_fallback_config(qsettings)
             api_key = get_deepseek_api_key()
             prompt_strategy = DEFAULT_PROMPT_STRATEGY
+            timeout = 60.0
 
         self._retry_failed_button.setVisible(False)
+        self._progress_samples.clear()
+        self._last_progress_log_time = -1.0
+        self._last_eta_update_time = -1.0
+        self._last_sample_time = -1.0
+        self._eta_label.setText("翻译速度：统计中…")
         self._translate_worker = TranslateWorker(
             self._db_path,
             api_key,
@@ -593,8 +649,10 @@ class MainWindow(QMainWindow):
             fallback_model,
             batch_size=batch_size,
             prompt_strategy=prompt_strategy,
+            timeout=timeout,
         )
         self._translate_worker.stage_changed.connect(self._log_message)
+        self._translate_worker.log_message.connect(self._log_message)
         self._translate_worker.progress_changed.connect(self._on_progress_changed)
         self._translate_worker.finished_ok.connect(self._on_translate_done)
         self._translate_worker.usage_changed.connect(self._on_usage_changed)
@@ -607,7 +665,55 @@ class MainWindow(QMainWindow):
     def _on_progress_changed(self, completed: int, total: int) -> None:
         self._progress_bar.setRange(0, max(total, 1))
         self._progress_bar.setValue(completed)
-        self._log_message(f"翻译批次 {completed}/{total}")
+
+        now = time.monotonic()
+        # 缓存命中多的时候（翻译记忆库里已经有译文），batch_translator.py 会在一个同步
+        # 循环里连续 emit 这个信号，完全不受网络请求节奏限制——不节流的话每一条都
+        # appendPlainText 一行，短时间内几千次跨线程信号 + 控件重排版会把内存和 Qt
+        # 事件队列撑爆（这就是之前那次翻译到一半原生崩溃、Python 侧却没有任何异常
+        # 记录的原因）。进度条仍然每次都更新（开销低），日志文本行、速度采样、ETA
+        # 显示各自按自己的时间间隔节流（见下方）。
+        if completed >= total or now - self._last_progress_log_time >= 0.5:
+            self._last_progress_log_time = now
+            self._log_message(f"翻译批次 {completed}/{total}")
+
+        if (
+            completed >= total
+            or self._last_sample_time < 0
+            or now - self._last_sample_time >= self._SAMPLE_MIN_INTERVAL_SECONDS
+        ):
+            self._last_sample_time = now
+            self._progress_samples.append((now, completed))
+
+        if completed >= total or now - self._last_eta_update_time >= 2.0:
+            self._last_eta_update_time = now
+            self._eta_label.setText(self._compute_eta_text(completed, total, now))
+
+    def _compute_eta_text(self, completed: int, total: int, now: float) -> str:
+        """用最近窗口（见 self._progress_samples）里最老一个样本到现在的速度估算剩余
+        时间——只是个粗略参考：真实速度会随并发占用、provider 限流退避、批次内条目数
+        多少而波动，不是恒定值。"""
+        if completed <= 0 or len(self._progress_samples) < 2:
+            return "翻译速度：统计中…"
+
+        oldest_time, oldest_completed = self._progress_samples[0]
+        elapsed = now - oldest_time
+        done_in_window = completed - oldest_completed
+        if elapsed <= 0 or done_in_window <= 0:
+            return "翻译速度：统计中…"
+
+        rate_per_second = done_in_window / elapsed
+        speed_text = f"约 {rate_per_second * 60:.1f} 批/分钟"
+
+        remaining = max(total - completed, 0)
+        if remaining == 0:
+            return f"翻译速度：{speed_text}"
+
+        eta_seconds = remaining / rate_per_second
+        return (
+            f"翻译速度：{speed_text} · 预计剩余 {_format_duration(eta_seconds)}"
+            f"（还剩 {remaining} 批）"
+        )
 
     def _on_translate_done(self, unit_count: int, failures: list[tuple[str, str]]) -> None:
         self._log_message(f"翻译完成，共 {unit_count} 条，可以点击下方“注入到游戏”写回。")
@@ -623,6 +729,7 @@ class MainWindow(QMainWindow):
                 self._log_message(f"  ……其余 {len(failures) - 10} 条略")
         self._progress_bar.setRange(0, 1)
         self._progress_bar.setValue(1)
+        self._eta_label.setText("")
         self._start_button.setEnabled(True)
         self._inject_button.setEnabled(True)
         self._stop_button.setVisible(False)
@@ -797,6 +904,7 @@ class MainWindow(QMainWindow):
         self._retry_failed_button.setVisible(False)
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
+        self._eta_label.setText("")
 
     def _on_open_output_clicked(self) -> None:
         if self._output_dir:

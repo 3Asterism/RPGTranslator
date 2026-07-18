@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 from pathlib import Path
@@ -130,13 +131,34 @@ def _build_llm_configs(
     fallback_api_key: str | None = None,
     fallback_base_url: str | None = None,
     fallback_model: str | None = None,
+    timeout: float = 60.0,
 ) -> list[LLMConfig]:
-    configs = [LLMConfig(api_key=api_key, base_url=base_url, model=model)]
+    configs = [LLMConfig(api_key=api_key, base_url=base_url, model=model, timeout=timeout)]
     if fallback_api_key and fallback_base_url and fallback_model:
+        # 备用 provider 走云端故障转移（本地引擎不启用备用 provider，见
+        # gui/main_window.py），云端 API 没有理由比主 provider 慢，用默认超时。
         configs.append(
             LLMConfig(api_key=fallback_api_key, base_url=fallback_base_url, model=fallback_model)
         )
     return configs
+
+
+_CANCEL_WATCH_POLL_SECONDS = 0.2
+
+
+async def _watch_cancel_and_abort(client: LLMClient, cancel_check: Callable[[], bool]) -> None:
+    """和 translate_units 里 _chat_cancellable 的取消检查并行跑：translate_units
+    对每个批次做的 Task.cancel() 只能打断还在 asyncio 层面等待的调用，个别情况下
+    底层 socket 读取会卡住、对这种取消不敏感（实测复现过点了停止后请求一直挂着，
+    既不报错也不返回，"停止"按钮跟着卡死，什么都不落盘）。这里作为兜底：一旦
+    cancel_check() 变 True，直接强制关闭 LLMClient 所有 provider 的连接池——
+    httpcore 的连接池 aclose 会强制断开正被占用、正卡在读取阶段的连接（见
+    llm_client.LLMClient.aclose 的说明），让这类请求很快报错退出，交给
+    batch_translator.py 按普通失败处理（保留 pending，不写入），而不是无限期
+    挂起等待一个可能永远不会返回的请求。"""
+    while not cancel_check():
+        await asyncio.sleep(_CANCEL_WATCH_POLL_SECONDS)
+    await client.aclose()
 
 
 async def run_translate(
@@ -153,6 +175,8 @@ async def run_translate(
     on_usage: Callable[[str, int, int], None] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     prompt_strategy: PromptStrategy = DEFAULT_PROMPT_STRATEGY,
+    timeout: float = 60.0,
+    on_log: Callable[[str], None] | None = None,
 ) -> tuple[list[TextUnit], list[tuple[str, str]]]:
     """只翻 status="pending" 的条目——中途停止或意外中断后重新调用，已经翻译过的
     （包括这次停止前刚落盘的那些）不会被重新送去调用 API，这是断点续传在翻译这一层
@@ -164,6 +188,14 @@ async def run_translate(
     on_usage(model, prompt_tokens, completion_tokens) 每次 LLM 调用成功后回调一次，
     供 GUI 实时统计 token 用量/预估花费，不传就跳过。
 
+    on_log(message) 在请求重试/限流冷却/批次拆分/失败跳过时各回调一次，供 GUI 在
+    日志框里展示这些中间状态，不传就跳过。
+
+    timeout 是主 provider 单次 HTTP 调用的超时秒数（备用 provider 固定用默认值，见
+    _build_llm_configs）。本地小模型处理一批几十条的请求本身就比云端 API 慢，
+    GUI 侧对本地引擎会传一个更宽松的值，不与云端共用同一个默认 60 秒（见
+    gui/main_window.py 的引擎分流处）。
+
     返回 (已翻译的 TextUnit 列表, 失败条目列表)。失败条目（比如被内容审核拒绝、或所有
     provider 都报错的条目）不会中断整体翻译，保持 status="pending" 供下次重跑续译，
     详见 translate_units 的说明。"""
@@ -171,19 +203,38 @@ async def run_translate(
     with Store(db_path) as store:
         pending = store.list_units(status="pending")
         configs = _build_llm_configs(
-            api_key, base_url, model, fallback_api_key, fallback_base_url, fallback_model
+            api_key,
+            base_url,
+            model,
+            fallback_api_key,
+            fallback_base_url,
+            fallback_model,
+            timeout=timeout,
         )
-        async with LLMClient(configs, on_usage=on_usage) as client:
-            failures = await translate_units(
-                client,
-                store,
-                pending,
-                concurrency,
-                on_progress=on_progress,
-                cancel_check=cancel_check,
-                batch_size=batch_size,
-                prompt_strategy=prompt_strategy,
+        async with LLMClient(configs, on_usage=on_usage, on_log=on_log) as client:
+            watcher = (
+                asyncio.ensure_future(_watch_cancel_and_abort(client, cancel_check))
+                if cancel_check is not None
+                else None
             )
+            try:
+                failures = await translate_units(
+                    client,
+                    store,
+                    pending,
+                    concurrency,
+                    on_progress=on_progress,
+                    cancel_check=cancel_check,
+                    batch_size=batch_size,
+                    prompt_strategy=prompt_strategy,
+                    on_log=on_log,
+                )
+            finally:
+                # 正常翻完（没被点停止）的情况下，把还在轮询的 watcher 收掉，不留
+                # 悬挂任务；已经在等 cancel_check() 变 True 的话 cancel() 直接生效。
+                if watcher is not None:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
         translated = store.list_units(status="translated")
     return translated, failures
 

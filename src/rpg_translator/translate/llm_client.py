@@ -67,6 +67,7 @@ class LLMClient:
         backoff_base_seconds: float = 1.0,
         transports: list[httpx.BaseTransport | None] | None = None,
         on_usage: Callable[[str, int, int], None] | None = None,
+        on_log: Callable[[str], None] | None = None,
     ):
         config_list = [configs] if isinstance(configs, LLMConfig) else list(configs)
         if not config_list:
@@ -85,6 +86,10 @@ class LLMClient:
         # GUI 实时统计本次会话的 token 用量/预估花费（见 gui/main_window.py 状态栏）；
         # 不传就跳过，不影响任何现有调用方。
         self._on_usage = on_usage
+        # on_log(message) 在限流冷却/请求异常重试/切换 provider 时回调一次，供 GUI
+        # 在翻译日志里实时展示这些原本只会在最后"N 条失败"汇总里才看得到的中间状态——
+        # 不然进度条长时间不动时，用户分不清是卡住了还是正在冷却重试。不传就跳过。
+        self._on_log = on_log
         self._http_clients = [
             httpx.AsyncClient(
                 base_url=_normalize_base_url(c.base_url),
@@ -96,8 +101,19 @@ class LLMClient:
         ]
 
     async def aclose(self) -> None:
+        """关闭所有 provider 的连接池。这个方法在两种场景下都可能被调用：正常的
+        `async with` 退出，以及用户点了"停止"后由 pipeline.run_translate 提前强制
+        调用一次（见那边的 _watch_cancel）——httpcore 的连接池 aclose 会强制关闭
+        池里所有连接，包括正被某个请求占用、正卡在读取响应阶段的那个，用来打断
+        可能对 asyncio 层面 Task.cancel() 不敏感的在途读取（不是所有平台的底层
+        socket 读取都能被普通取消及时打断）。允许重复调用，第二次（`__aexit__`
+        走到这里时）不应该因为已经关过一次而报错。
+        """
         for http in self._http_clients:
-            await http.aclose()
+            try:
+                await http.aclose()
+            except Exception:
+                pass
 
     async def __aenter__(self) -> LLMClient:
         return self
@@ -105,7 +121,9 @@ class LLMClient:
     async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(
+        self, system_prompt: str, user_prompt: str, extra_body: dict | None = None
+    ) -> str:
         last_error: Exception | None = None
 
         for provider_idx, (config, http) in enumerate(zip(self._configs, self._http_clients)):
@@ -130,6 +148,7 @@ class LLMClient:
                             # 这个字段的 provider，未知参数按 OpenAI 兼容协议惯例会被忽略，
                             # 不影响调用。
                             "enable_thinking": False,
+                            **(extra_body or {}),
                         },
                     )
                     response.raise_for_status()
@@ -154,11 +173,28 @@ class LLMClient:
                         )
                         self._consecutive_rate_limit_hits[provider_idx] = hits + 1
                         self._rate_limited_until[provider_idx] = time.monotonic() + cooldown
+                        if self._on_log is not None:
+                            self._on_log(
+                                f"{config.model} 被限流（429），冷却 {cooldown:.0f}s 后重试"
+                            )
                         continue  # 冷却在下一次循环开头统一等，不再叠加下面的固定退避
                     if e.response.status_code not in _RETRYABLE_STATUS_CODES:
+                        if self._on_log is not None:
+                            self._on_log(
+                                f"{config.model} 请求出错（{e.response.status_code}），换下一个 provider"
+                            )
                         break  # 换下一个 provider，不在这个 provider 上继续重试
+                    if self._on_log is not None:
+                        self._on_log(
+                            f"{config.model} 请求出错（{e.response.status_code}），"
+                            f"第 {attempt + 1}/{self._max_retries} 次重试"
+                        )
                 except httpx.TransportError as e:
                     last_error = e
+                    if self._on_log is not None:
+                        self._on_log(
+                            f"{config.model} 连接失败（{e}），第 {attempt + 1}/{self._max_retries} 次重试"
+                        )
 
                 if attempt < self._max_retries - 1:
                     await asyncio.sleep(self._backoff_base_seconds * (2**attempt))

@@ -45,6 +45,7 @@ class TranslateWorker(QThread):
     progress_changed = Signal(int, int)  # (completed, total)
     finished_ok = Signal(int, list)  # (翻译完成的 TextUnit 条数, 失败条目 [(原文, 错误信息), ...])
     usage_changed = Signal(str, int, int)  # (model, prompt_tokens, completion_tokens)
+    log_message = Signal(str)  # 请求重试/限流冷却/批次拆分/失败跳过等中间状态
     failed = Signal(str)
 
     def __init__(
@@ -60,6 +61,7 @@ class TranslateWorker(QThread):
         parent=None,
         batch_size: int = DEFAULT_BATCH_SIZE,
         prompt_strategy: PromptStrategy = DEFAULT_PROMPT_STRATEGY,
+        timeout: float = 60.0,
     ):
         super().__init__(parent)
         self._db_path = db_path
@@ -72,6 +74,7 @@ class TranslateWorker(QThread):
         self._fallback_model = fallback_model
         self._batch_size = batch_size
         self._prompt_strategy = prompt_strategy
+        self._timeout = timeout
         # threading.Event 而不是 asyncio.Event：stop() 是主线程（Qt 事件循环）调这个
         # 方法，run() 里的 asyncio 事件循环跑在这个 QThread 自己的线程里，两边不共享
         # 一个 event loop，只有 threading.Event 能安全跨线程 set()。
@@ -101,6 +104,8 @@ class TranslateWorker(QThread):
                     on_usage=self.usage_changed.emit,
                     batch_size=self._batch_size,
                     prompt_strategy=self._prompt_strategy,
+                    timeout=self._timeout,
+                    on_log=self.log_message.emit,
                 )
             )
         except Exception as e:
