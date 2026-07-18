@@ -5,7 +5,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QUrl, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -306,6 +306,18 @@ class MainWindow(QMainWindow):
         self._translate_worker: TranslateWorker | None = None
         self._inject_worker: InjectWorker | None = None
 
+        # log_message/stage_changed 信号来自后台线程，两个 provider 都报错时高并发
+        # 下每个批次的每次重试/限流冷却/换 provider 都各发一条（见 llm_client.py 的
+        # on_log），跟 _on_progress_changed 注释里那次"appendPlainText 撑爆崩溃"是
+        # 同一类问题——那次修的是 progress_changed 的节流，这里 log_message 从来没
+        # 节流过。缓冲 + 定时器批量落盘，把"来一条就跨线程 append 一次控件"降成
+        # 固定频率的批量刷新，不管后台产生消息多快，GUI 线程这边的更新频率封顶。
+        self._pending_log_lines: list[str] = []
+        self._log_flush_timer = QTimer(self)
+        self._log_flush_timer.setInterval(150)
+        self._log_flush_timer.timeout.connect(self._flush_log_buffer)
+        self._log_flush_timer.start()
+
         # 本次会话（软件跑起来到现在）累计的 token 用量/预估花费——重开软件清零，
         # 不落地存储，纯粹是给正在跑的这一轮汉化一个实时的量级参考。
         self._session_prompt_tokens = 0
@@ -483,8 +495,17 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self._usage_label)
 
     def _log_message(self, message: str) -> None:
-        self._log.appendPlainText(message)
+        # 只做轻量的缓冲入列 + 落文件日志，真正touch控件的 appendPlainText 挪到
+        # _flush_log_buffer 里按固定频率批量执行（见 __init__ 里 _log_flush_timer
+        # 的说明），不管这个方法本身被跨线程调用得多频繁，都不会直接怼控件。
+        self._pending_log_lines.append(message)
         logger.info(message)  # 同步落一份到文件日志，软件本身崩了也能翻记录复盘
+
+    def _flush_log_buffer(self) -> None:
+        if not self._pending_log_lines:
+            return
+        self._log.appendPlainText("\n".join(self._pending_log_lines))
+        self._pending_log_lines.clear()
 
     def _on_usage_changed(self, model: str, prompt_tokens: int, completion_tokens: int) -> None:
         self._session_prompt_tokens += prompt_tokens
@@ -593,6 +614,7 @@ class MainWindow(QMainWindow):
         self._progress_bar.setRange(0, 0)  # 不确定进度，先用忙碌样式
         self._log_message("提取中…")
 
+        self._ensure_worker_stopped(self._extract_worker)
         self._extract_worker = ExtractWorker(self._project_dir, self._db_path)
         self._extract_worker.finished_ok.connect(self._on_extract_done)
         self._extract_worker.failed.connect(self._on_failed)
@@ -638,6 +660,7 @@ class MainWindow(QMainWindow):
         self._last_eta_update_time = -1.0
         self._last_sample_time = -1.0
         self._eta_label.setText("翻译速度：统计中…")
+        self._ensure_worker_stopped(self._translate_worker)
         self._translate_worker = TranslateWorker(
             self._db_path,
             api_key,
@@ -741,6 +764,17 @@ class MainWindow(QMainWindow):
         self._log_message("重试失败项…")
         self._start_translate_worker()
 
+    def _ensure_worker_stopped(self, worker: QThread | None) -> None:
+        """在把 self._xxx_worker 指向一个新线程、丢掉旧引用之前，确保旧线程真的已经
+        跑完。正常按钮状态下旧线程在这里必然已经结束（isRunning() 为 False，wait()
+        立即返回），这里只是加一道保险：一旦这个前提在某次时序下不成立，旧 QThread
+        对象在引用被覆盖的瞬间因为 Python 侧引用计数归零而被销毁——PySide 里销毁一个
+        仍在运行的 QThread 会在 C++ 层直接 qFatal/abort，表现为整个程序无预兆闪退，
+        既不会弹「出错」对话框，也不会被 logging_setup.py 的 sys.excepthook 记录
+        （那只能捕获 Python 异常，接不住 native abort）。"""
+        if worker is not None and worker.isRunning():
+            worker.wait(5000)
+
     def _on_stop_clicked(self) -> None:
         if self._translate_worker is None:
             return
@@ -805,6 +839,7 @@ class MainWindow(QMainWindow):
         self._inject_button.setEnabled(False)
         self._log_message("写回中…")
 
+        self._ensure_worker_stopped(self._inject_worker)
         self._inject_worker = InjectWorker(self._project_dir, self._db_path, output_dir)
         self._inject_worker.finished_ok.connect(self._on_inject_done)
         self._inject_worker.failed.connect(self._on_inject_failed)
