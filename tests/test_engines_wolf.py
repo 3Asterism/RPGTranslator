@@ -56,11 +56,16 @@ def test_wolf_extract_skips_comment_command(wolf_project: Path):
     assert "events/0/pages/0/commands/3/string_args/0" not in locators  # cid 103 Comment
 
 
-def test_wolf_extract_context_includes_sibling_dialogue(wolf_project: Path):
+def test_wolf_extract_groups_sibling_dialogue_into_same_context_group(wolf_project: Path):
+    """不再把兄弟台词整段拼进 context（页面越长开销越是平方级）——改成给同一页面的
+    条目打上相同的 context_group，交给 batch_translator 打包进同一次请求整体翻译，
+    上下文靠"同一次请求里的其它行"自然获得（调研见 CLAUDE.md）。"""
     units = WolfAdapter().extract(wolf_project)
     line1 = _by_locator(units, MAP_FILE, "events/0/pages/0/commands/0/string_args/0")
-    assert "この村へようこそ。" in line1.context
-    assert line1.source_text not in line1.context
+    line2 = _by_locator(units, MAP_FILE, "events/0/pages/0/commands/1/string_args/0")
+    assert line1.context == ""
+    assert line1.context_group
+    assert line1.context_group == line2.context_group
 
 
 def test_wolf_extract_common_events(wolf_project: Path):

@@ -29,13 +29,17 @@ _TRANSLATE_SYSTEM_PROMPT = (
 # 这个值也是控制请求数（进而是撞上 provider RPM 限流概率）的主要杠杆：同样翻 550 条，
 # 25 条/请求要发 22 次请求，50 条/请求只要 11 次——请求数减半，压力也减半。真撞上限流
 # 时靠 llm_client.py 的共享冷却兜底，但从源头减少请求数比事后退避更省时间。
+#
+# 批次内部不是随便凑数：同一个事件页面（TextUnit.context_group）的台词会尽量分进
+# 同一批（见 _chunk_jobs_by_group），是这个数字的软上限，不是硬性每批必须凑满这么多。
 DEFAULT_BATCH_SIZE = 50
 
 _BATCH_INSTRUCTION = (
     "逐条翻译下面编号的文本。每条译文以 [编号] 开头另起一行，编号需与输入一一对应，"
     "不合并、不跳号、不输出编号外的文字。每条里的「上下文」只是背景参考，不要翻译"
     "或输出上下文本身，只翻译「待翻译」那一句，不要在该条译文里出现「上下文」"
-    "「待翻译」这类标签字样或复述背景对话。"
+    "「待翻译」这类标签字样或复述背景对话。如果连续多条编号本身就是同一段场景里的"
+    "连续台词，请让人名、称呼、术语在这些条目之间前后保持一致。"
 )
 _ITEM_MARKER_RE = re.compile(r"^\[(\d+)\]\s*", re.MULTILINE)
 
@@ -87,6 +91,7 @@ class Job(NamedTuple):
     protected_text: str
     mapping: dict[str, str]
     context: str
+    context_group: str
 
 
 def _build_single_user_prompt(protected_text: str, context: str) -> str:
@@ -190,6 +195,28 @@ DEFAULT_PROMPT_STRATEGY = PromptStrategy(
 )
 
 
+def _chunk_jobs_by_group(jobs: list[Job], batch_size: int) -> list[list[Job]]:
+    """把 job 按 context_group 切成批次：同一个 context_group（比如同一个事件页面）的
+    job 尽量分进同一批里，让它们在同一次请求里天然共享上下文、保持人名/术语前后一致
+    （段落进段落出——实测对照见 CLAUDE.md 的调研记录：拆成多次独立请求不但更费 token
+    ——每次都要重复付一遍固定模板的开销——译名还会在请求之间漂移）。不同 context_group
+    的边界处强制切批，不让不相关场景的台词混进同一次请求。空 context_group（数据库
+    字段这类没有自然顺序、不需要共享上下文的条目）视为统一的一个分组，退化成原来纯按
+    batch_size 切块的行为。每批仍然不超过 batch_size 条，超长的单个分组会被拆成多批。"""
+    batches: list[list[Job]] = []
+    current: list[Job] = []
+    current_group: str | None = None
+    for job in jobs:
+        if current and (len(current) >= batch_size or job.context_group != current_group):
+            batches.append(current)
+            current = []
+        current.append(job)
+        current_group = job.context_group
+    if current:
+        batches.append(current)
+    return batches
+
+
 async def translate_units(
     client: LLMClient,
     store: Store,
@@ -203,7 +230,10 @@ async def translate_units(
     prompt_strategy: PromptStrategy = DEFAULT_PROMPT_STRATEGY,
 ) -> list[tuple[str, str]]:
     """按 source_text 去重分组，相同原文只调用一次 LLM；多个不同分组打包进同一次请求
-    （见 batch_size），减少大文本量下的请求数和重复的 system prompt token 开销。
+    （见 batch_size），减少大文本量下的请求数和重复的 system prompt token 开销。同一个
+    事件页面（TextUnit.context_group）的分组会尽量分进同一批（见 _chunk_jobs_by_group），
+    让这段台词在同一次请求里当成一整段翻译，人名/术语靠模型自己在这次请求内部保持
+    一致，不需要再给每条各自拼一份背景上下文。
 
     on_progress(completed, total) 在每个去重分组处理完（无论成功还是失败）后调用一次，
     供 GUI 显示"翻译批次 X/Y" 进度用（见 spec 第 10 节），不传则跳过。
@@ -250,7 +280,16 @@ async def translate_units(
                 # 保留"，restore() 对恒等映射来说是空操作，不会误改译文。
                 protected_text = source_text
                 mapping = {code: code for code in extract_codes(source_text)}
-            jobs.append(Job(source_text, group, protected_text, mapping, group[0].context))
+            jobs.append(
+                Job(
+                    source_text,
+                    group,
+                    protected_text,
+                    mapping,
+                    group[0].context,
+                    group[0].context_group,
+                )
+            )
 
     total = len(jobs) + len(cache_hits)
     completed = 0
@@ -359,7 +398,7 @@ async def translate_units(
                 *(_translate_single_job(job, count_progress) for job in fallback_jobs)
             )
 
-    batches = [jobs[i : i + batch_size] for i in range(0, len(jobs), batch_size)]
+    batches = _chunk_jobs_by_group(jobs, batch_size)
     await asyncio.gather(*(_translate_batch(batch) for batch in batches))
 
     jobs_by_source = {job.source_text: job for job in jobs}
@@ -371,9 +410,7 @@ async def translate_units(
             break
         retry_jobs = [jobs_by_source[source_text] for source_text, _error in failures]
         failures.clear()
-        retry_batches = [
-            retry_jobs[i : i + batch_size] for i in range(0, len(retry_jobs), batch_size)
-        ]
+        retry_batches = _chunk_jobs_by_group(retry_jobs, batch_size)
         await asyncio.gather(
             *(_translate_batch(batch, count_progress=False) for batch in retry_batches)
         )

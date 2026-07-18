@@ -96,13 +96,20 @@ class _MalformedBatchStub:
         return "这是一段不符合格式要求的胡乱回复"
 
 
-def _make_unit(uid: str, source_text: str, status: str = "pending", context: str = "") -> TextUnit:
+def _make_unit(
+    uid: str,
+    source_text: str,
+    status: str = "pending",
+    context: str = "",
+    context_group: str = "",
+) -> TextUnit:
     return TextUnit(
         id=uid,
         engine="mz",
         file_path="data/Map001.json",
         locator=f"events/1/pages/0/list/{uid}/parameters/0",
         context=context,
+        context_group=context_group,
         source_text=source_text,
         status=status,
     )
@@ -506,6 +513,29 @@ async def test_translate_units_splits_into_multiple_batches_when_exceeding_batch
         # 5 条，batch_size=2 -> 3 批（2+2+1）
         assert stub.call_count == 3
         for i in range(5):
+            assert store.get_unit(str(i)).translated_text == f"译文:文本{i}号"
+
+
+@pytest.mark.anyio
+async def test_translate_units_splits_batch_at_context_group_boundary(tmp_path: Path):
+    """同一个 context_group（比如同一个事件页面）的条目要尽量分进同一批、当成一整段
+    翻译；不同 context_group 就算凑不满 batch_size 也要另起一批，不能把不相关场景的
+    台词混进同一次请求（段落进段落出，调研见 CLAUDE.md）。"""
+    stub = _BatchAwareStub()
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("1", "文本1号", context_group="page-A"),
+            _make_unit("2", "文本2号", context_group="page-A"),
+            _make_unit("3", "文本3号", context_group="page-B"),
+        ]
+        store.upsert_units(units)
+
+        await translate_units(stub, store, units, concurrency=4, batch_size=25)
+
+        # page-A 的 2 条打包成 1 次请求，page-B 单独 1 条另起一次请求，一共 2 次调用
+        # ——不是把 3 条不分场景硬凑成 1 次请求
+        assert stub.call_count == 2
+        for i in range(1, 4):
             assert store.get_unit(str(i)).translated_text == f"译文:文本{i}号"
 
 

@@ -300,26 +300,24 @@ class RGSSAdapterBase(EngineAdapter):
         return units
 
     def _pending_to_units(self, pending: list[PendingUnit]) -> list[TextUnit]:
-        by_group: dict[str, list[PendingUnit]] = {}
-        for p in pending:
-            by_group.setdefault(p.context_group, []).append(p)
-
+        # 不再把同页其它台词整段拼进 context（页面越长开销越是平方级）——改成只带一个
+        # 分组 id，交给 batch_translator 把同一分组的台词打包进同一次请求整体翻译，
+        # 上下文靠"同一次请求里的其它行"自然获得（调研见 CLAUDE.md）。
         units: list[TextUnit] = []
-        for group, members in by_group.items():
-            file_path = group.split(":", 1)[0]
-            for p in members:
-                context = "\n".join(m.source_text for m in members if m is not p)
-                units.append(
-                    TextUnit(
-                        id=compute_text_unit_id(self.engine_name, file_path, p.locator),
-                        engine=self.engine_name,
-                        file_path=file_path,
-                        locator=p.locator,
-                        context=context,
-                        source_text=p.source_text,
-                        extra_locators=p.extra_locators,
-                    )
+        for p in pending:
+            file_path = p.context_group.split(":", 1)[0]
+            units.append(
+                TextUnit(
+                    id=compute_text_unit_id(self.engine_name, file_path, p.locator),
+                    engine=self.engine_name,
+                    file_path=file_path,
+                    locator=p.locator,
+                    context="",
+                    context_group=p.context_group,
+                    source_text=p.source_text,
+                    extra_locators=p.extra_locators,
                 )
+            )
         return units
 
     def inject(self, project_dir: Path, units: list[TextUnit], output_dir: Path) -> None:

@@ -6,7 +6,14 @@ from typing import TypedDict
 
 from rpg_translator.core.store import Store
 
-_CSV_FIELDNAMES = ["source_text", "file_path", "locator", "context", "translated_text"]
+_CSV_FIELDNAMES = [
+    "source_text",
+    "file_path",
+    "locator",
+    "context",
+    "context_group",
+    "translated_text",
+]
 
 
 class ConflictRow(TypedDict):
@@ -14,13 +21,22 @@ class ConflictRow(TypedDict):
     file_path: str
     locator: str
     context: str
+    context_group: str
     translated_text: str
 
 
-def find_context_conflicts(store: Store) -> list[ConflictRow]:
-    """找出同一 source_text（复用了同一份翻译记忆）却出现在不同 context 里的候选冲突。
+def _scene_key(unit) -> str:
+    # context_group（事件页面 id）现在是主要的"这句话来自哪个场景"信号——大部分
+    # 台词类条目的 context 字段本身已经不再携带场景描述（改成靠段落打包提供上下文，
+    # 见 CLAUDE.md）。没有 context_group 的条目（数据库字段这类）退回用 context
+    # 本身的静态描述（比如"数据库记录：xxx"）区分场景，兼容旧行为。
+    return unit.context_group or unit.context
 
-    这里只做机械的分组启发式，不判断这些 context 是否真的语义冲突——按 spec 要求，
+
+def find_context_conflicts(store: Store) -> list[ConflictRow]:
+    """找出同一 source_text（复用了同一份翻译记忆）却出现在不同场景里的候选冲突。
+
+    这里只做机械的分组启发式，不判断这些场景是否真的语义冲突——按 spec 要求，
     这类判断留给人工复核，导出列表即可。
     """
     units = store.list_units()
@@ -30,8 +46,8 @@ def find_context_conflicts(store: Store) -> list[ConflictRow]:
 
     conflicts: list[ConflictRow] = []
     for source_text, group in by_source.items():
-        distinct_contexts = {u.context for u in group if u.context}
-        if len(group) > 1 and len(distinct_contexts) > 1:
+        distinct_keys = {_scene_key(u) for u in group if _scene_key(u)}
+        if len(group) > 1 and len(distinct_keys) > 1:
             for unit in group:
                 conflicts.append(
                     {
@@ -39,6 +55,7 @@ def find_context_conflicts(store: Store) -> list[ConflictRow]:
                         "file_path": unit.file_path,
                         "locator": unit.locator,
                         "context": unit.context,
+                        "context_group": unit.context_group,
                         "translated_text": unit.translated_text or "",
                     }
                 )

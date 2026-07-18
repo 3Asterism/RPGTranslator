@@ -89,15 +89,21 @@ def test_vxace_extract_skips_empty_fields(vxace_project: Path):
     assert ("Data/Actors.rvdata2", "2/@description") not in locators
 
 
-def test_vxace_extract_context_includes_sibling_dialogue(vxace_project: Path):
+def test_vxace_extract_groups_sibling_dialogue_into_same_context_group(vxace_project: Path):
+    """不再把兄弟台词整段拼进 context（页面越长开销越是平方级）——改成给同一页面的
+    条目打上相同的 context_group，交给 batch_translator 打包进同一次请求整体翻译，
+    上下文靠"同一次请求里的其它行"自然获得（调研见 CLAUDE.md）。"""
     units = VXAceAdapter().extract(vxace_project)
     message = _by_locator(
         units, "Data/Map001.rvdata2", "@events/1/@pages/0/@list/0/@parameters/0"
     )
-    # 两行 Show Text 已经合并进 message 自己的 source_text，context 里不该再重复出现；
-    # 但同一页里其他命令（改名）仍然算作 sibling context。
-    assert "勇者" in message.context
-    assert message.source_text not in message.context
+    change_name = _by_locator(
+        units, "Data/Map001.rvdata2", "@events/1/@pages/0/@list/4/@parameters/1"
+    )
+    assert change_name.source_text == "勇者"
+    assert message.context == ""
+    assert message.context_group
+    assert message.context_group == change_name.context_group
 
 
 def _all_rvdata2_files(root: Path) -> list[Path]:

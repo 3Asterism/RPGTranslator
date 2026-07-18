@@ -29,13 +29,14 @@ def _escape_newlines(text: str) -> str:
 
 def _build_history(items: list[Job]) -> str:
     # 官方实现里 [History] 放的是"上一批的翻译结果"，用来串联多轮请求之间的剧情
-    # 连续性；我们的 Job.context 是"同一事件分组里的其它原文台词"（见
-    # batch_translator.translate_units 的分组逻辑），语义上更接近"当前剧情背景"而
-    # 非"上一次翻译结果"，但同样是给模型的剧情上下文，借用 [History] 这个槽位承载。
-    #
-    # 一个批次可能打包了来自不同事件（不同上下文）的条目——[History] 是整批共享
-    # 的一个槽位，没法按条目区分，硬取第一条的 context 会把不相关的剧情背景安到
-    # 其它条目头上。批次内 context 不一致时宁可不给背景，也不要给错的。
+    # 连续性。batch_translator._chunk_jobs_by_group 保证一批里的条目都来自同一个
+    # context_group（同一个事件页面），Job.context 对这类分组条目现在恒为""——上下文
+    # 靠"同一次请求里的其它行"自然获得，不需要额外的 [History] 背景（调研见
+    # CLAUDE.md：给不给这段背景对翻译质量影响不大，反而是拆成多次独立请求会让译名在
+    # 请求之间漂移）。[History] 这个槽位目前只在数据库字段这类没有 context_group、
+    # 仍然带静态描述性 context（比如"数据库记录：xxx"）的批次里可能派上用场——这些
+    # 条目彼此本来就无关，contexts 集合大小 != 1 时直接不给背景，避免把不相关的描述
+    # 安到其它条目头上。
     contexts = {job.context for job in items}
     if len(contexts) != 1:
         return ""

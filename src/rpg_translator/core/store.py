@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS text_units (
     file_path TEXT NOT NULL,
     locator TEXT NOT NULL,
     context TEXT NOT NULL,
+    context_group TEXT NOT NULL DEFAULT '',
     source_text TEXT NOT NULL,
     control_code_map TEXT NOT NULL,
     translated_text TEXT,
@@ -44,6 +45,10 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE text_units ADD COLUMN extra_locators TEXT NOT NULL DEFAULT '[]'"
             )
+        if "context_group" not in columns:
+            self._conn.execute(
+                "ALTER TABLE text_units ADD COLUMN context_group TEXT NOT NULL DEFAULT ''"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -62,6 +67,7 @@ class Store:
                 u.file_path,
                 u.locator,
                 u.context,
+                u.context_group,
                 u.source_text,
                 json.dumps(u.control_code_map, ensure_ascii=False),
                 u.translated_text,
@@ -73,14 +79,15 @@ class Store:
         self._conn.executemany(
             """
             INSERT INTO text_units
-                (id, engine, file_path, locator, context, source_text,
+                (id, engine, file_path, locator, context, context_group, source_text,
                  control_code_map, translated_text, status, extra_locators)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 engine=excluded.engine,
                 file_path=excluded.file_path,
                 locator=excluded.locator,
                 context=excluded.context,
+                context_group=excluded.context_group,
                 source_text=excluded.source_text,
                 control_code_map=excluded.control_code_map,
                 extra_locators=excluded.extra_locators,
@@ -156,6 +163,7 @@ class Store:
             file_path=row["file_path"],
             locator=row["locator"],
             context=row["context"],
+            context_group=row["context_group"],
             source_text=row["source_text"],
             control_code_map=json.loads(row["control_code_map"]),
             translated_text=row["translated_text"],
