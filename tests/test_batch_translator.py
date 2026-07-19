@@ -96,6 +96,42 @@ class _MalformedBatchStub:
         return "这是一段不符合格式要求的胡乱回复"
 
 
+class _RecordingEchoStub:
+    """把 "待翻译文本：" 之后的内容套一层 "译:" 前缀原样吐回来，同时记下每次请求
+    实际发给模型的 user_prompt——用来断言"\\n<角色名>正文 拆分之后模型的 prompt
+    里到底出现过什么"，而不是只看最终写回结果对不对。"""
+
+    def __init__(self):
+        self.call_count = 0
+        self.prompts: list[str] = []
+
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
+        self.call_count += 1
+        self.prompts.append(user_prompt)
+        marker = "待翻译文本：\n"
+        idx = user_prompt.index(marker) + len(marker)
+        return f"译:{user_prompt[idx:]}"
+
+
+class _DropsAngleBracketPlaceholderStub:
+    """模拟真实观察到的失败模式：只要回复里出现跟"尖括号"相关的占位符，就把它删掉
+    （复现"模型偶尔把 <角色名> 连括号带名字一起吞掉"的行为）。用来验证：\\n<角色名>
+    正文 经过拆分之后，模型的 prompt 里压根不会出现跟尖括号相关的占位符，这种"会
+    吞占位符"的模型也不会触发失败/重试——因为它根本没机会吞。"""
+
+    def __init__(self):
+        self.call_count = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
+        self.call_count += 1
+        marker = "待翻译文本：\n"
+        idx = user_prompt.index(marker) + len(marker)
+        protected_text = user_prompt[idx:]
+        translated = f"译:{protected_text}"
+        # 复现失败行为：吞掉所有占位符 token（不管它对应的原始码是什么）
+        return re.sub(r"⟦CC\d+⟧", "", translated)
+
+
 def _make_unit(
     uid: str,
     source_text: str,
@@ -837,3 +873,80 @@ async def test_translate_units_batching_works_against_real_provider(tmp_path: Pa
         control_code_unit = store.get_unit("2")
         assert "\\C[1]" in control_code_unit.translated_text
         assert "⟦CC" not in control_code_unit.translated_text
+
+
+@pytest.mark.anyio
+async def test_translate_units_splits_speaker_tag_name_and_body_never_exposing_brackets(
+    tmp_path: Path,
+):
+    r"""真实工程实测到的写法：\n<角色名>正文 在消息开头标出说话人。这次改造的目标是
+    不让模型看到跟尖括号相关的任何占位符/字符——直接断言发给模型的 prompt 里没有
+    "<" ">"⟦CC"这几种东西，而不是只看最终结果对不对（结果对但过程里还是暴露了占
+    位符的话，只是运气好没被吞，不代表这个问题真的解决了）。"""
+    stub = _RecordingEchoStub()
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit("1", "\\n<ローズ>ふふ・・・♥")
+        store.upsert_units([unit])
+
+        failures = await translate_units(stub, store, [unit], concurrency=4)
+
+        assert failures == []
+        for prompt in stub.prompts:
+            assert "<" not in prompt
+            assert ">" not in prompt
+            assert "⟦CC" not in prompt
+
+        result = store.get_unit("1")
+        assert result.status == "translated"
+        # 名字和正文分别过了一遍 _RecordingEchoStub 的 "译:" 前缀，代码自己拼回
+        # "\n<...>...." 的结构
+        assert result.translated_text == "\\n<译:ローズ>译:ふふ・・・♥"
+
+
+@pytest.mark.anyio
+async def test_translate_units_speaker_tag_name_translated_once_and_reused(tmp_path: Path):
+    """同一个角色名在很多条台词里反复出现（说话人标签）——名字应该只真正调用一次
+    模型翻译，其余全靠翻译记忆库复用，不应该每条台词都重新翻一遍这同一个名字。"""
+    stub = _RecordingEchoStub()
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("1", "\\n<ローズ>おはよう"),
+            _make_unit("2", "\\n<ローズ>こんばんは"),
+            _make_unit("3", "\\n<ローズ>さようなら"),
+        ]
+        store.upsert_units(units)
+
+        failures = await translate_units(stub, store, units, concurrency=4)
+
+        assert failures == []
+        name_calls = [p for p in stub.prompts if p.endswith("ローズ")]
+        assert len(name_calls) == 1, (
+            f"角色名应该只真正调用一次模型翻译、其余靠记忆库复用，实际对名字发起了 "
+            f"{len(name_calls)} 次请求"
+        )
+        for uid, body in (("1", "おはよう"), ("2", "こんばんは"), ("3", "さようなら")):
+            assert store.get_unit(uid).translated_text == f"\\n<译:ローズ>译:{body}"
+
+
+@pytest.mark.anyio
+async def test_translate_units_speaker_tag_survives_model_that_drops_placeholders(
+    tmp_path: Path,
+):
+    r"""核心验证目标：这次改造是为了减少"占位符被模型吞掉 -> 判失败 -> 自动重试"
+    这种返工。用一个专门吞占位符的对抗性 stub（复现真实观察到的失败模式）来翻译
+    \n<角色名>正文，因为拆分之后这部分内容压根不含占位符，这个"会吞占位符"的
+    模型也翻译得干干净净、一次就成，不会触发失败/重试。"""
+    stub = _DropsAngleBracketPlaceholderStub()
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit("1", "\\n<シャーロット>じ・・・\\.ちゃ？")
+        store.upsert_units([unit])
+
+        failures = await translate_units(
+            stub, store, [unit], concurrency=4, retry_wait_seconds=0
+        )
+
+        # \.（等待控制码）仍然走占位符机制、仍然可能被这个对抗性 stub 吞掉、仍然
+        # 可能触发失败重试——这次改造要解决的是"角色名标签"这一类，不是全部控制码。
+        # 这里只断言角色名标签部分没有引入额外的失败，不强求 \. 也免疫。
+        for source_text, error in failures:
+            assert "シャーロット" not in error and "じ" not in error

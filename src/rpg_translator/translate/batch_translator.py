@@ -98,6 +98,38 @@ class Job(NamedTuple):
     mapping: dict[str, str]
     context: str
     context_group: str
+    # "\n<角色名>正文" 这种说话人标记写法（见 _split_speaker_tag）被拆成名字/正文
+    # 分开翻译时，这里存翻好的 "\n<译名>" 前缀，写回结果时直接拼在模型翻译的正文
+    # 前面——非空时说明这个 job 的 source_text/protected_text 已经是拆出来的正文，
+    # 不是 TextUnit.source_text 原文整句。
+    result_prefix: str = ""
+
+
+_SPEAKER_TAG_SOURCE_RE = re.compile(r"^\\n<([^>\n]*)>(.*)\Z", re.DOTALL)
+
+
+def _split_speaker_tag(source_text: str) -> tuple[str, str] | None:
+    """"\\n<角色名>正文" 这种说话人标记写法是真实 RPG Maker MV 工程里实测到的用法：
+    \\n 是普通换行控制码，尖括号是插件/作者自己的说话人标记约定，不是标准控制码
+    语法。protect() 只能把尖括号本身当占位符保护住、名字仍暴露给模型翻译（见
+    codec/control_codes.py），但这仍然要求模型老实保留两个占位符——实测虽然加了
+    校验+自动重试兜底，还是不如干脆不让模型看到尖括号可靠。
+
+    这里在更上一层直接把 "角色名" 和 "正文" 拆成两个独立的翻译任务分别处理（见
+    translate_units），模型全程看不到 "\\n<" ">" 这几个字符，写回结果时由代码自己
+    拼成 "\\n<译名>译正文"，从根上消灭"模型该不该保留这段尖括号"的判断失误。
+
+    没匹配上（不是这个写法，或者尖括号里是空的）返回 None，走原来的整句
+    protect()/翻译流程。"""
+    m = _SPEAKER_TAG_SOURCE_RE.match(source_text)
+    if m is None:
+        return None
+    name, rest = m.group(1), m.group(2)
+    if not name or not rest:
+        # 名字为空、或者标签后面没有正文（比如整句就是 "\n<角色名>"，没有实际
+        # 台词）——没什么好拆的，交给原来的整句 protect()/翻译流程处理。
+        return None
+    return name, rest
 
 
 def _build_single_user_prompt(protected_text: str, context: str) -> str:
@@ -276,18 +308,68 @@ async def translate_units(
     system_prompt = prompt_strategy.system_prompt
     semaphore = asyncio.Semaphore(concurrency)
 
-    groups: dict[str, list[TextUnit]] = {}
+    # "\n<角色名>正文" 写法先拆出名字单独翻译（见 _split_speaker_tag），结果落进
+    # 翻译记忆库，供下面构造正文 job 时直接查表拼前缀——只在默认占位符包装策略下
+    # 做这个拆分，Sakura 本地模型走的是完全不同的批量格式，不覆盖这个机制。
+    speaker_split: dict[str, tuple[str, str]] = {}  # unit.id -> (角色名, 正文)
+    if prompt_strategy.wrap_control_codes:
+        for unit in units:
+            if unit.status != "pending":
+                continue
+            split = _split_speaker_tag(unit.source_text)
+            if split is not None:
+                speaker_split[unit.id] = split
+
+    name_translations: dict[str, str] = {}
+    if speaker_split:
+        distinct_names = list(dict.fromkeys(name for name, _ in speaker_split.values()))
+        name_units = [
+            TextUnit(
+                id=f"__speaker_name__{i}",
+                engine=units[0].engine,
+                file_path="",
+                locator="",
+                context="",
+                source_text=name,
+                status="pending",
+            )
+            for i, name in enumerate(distinct_names)
+        ]
+        # 复用同一套翻译流程翻名字：去重、批量打包、失败重试、取消响应全部继承，
+        # 不用另写一套。name_units 是内存里现造的临时 TextUnit，不会被 upsert 进
+        # 数据库——update_translation 对不存在的 id 只是一次无操作的 UPDATE（0 行
+        # 受影响，不报错），真正需要的是这次调用顺带把翻译结果写进 store 的翻译
+        # 记忆库（下面按原文查表取）。
+        await translate_units(
+            client, store, name_units, concurrency,
+            batch_size=batch_size, cancel_check=cancel_check,
+            auto_retry_rounds=auto_retry_rounds, retry_wait_seconds=retry_wait_seconds,
+            prompt_strategy=prompt_strategy, on_log=on_log,
+        )
+        for name in distinct_names:
+            cached = store.get_memory(compute_source_hash(name))
+            # 查不到（比如取消了，或者这个名字翻译重试用尽还是失败）就退化成用
+            # 原名——不能让整条线因为名字这一小部分翻不出来就跟着失败/卡住。
+            name_translations[name] = cached if cached is not None else name
+
+    groups: dict[tuple[str, str], list[TextUnit]] = {}  # (待翻译正文, 结果前缀) -> units
     for unit in units:
         if unit.status != "pending":
             continue
-        groups.setdefault(unit.source_text, []).append(unit)
+        split = speaker_split.get(unit.id)
+        if split is not None:
+            name, rest = split
+            key = (rest, f"\\n<{name_translations[name]}>")
+        else:
+            key = (unit.source_text, "")
+        groups.setdefault(key, []).append(unit)
 
     jobs: list[Job] = []
     cache_hits: list[tuple[list[TextUnit], str]] = []
-    for source_text, group in groups.items():
+    for (source_text, result_prefix), group in groups.items():
         cached = store.get_memory(compute_source_hash(source_text))
         if cached is not None:
-            cache_hits.append((group, cached))
+            cache_hits.append((group, result_prefix + cached))
         else:
             if prompt_strategy.wrap_control_codes:
                 protected_text, mapping = protect(source_text)
@@ -307,6 +389,7 @@ async def translate_units(
                     mapping,
                     group[0].context,
                     group[0].context_group,
+                    result_prefix,
                 )
             )
 
@@ -372,7 +455,7 @@ async def translate_units(
             return
         translated_text = restore(stripped, job.mapping)
         store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
-        _write_result(job.group, translated_text, count_progress)
+        _write_result(job.group, job.result_prefix + translated_text, count_progress)
 
     async def _bisect_batch(batch: list[Job], count_progress: bool) -> None:
         # 整批请求失败/解析失败时的退化路径：二分成两半各自重新走 _translate_batch，
@@ -440,7 +523,7 @@ async def translate_units(
                 continue
             translated_text = restore(item_text, job.mapping)
             store.set_memory(compute_source_hash(job.source_text), job.source_text, translated_text)
-            _write_result(job.group, translated_text, count_progress)
+            _write_result(job.group, job.result_prefix + translated_text, count_progress)
 
         if fallback_jobs:
             await asyncio.gather(
