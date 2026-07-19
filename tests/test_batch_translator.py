@@ -45,7 +45,7 @@ class _StubClient:
         self.call_count = 0
         self.calls: list[tuple[str, str]] = []
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         self.call_count += 1
         self.calls.append((system_prompt, user_prompt))
         return self.response
@@ -54,7 +54,7 @@ class _StubClient:
 class _EchoStub:
     """把 user_prompt 里"待翻译文本："之后的内容原样吐回来，模拟一个乖乖保留占位符的模型。"""
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         marker = "待翻译文本：\n"
         idx = user_prompt.index(marker) + len(marker)
         protected_text = user_prompt[idx:]
@@ -70,7 +70,7 @@ class _BatchAwareStub:
         self.call_count = 0
         self.last_user_prompt = ""
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         import re
 
         self.call_count += 1
@@ -91,7 +91,7 @@ class _MalformedBatchStub:
     def __init__(self):
         self.call_count = 0
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         self.call_count += 1
         return "这是一段不符合格式要求的胡乱回复"
 
@@ -123,7 +123,7 @@ class _ConcurrencyTrackingStub:
         self.in_flight = 0
         self.max_in_flight = 0
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         await asyncio.sleep(self.delay)
@@ -272,7 +272,7 @@ class _DropsPlaceholderOnceStub:
     def __init__(self):
         self.call_count = 0
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         self.call_count += 1
         marker = "待翻译文本：\n"
         idx = user_prompt.index(marker) + len(marker)
@@ -308,7 +308,7 @@ class _LeaksContextOnceStub:
     def __init__(self):
         self.call_count = 0
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         self.call_count += 1
         marker = "待翻译文本（只翻译并只输出这一句）：\n"
         idx = user_prompt.index(marker) + len(marker)
@@ -350,7 +350,7 @@ class _RunawayLengthOnceStub:
     def __init__(self):
         self.call_count = 0
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         self.call_count += 1
         marker = "待翻译文本：\n"
         idx = user_prompt.index(marker) + len(marker)
@@ -387,7 +387,7 @@ class _BatchLeaksContextOnceStub:
         self.batch_calls = 0
         self.single_calls = 0
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         items = re.findall(r"\[(\d+)\].*?待翻译：(.*?)(?=\n\n\[\d+\]|\Z)", user_prompt, re.S)
         if items:
             self.batch_calls += 1
@@ -439,7 +439,7 @@ class _BatchDropsOnePlaceholderStub:
         self.batch_calls = 0
         self.single_calls = 0
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         items = re.findall(r"\[(\d+)\].*?待翻译：(.*?)(?=\n\n\[\d+\]|\Z)", user_prompt, re.S)
         if items:
             self.batch_calls += 1
@@ -550,8 +550,11 @@ async def test_translate_units_falls_back_to_individual_calls_when_batch_parse_f
 
         await translate_units(stub, store, units, concurrency=4, batch_size=25)
 
-        # 1 次打包尝试（解析失败）+ 3 次逐条重试 = 4 次调用
-        assert stub.call_count == 4
+        # _bisect_batch 是对半递归二分，不是直接拆成 len(batch) 次单条：3 条先整批
+        # 试一次（失败）-> 二分成 1+2 -> 1 条那半直接单条重试成功，2 条那半又先按
+        # 批尝试一次（这个 stub 不管批大小回复都不合规，所以还是失败）-> 再二分成
+        # 1+1 各自单条重试成功。合计 1(整批) + 1(单条) + 1(2 条批) + 2(单条) = 5 次。
+        assert stub.call_count == 5
         for i in range(3):
             result = store.get_unit(str(i))
             assert result.status == "translated"
@@ -566,7 +569,7 @@ class _FlakyStub:
         self.bad_snippet = bad_snippet
         self.call_count = 0
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         self.call_count += 1
         if self.bad_snippet in user_prompt:
             raise RuntimeError("400 Bad Request: data_inspection_failed")
@@ -608,7 +611,7 @@ class _FlakyThenSucceedsStub:
         self.fail_times = fail_times
         self.call_count = 0
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         self.call_count += 1
         if self.call_count <= self.fail_times:
             raise RuntimeError("503 Service Unavailable")
@@ -720,7 +723,7 @@ async def test_translate_units_cancel_stops_new_batches_and_aborts_in_flight(
         def __init__(self):
             self.call_count = 0
 
-        async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
             self.call_count += 1
             await release.wait()
             return "翻译结果"
