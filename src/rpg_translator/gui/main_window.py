@@ -6,7 +6,7 @@ from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from rpg_translator.config import get_deepseek_api_key
+from rpg_translator.core.evb_unpack import find_evb_candidate
 from rpg_translator.core.pipeline import (
     UnknownEngineError,
     detect_adapter,
@@ -44,7 +45,7 @@ from rpg_translator.gui.settings_dialog import (
     resolve_fallback_config,
     resolve_local_config,
 )
-from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker
+from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker, UnpackWorker
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY
 from rpg_translator.translate.pricing import estimate_cost_cny
 from rpg_translator.translate.sakura_prompt import SAKURA_PROMPT_STRATEGY
@@ -305,6 +306,7 @@ class MainWindow(QMainWindow):
         self._extract_worker: ExtractWorker | None = None
         self._translate_worker: TranslateWorker | None = None
         self._inject_worker: InjectWorker | None = None
+        self._unpack_worker: UnpackWorker | None = None
         self._WORKER_STOP_TIMEOUT_MS = 5000
 
         # log_message/stage_changed 信号来自后台线程，两个 provider 都报错时高并发
@@ -534,6 +536,10 @@ class MainWindow(QMainWindow):
         try:
             adapter = detect_adapter(path)
         except UnknownEngineError:
+            evb_candidate = find_evb_candidate(path)
+            if evb_candidate is not None:
+                self._start_evb_unpack(evb_candidate)
+                return
             self._info_label.setText("未识别到支持的 RPG Maker 引擎")
             self._adapter = None
             self._start_button.setEnabled(False)
@@ -565,6 +571,53 @@ class MainWindow(QMainWindow):
         self._retry_failed_button.setVisible(False)
         if not self._output_dir_edit.text().strip():
             self._output_dir_edit.setText(str(default_output_dir(path)))
+
+    def _start_evb_unpack(self, exe_path: Path) -> None:
+        """拖进来的目录没找到能直接识别的工程文件，但顶层有个 Enigma Virtual Box
+        打包的单文件游戏（RPG Maker MV/MZ 常见的分发方式：资源和 nw.js 运行时全部
+        封进一个 exe，磁盘上没有散落的 www/data）——自动解包到同级的 `<原目录名>_已解包`
+        目录，解包完再走一遍正常的识别流程，不用用户自己先去找工具手动解包。"""
+        if not self._ensure_worker_stopped(self._unpack_worker):
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还在收尾上一次解包，请稍等几秒再试。",
+            )
+            return
+
+        out_dir = exe_path.parent.parent / f"{exe_path.parent.name}_已解包"
+        self._info_label.setText(f"检测到 Enigma Virtual Box 打包的单文件游戏，正在解包到 {out_dir}…")
+        self._log_message(f"检测到 Enigma Virtual Box 打包：{exe_path}，开始解包（体积较大时可能需要几分钟）…")
+        self._start_button.setEnabled(False)
+        self._progress_bar.setRange(0, 0)  # 解包耗时不确定，先用忙碌样式
+
+        self._unpack_worker = UnpackWorker(exe_path, out_dir)
+        self._unpack_worker.finished_ok.connect(self._on_evb_unpack_done)
+        self._unpack_worker.failed.connect(self._on_evb_unpack_failed)
+        self._unpack_worker.start()
+
+    def _on_evb_unpack_done(self, out_dir: str) -> None:
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        # unpack_evb() 内部把各阶段异常自己 log 掉不往外抛（见 core/evb_unpack.py 的
+        # 说明），"解包这个动作报没报错"不能说明解包出来的东西真的有用——重新走一遍
+        # 正常识别流程，识别成功才算数，失败就老实告诉用户，而不是假装解包顺利。
+        out_path = Path(out_dir)
+        self._log_message(f"解包完成：{out_path}，正在重新识别引擎…")
+        self._on_path_dropped(out_path)
+        if self._adapter is None:
+            self._info_label.setText(
+                f"已解包到 {out_path}，但仍未识别到支持的 RPG Maker 引擎——"
+                "可能是这个游戏用的不是 RPG Maker MV/MZ 引擎，或者解包结果不完整。"
+            )
+
+    def _on_evb_unpack_failed(self, message: str) -> None:
+        self._log_message(f"解包失败：{message}")
+        QMessageBox.critical(self, "解包失败", message)
+        self._info_label.setText("未识别到支持的 RPG Maker 引擎（尝试自动解包也失败了）")
+        self._adapter = None
+        self._start_button.setEnabled(False)
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
 
     @staticmethod
     def _resume_progress_note(project_dir: Path, units: list) -> str:
@@ -799,6 +852,47 @@ class MainWindow(QMainWindow):
         if worker.isRunning():
             worker.wait(self._WORKER_STOP_TIMEOUT_MS)
         return not worker.isRunning()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """所有 xxxWorker 都是挂在 self 上的 QThread：关窗口时 Qt/Python 会把
+        MainWindow 连同这些子对象一起销毁。_ensure_worker_stopped 那套超时后拒绝
+        的保险只挡住了"开始翻译/重试/注入/解包时覆盖引用"这一条路径——用户直接
+        点窗口右上角关掉，走的是这里，之前完全没挡：worker 还在跑的时候整个窗口
+        被销毁，同样是销毁运行中的 QThread，一样 qFatal/abort 无预兆闪退（实测
+        复现过：翻译中途、或者点了停止但还没真正停干净就关窗口）。这里在真正放行
+        关闭之前，把还在跑的 worker 找出来，能取消的先请求取消（目前只有
+        TranslateWorker 有 stop()），限时等它们跑完；等不到就不放行，留给用户
+        「再等等」的机会，而不是硬关闭把还活着的线程带走。"""
+        running = [
+            worker
+            for worker in (
+                self._extract_worker,
+                self._translate_worker,
+                self._inject_worker,
+                self._unpack_worker,
+            )
+            if worker is not None and worker.isRunning()
+        ]
+        if not running:
+            event.accept()
+            return
+
+        if self._translate_worker is not None and self._translate_worker.isRunning():
+            self._translate_worker.stop()
+
+        for worker in running:
+            worker.wait(self._WORKER_STOP_TIMEOUT_MS)
+
+        if any(worker.isRunning() for worker in running):
+            QMessageBox.warning(
+                self, "还有任务没跑完",
+                "后台还有任务在跑（提取/翻译/写回/解包），现在关闭可能导致崩溃或丢失"
+                "当前进度，请等它跑完、或者点「停止」等翻译真正停下来之后再关闭。",
+            )
+            event.ignore()
+            return
+
+        event.accept()
 
     def _on_stop_clicked(self) -> None:
         if self._translate_worker is None:

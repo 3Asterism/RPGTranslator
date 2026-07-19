@@ -25,6 +25,14 @@
 | WOLF RPG エディター（ウディタ） | ✅ 完整支持 | 已用 WOLF RPG Editor 官方自带示例工程验证过（Map/CommonEvent/Database 三种文件全覆盖，含当前编辑器版本默认的 LZ4 压缩格式）；仍不支持 WolfPro 加密保护和经典 XOR 加密的工程 |
 | RPG Maker 2000/2003 | ❌ 不支持 | 完全不同的格式，明确排除在范围外 |
 
+**拖进来的是单文件 exe、没有散落的工程文件？** 不少 RPG Maker MV/MZ 游戏用
+[Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html) 把 `www` 资源目录和
+nw.js 运行时整个打包进一个 exe 里分发（磁盘上找不到 `www/data`，只有孤零零一个几百 MB
+到几 GB 的 exe）。拖进这类文件夹时，如果正常识别失败、又在顶层找到一个这样打包的 exe，
+会自动解包到同级的 `<原目录名>_已解包` 目录（体积大的话要等一会），解包完自动重新识别
+引擎——不挑具体是 MV/MZ 还是 VX Ace/XP/VX/WOLF，解包这一步和引擎种类无关，识别哪种引擎
+交给解包完之后的正常识别流程。
+
 ## 功能
 
 - **控制码保护**：`\C[n]` `\N[n]` `\V[n]` 等变量/颜色码翻译前转义成占位符，翻译后精确还原并校验完整性
@@ -39,6 +47,8 @@
 - **并发限流 + 批量打包请求**：省时间也省 token（配合 DeepSeek 的 prompt caching），批量大小可在设置面板调整
 - **限流自适应退避**：撞到 429 时同一 provider 上所有并发请求共享一个冷却窗口（优先读 `Retry-After`，
   否则按连续命中次数指数退避），避免各自独立重试反复冲撞同一个限流窗口
+- **单文件 exe 自动解包**：拖进来的游戏是 Enigma Virtual Box 打包的单文件 exe（找不到散落的
+  `www/data`）时自动解包再识别，不用先手动找工具解包
 
 ## 快速开始
 
@@ -185,6 +195,9 @@ rpg-translator run       <项目目录> --out <输出目录>
   Page/Command 结构变化），仍明确不支持 WolfPro 加密保护和经典 XOR 加密的工程，遇到会直接
   报错而不是猜测/静默产出乱码
 - PyInstaller 打包出的 exe 可能被杀毒软件误报，是已知的普遍现象
+- 单文件 exe 自动解包目前只认 Enigma Virtual Box 这一种打包方式（`evbunpack`），像
+  VMProtect/Themida 这类加壳保护、或者把资源塞进 NSIS 安装包里的分发方式不在覆盖范围内，
+  遇到这些会照常回退到"未识别到支持的引擎"
 
 完整技术规格、每个里程碑的验收标准、逆向工程来源（WOLF 部分参考了
 [wolftrans](https://github.com/elizagamedev/wolftrans)、

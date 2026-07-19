@@ -97,7 +97,7 @@ class _SakuraStub:
         self.call_count = 0
         self.last_user_prompt = ""
 
-    async def chat(self, system_prompt: str, user_prompt: str) -> str:
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
         assert system_prompt == SAKURA_SYSTEM_PROMPT
         self.call_count += 1
         self.last_user_prompt = user_prompt
@@ -146,7 +146,7 @@ async def test_translate_units_with_sakura_strategy_falls_back_when_line_count_m
         def __init__(self):
             self.call_count = 0
 
-        async def chat(self, system_prompt: str, user_prompt: str) -> str:
+        async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
             self.call_count += 1
             input_marker = "简体中文：\n"
             idx = user_prompt.index(input_marker) + len(input_marker)

@@ -393,6 +393,8 @@ async def translate_units(
             return
 
         user_prompt = prompt_strategy.build_batch_prompt(batch)
+        request_failed = False
+        raw: str | None = None
         async with semaphore:
             if _cancelled():
                 return
@@ -405,9 +407,19 @@ async def translate_units(
             except Exception as e:
                 if on_log is not None:
                     on_log(f"批次请求失败（{len(batch)} 条），拆分重试：{e}")
-                await _bisect_batch(batch, count_progress)
-                return
+                request_failed = True
 
+        if request_failed:
+            # 二分重试要重新抢并发名额，绝不能在还攥着这一个名额的时候直接递归调用——
+            # 并发数一低、又好巧不巧撞上好几个批次同时失败，子任务要抢的名额会永远
+            # 轮不到（全被还没释放的上级占着不放），直接死锁在这：不是取消检查本身
+            # 失灵，是子任务压根排不上队去做那个检查，"停止"按下去也没用，线程再也
+            # 不会结束（实测复现过：全部请求持续失败时会稳定卡死，不是偶发）。这里
+            # 先让 `async with semaphore` 正常退出、名额还回去，再递归。
+            await _bisect_batch(batch, count_progress)
+            return
+
+        assert raw is not None
         parsed = prompt_strategy.parse_batch_response(raw, len(batch))
         if parsed is None:
             if on_log is not None:
