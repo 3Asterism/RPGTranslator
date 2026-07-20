@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
@@ -16,6 +17,13 @@ def main() -> int:
     # APP_STYLESHEET 的说明）。
     app.setStyleSheet(APP_STYLESHEET)
     window = MainWindow()
+    # 命令行传工程目录时直接加载，跳过拖拽——排查"静默闪退"用 UI 自动化（pywinauto
+    # 之类）驱动真实打包 exe 复现时，拖拽这个动作本身没法脚本化，这里给自动化留个
+    # 口子；不传参数（正常双击启动）行为不变。
+    if len(sys.argv) > 1:
+        project_dir = Path(sys.argv[1])
+        if project_dir.is_dir():
+            window._on_path_dropped(project_dir)
     window.show()
     return app.exec()
 
