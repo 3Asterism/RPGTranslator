@@ -629,7 +629,17 @@ class MainWindow(QMainWindow):
         return f"，已翻译 {done}/{len(units)}（点击「开始翻译」续译剩余部分）"
 
     def _open_settings(self) -> None:
-        SettingsDialog(self).exec()
+        # 原来 SettingsDialog(self).exec() 没接住返回的对象——exec() 一返回这行
+        # Python 侧引用就没了，可能立刻被 GC；但 C++ 侧因为传了 parent=self 还挂在
+        # 主窗口下面没真的销毁，变成"C++ 对象还在、Python 包装没了"的悬空状态。真机
+        # 崩溃转储（ucrtbase!abort 的 stack buffer overrun，栈里混着 msctf.dll/
+        # TextInputFramework.dll 这类 Windows 无障碍框架的帧）只有真实鼠标点击（会
+        # 触发真实窗口激活和无障碍查询）才复现，Python 直接调方法完全复现不出来——
+        # 用 pywinauto 驱动真实鼠标点击复现后确认加上这两行就不再崩，显式保留引用 +
+        # 用完 deleteLater() 主动收尾，两边生命周期对齐，不再依赖 GC 时机。
+        dialog = SettingsDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
 
     def _on_start_clicked(self) -> None:
         if self._project_dir is None:
