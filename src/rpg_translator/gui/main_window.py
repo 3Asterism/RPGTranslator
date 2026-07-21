@@ -31,6 +31,7 @@ from rpg_translator.core.pipeline import (
     export_translation_package,
     has_language_variant,
     import_translation_package,
+    prune_stale_units,
     run_extract,
     switch_language,
 )
@@ -451,11 +452,16 @@ class MainWindow(QMainWindow):
         self._import_package_button.setObjectName("secondaryButton")
         self._import_package_button.clicked.connect(self._on_import_package_clicked)
 
+        self._cleanup_db_button = QPushButton("清理数据库…")
+        self._cleanup_db_button.setObjectName("secondaryButton")
+        self._cleanup_db_button.clicked.connect(self._on_cleanup_db_clicked)
+
         share_row = QHBoxLayout()
         share_row.addWidget(self._switch_original_button)
         share_row.addWidget(self._switch_translated_button)
         share_row.addWidget(self._export_package_button)
         share_row.addWidget(self._import_package_button)
+        share_row.addWidget(self._cleanup_db_button)
         share_row.addStretch(1)
 
         share_box = QGroupBox(
@@ -1037,6 +1043,36 @@ class MainWindow(QMainWindow):
         if imported > 0:
             self._inject_button.setEnabled(True)
         QMessageBox.information(self, "导入完成", f"成功导入 {imported} 条，跳过 {skipped} 条。")
+
+    def _on_cleanup_db_clicked(self) -> None:
+        """按当前游戏工程重新扫描一遍文本，删掉数据库里不再对应任何现存文本的历史
+        记录（比如游戏更新后已经不存在的旧台词）并回收磁盘空间——数据库本身没有
+        自动过期机制，长期反复重新提取会不断累积这类历史行（见 CLAUDE.md 相关调研），
+        这是手动触发的瘦身入口，不会自动执行，避免误删还有用的翻译记录。"""
+        if self._project_dir is None or self._db_path is None:
+            QMessageBox.warning(self, "还没有选择工程", "请先拖入工程并跑一遍翻译。")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "清理数据库",
+            "会按当前游戏工程重新扫描一遍文本，删掉数据库里不再对应任何现存文本的历史"
+            "记录（比如游戏更新后已经不存在的旧台词），并回收 sqlite 释放出的磁盘空间。\n\n"
+            "仍然存在于游戏里的文本及其翻译不受影响。确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            deleted = prune_stale_units(self._project_dir, self._db_path)
+        except Exception as e:
+            QMessageBox.critical(self, "清理失败", str(e))
+            return
+
+        self._log_message(f"数据库清理完成：删除了 {deleted} 条不再对应当前文本的历史记录。")
+        QMessageBox.information(self, "清理完成", f"已删除 {deleted} 条历史记录并回收磁盘空间。")
 
     def _on_failed(self, message: str) -> None:
         self._log_message(f"出错：{message}")

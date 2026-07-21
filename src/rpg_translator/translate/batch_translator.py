@@ -19,7 +19,9 @@ _TRANSLATE_SYSTEM_PROMPT = (
     "上下文的内容——只翻译、只输出「待翻译」标记的那一句。\n"
     "5. 输出里不能出现「上下文」「待翻译」这类标签字样本身，也不能把背景对话"
     "复述或翻译进来——译文应该只比原文这一句本身长，不会因为夹带背景内容而"
-    "明显变长。"
+    "明显变长。\n"
+    "6. 如果提供了「人名对照」，其中列出的角色名必须直接照抄给定译名，不要自己"
+    "另外翻译或换用别的音译，保证同一个角色在全篇的译名前后一致。"
 )
 
 # 一次请求最多打包多少条不同原文一起翻译。几万行文本量级下，一行一请求在时间和 token 成本
@@ -103,6 +105,12 @@ class Job(NamedTuple):
     # 前面——非空时说明这个 job 的 source_text/protected_text 已经是拆出来的正文，
     # 不是 TextUnit.source_text 原文整句。
     result_prefix: str = ""
+    # 这条正文里检测到"提及"的已知角色名 -> 译名（见 _match_name_hints）。只在
+    # translate_units 已经从「\n<角色名>」说话人标签里收集到名字表时才会非空——
+    # 这条正文本身不是说话人标签，但里面提到了某个已经翻过的角色名（比如台词
+    # "花子，等等我"），用于在 prompt 里提示模型直接照抄已定的译名，不要自己
+    # 另外音译，从而统一"说话人标签"之外、正文里提及角色名的译法。
+    name_hints: dict[str, str] = {}
 
 
 _SPEAKER_TAG_SOURCE_RE = re.compile(r"^\\n<([^>\n]*)>(.*)\Z", re.DOTALL)
@@ -132,17 +140,45 @@ def _split_speaker_tag(source_text: str) -> tuple[str, str] | None:
     return name, rest
 
 
-def _build_single_user_prompt(protected_text: str, context: str) -> str:
+# 角色名长度低于这个值的不参与"正文里提及角色名"的子串匹配——单字/单假名的角色名
+# 很容易在毫不相关的词里凑巧当子串命中（误报），命中后塞进 prompt 里反而可能误导
+# 模型把无关文字也套上这个角色的译名；两个字符起步能大幅降低这种误判概率。
+_MIN_NAME_HINT_LENGTH = 2
+
+
+def _match_name_hints(text: str, name_translations: dict[str, str]) -> dict[str, str]:
+    """在 text（某条待译正文）里查找已知角色名（见 translate_units 里从
+    "\\n<角色名>" 说话人标签收集的 name_translations）是否作为子串出现——命中的
+    才需要在这条/这批请求的 prompt 里提示模型，不命中的批次不多付一个字的 token。"""
+    return {
+        name: translated
+        for name, translated in name_translations.items()
+        if len(name) >= _MIN_NAME_HINT_LENGTH and name in text
+    }
+
+
+def _format_name_hint_line(name_hints: dict[str, str]) -> str:
+    if not name_hints:
+        return ""
+    pairs = "、".join(f"{name}→{translated}" for name, translated in name_hints.items())
+    return f"人名对照（直接照抄译名，不要重新翻译或改用别的音译）：{pairs}\n\n"
+
+
+def _build_single_user_prompt(protected_text: str, context: str, name_hints: dict[str, str]) -> str:
+    hint = _format_name_hint_line(name_hints)
     if context:
         return (
-            f"上下文（仅供理解语境，不要翻译，不要输出）：\n{context}\n\n"
+            f"{hint}上下文（仅供理解语境，不要翻译，不要输出）：\n{context}\n\n"
             f"待翻译文本（只翻译并只输出这一句）：\n{protected_text}"
         )
-    return f"待翻译文本：\n{protected_text}"
+    return f"{hint}待翻译文本：\n{protected_text}"
 
 
 def _build_batch_user_prompt(items: list[Job]) -> str:
-    parts = [_BATCH_INSTRUCTION]
+    merged_hints: dict[str, str] = {}
+    for job in items:
+        merged_hints.update(job.name_hints)
+    parts = [_format_name_hint_line(merged_hints) + _BATCH_INSTRUCTION]
     for i, job in enumerate(items, start=1):
         if job.context:
             parts.append(
@@ -210,7 +246,7 @@ class PromptStrategy:
     这三个函数就能复用同一套翻译流程，不用另起一套并行实现。"""
 
     system_prompt: str
-    build_single_prompt: Callable[[str, str], str]
+    build_single_prompt: Callable[[str, str, dict[str, str]], str]
     build_batch_prompt: Callable[[list[Job]], str]
     # (response, expected_count) -> {1-based 序号: 该条译文}，None 表示解析失败
     parse_batch_response: Callable[[str, int], dict[int, str] | None]
@@ -308,21 +344,30 @@ async def translate_units(
     system_prompt = prompt_strategy.system_prompt
     semaphore = asyncio.Semaphore(concurrency)
 
-    # "\n<角色名>正文" 写法先拆出名字单独翻译（见 _split_speaker_tag），结果落进
-    # 翻译记忆库，供下面构造正文 job 时直接查表拼前缀——只在默认占位符包装策略下
-    # 做这个拆分，Sakura 本地模型走的是完全不同的批量格式，不覆盖这个机制。
-    speaker_split: dict[str, tuple[str, str]] = {}  # unit.id -> (角色名, 正文)
-    if prompt_strategy.wrap_control_codes:
-        for unit in units:
-            if unit.status != "pending":
-                continue
-            split = _split_speaker_tag(unit.source_text)
-            if split is not None:
-                speaker_split[unit.id] = split
+    # "\n<角色名>正文" 写法先拆出名字单独翻译（见 _split_speaker_tag）。探测名字本身
+    # 只是字符串匹配，跟批量协议无关，所有策略（包括 Sakura）都做；但"把这个 unit
+    # 拆成独立的正文 job、结果写回时再拼回名字前缀"这一步只在默认占位符包装策略下
+    # 做——Sakura 本地模型走的是完全不同的批量格式（一行一条严格对齐），没有验证过
+    # 这套拆分在它的协议下是否安全，所以 Sakura 场景下 unit 仍然整句原样翻译，只是
+    # 探测到的名字表额外用来给 [Glossary] 槽位（见 sakura_prompt.py）填角色名提示。
+    speaker_split: dict[str, tuple[str, str]] = {}  # unit.id -> (角色名, 正文)，仅默认策略下非空
+    detected_names: list[str] = []
+    seen_names: set[str] = set()
+    for unit in units:
+        if unit.status != "pending":
+            continue
+        split = _split_speaker_tag(unit.source_text)
+        if split is None:
+            continue
+        name, _rest = split
+        if name not in seen_names:
+            seen_names.add(name)
+            detected_names.append(name)
+        if prompt_strategy.wrap_control_codes:
+            speaker_split[unit.id] = split
 
     name_translations: dict[str, str] = {}
-    if speaker_split:
-        distinct_names = list(dict.fromkeys(name for name, _ in speaker_split.values()))
+    if detected_names:
         name_units = [
             TextUnit(
                 id=f"__speaker_name__{i}",
@@ -333,7 +378,7 @@ async def translate_units(
                 source_text=name,
                 status="pending",
             )
-            for i, name in enumerate(distinct_names)
+            for i, name in enumerate(detected_names)
         ]
         # 复用同一套翻译流程翻名字：去重、批量打包、失败重试、取消响应全部继承，
         # 不用另写一套。name_units 是内存里现造的临时 TextUnit，不会被 upsert 进
@@ -346,7 +391,7 @@ async def translate_units(
             auto_retry_rounds=auto_retry_rounds, retry_wait_seconds=retry_wait_seconds,
             prompt_strategy=prompt_strategy, on_log=on_log,
         )
-        for name in distinct_names:
+        for name in detected_names:
             cached = store.get_memory(compute_source_hash(name))
             # 查不到（比如取消了，或者这个名字翻译重试用尽还是失败）就退化成用
             # 原名——不能让整条线因为名字这一小部分翻不出来就跟着失败/卡住。
@@ -390,6 +435,7 @@ async def translate_units(
                     group[0].context,
                     group[0].context_group,
                     result_prefix,
+                    _match_name_hints(source_text, name_translations),
                 )
             )
 
@@ -426,7 +472,9 @@ async def translate_units(
         return cancel_check is not None and cancel_check()
 
     async def _translate_single_job(job: Job, count_progress: bool = True) -> None:
-        user_prompt = prompt_strategy.build_single_prompt(job.protected_text, job.context)
+        user_prompt = prompt_strategy.build_single_prompt(
+            job.protected_text, job.context, job.name_hints
+        )
         async with semaphore:
             # 取消检查放在拿到并发名额之后、真正发请求之前：还在排队等名额的批次，
             # 轮到它的时候如果已经被取消就直接放弃，不发这次请求；但已经拿到名额、

@@ -4,12 +4,14 @@ from pathlib import Path
 
 import pytest
 
+from rpg_translator.core.ir import TextUnit
 from rpg_translator.core.pipeline import (
     UnknownEngineError,
     detect_adapter,
     export_translation_package,
     has_language_variant,
     import_translation_package,
+    prune_stale_units,
     run_extract,
     run_inject,
     switch_language,
@@ -35,6 +37,37 @@ def test_detect_adapter_picks_vxace(vxace_project: Path):
 def test_detect_adapter_raises_on_unrecognized_dir(tmp_path: Path):
     with pytest.raises(UnknownEngineError):
         detect_adapter(tmp_path)
+
+
+def test_prune_stale_units_removes_rows_missing_from_current_extraction(
+    mz_project: Path, tmp_path: Path
+):
+    """text_units 表没有过期机制，同一工程反复重新提取会不断累积不再对应当前游戏
+    内容的历史行（见 CLAUDE.md 相关调研）——这里模拟数据库里存在一条不属于当前
+    工程任何文本的"孤儿"行（比如游戏更新后已经删掉的旧台词），验证手动清理入口
+    能把它删掉，同时不影响仍然存在于游戏里的正常行。"""
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        original_ids = {u.id for u in store.list_units()}
+        stale_unit = TextUnit(
+            id="stale-leftover-id",
+            engine="mz",
+            file_path="data/RemovedMap.json",
+            locator="$.list[0]",
+            context="",
+            source_text="已经不存在的旧文本",
+        )
+        store.upsert_units([stale_unit])
+        assert store.get_unit("stale-leftover-id") is not None
+
+    deleted = prune_stale_units(mz_project, db_path)
+
+    assert deleted == 1
+    with Store(db_path) as store:
+        remaining_ids = {u.id for u in store.list_units()}
+    assert remaining_ids == original_ids
+    assert "stale-leftover-id" not in remaining_ids
 
 
 def test_export_and_import_translation_package_round_trip(tmp_path: Path, mz_project: Path):
