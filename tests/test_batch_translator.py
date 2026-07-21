@@ -929,6 +929,46 @@ async def test_translate_units_speaker_tag_name_translated_once_and_reused(tmp_p
 
 
 @pytest.mark.anyio
+async def test_translate_units_hints_known_character_name_mentioned_inline(tmp_path: Path):
+    """角色名先通过 "\\n<角色名>正文" 标签翻译过一次之后，如果正文里（不是作为说话人
+    标签，而是被别的角色提到）再次出现同一个角色名，应该在 prompt 里收到统一译名的
+    提示，不能让模型对同一个角色每次都重新音译一遍。"""
+    stub = _RecordingEchoStub()
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("1", "\\n<ローズ>おはよう"),
+            _make_unit("2", "ローズ、待って"),  # 正文里提到同一个角色名，不是说话人标签
+        ]
+        store.upsert_units(units)
+
+        failures = await translate_units(stub, store, units, concurrency=4, batch_size=1)
+
+        assert failures == []
+        hinted_prompts = [p for p in stub.prompts if "人名对照" in p]
+        assert len(hinted_prompts) == 1
+        assert "ローズ→译:ローズ" in hinted_prompts[0]
+
+
+@pytest.mark.anyio
+async def test_translate_units_does_not_hint_single_character_names(tmp_path: Path):
+    """角色名长度低于 2 的不参与"正文里提及"的子串匹配提示——单字名字很容易在毫不
+    相关的词里凑巧当子串命中，命中后反而可能误导模型把无关文字也套上这个角色的
+    译名（见 _MIN_NAME_HINT_LENGTH 的说明）。"""
+    stub = _RecordingEchoStub()
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("1", "\\n<葵>おはよう"),
+            _make_unit("2", "葵の日記帳"),  # 恰好含有单字角色名的无关词
+        ]
+        store.upsert_units(units)
+
+        failures = await translate_units(stub, store, units, concurrency=4, batch_size=1)
+
+        assert failures == []
+        assert not any("人名对照" in p for p in stub.prompts)
+
+
+@pytest.mark.anyio
 async def test_translate_units_speaker_tag_survives_model_that_drops_placeholders(
     tmp_path: Path,
 ):

@@ -316,6 +316,21 @@ async def run_full(
     return all_units
 
 
+def prune_stale_units(project_dir: Path, db_path: Path) -> int:
+    """重新扫描一遍游戏工程当前的文本，把 db 里不再对应任何现存 TextUnit 的历史行
+    （比如游戏更新后已经被删掉/改写的旧台词）清掉，再 VACUUM 回收磁盘空间。text_units
+    表本身没有过期机制（见 core/store.py），同一工程反复重新提取会不断累积这类历史
+    行，长期只增不减，这个函数是手动触发的瘦身入口，不在提取/翻译流程里自动调用——
+    避免提取规则临时出错、或用户误把工程目录指错时静默删掉还有用的翻译记录。"""
+    adapter = detect_adapter(project_dir)
+    current_units = adapter.extract(project_dir)
+    current_ids = {u.id for u in current_units}
+    with Store(db_path) as store:
+        deleted = store.delete_missing(current_ids)
+        store.vacuum()
+    return deleted
+
+
 def run_qa(db_path: Path, export_path: Path | None) -> list[ConflictRow]:
     with Store(db_path) as store:
         conflicts = find_context_conflicts(store)
