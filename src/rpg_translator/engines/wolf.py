@@ -26,11 +26,10 @@ the project spec's secondhand section 6.4):
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 from rpg_translator.core.ir import TextUnit, compute_text_unit_id
-from rpg_translator.engines.base import EngineAdapter
+from rpg_translator.engines.base import EngineAdapter, copy_project_if_different
 from rpg_translator.engines.wolf_binary import (
     Command,
     WolfCommonEvents,
@@ -162,7 +161,7 @@ class WolfAdapter(EngineAdapter):
         return units
 
     def inject(self, project_dir: Path, units: list[TextUnit], output_dir: Path) -> None:
-        shutil.copytree(project_dir, output_dir, dirs_exist_ok=True)
+        copy_project_if_different(project_dir, output_dir)
 
         by_file: dict[str, list[TextUnit]] = {}
         for unit in units:

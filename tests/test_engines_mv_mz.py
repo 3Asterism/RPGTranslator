@@ -242,3 +242,21 @@ def test_inject_does_not_mutate_source_project(tmp_path: Path, mz_project: Path)
 
     after = (mz_project / "data/Map001.json").read_bytes()
     assert before == after
+
+
+def test_inject_writes_in_place_when_output_dir_is_project_dir(mz_project: Path):
+    """output_dir 等于 project_dir 时是原地注入——不再 copytree 出一份额外目录
+    （对同一个目录自拷贝本身也会报错），直接改写游戏工程自己的文件。"""
+    adapter = MZAdapter()
+    units = adapter.extract(mz_project)
+
+    target = _by_locator(units, "data/Map001.json", "events/1/pages/0/list/1/parameters/0")
+    target.translated_text = "TRANSLATED IN PLACE"
+
+    adapter.inject(mz_project, units, mz_project)
+
+    import json
+
+    data = json.loads((mz_project / "data/Map001.json").read_text(encoding="utf-8"))
+    changed = data["events"][1]["pages"][0]["list"][1]["parameters"][0]
+    assert changed == "TRANSLATED IN PLACE"
