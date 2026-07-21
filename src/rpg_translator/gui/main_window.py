@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -233,12 +232,6 @@ def db_path_for_project(project_dir: Path) -> Path:
     return project_dir / ".rpg_translator" / "units.db"
 
 
-def default_output_dir(project_dir: Path) -> Path:
-    """默认输出到工程同级目录下的 `<工程名>_汉化`，而不是当前工作目录下一个裸的
-    `output` 文件夹——双击 exe 打包版时 cwd 是谁都不知道，裸相对路径对用户很不友好。"""
-    return project_dir.parent / f"{project_dir.name}_汉化"
-
-
 def _format_duration(seconds: float) -> str:
     seconds = max(0.0, seconds)
     if seconds < 60:
@@ -302,7 +295,6 @@ class MainWindow(QMainWindow):
         self._project_dir: Path | None = None
         self._adapter: EngineAdapter | None = None
         self._db_path: Path | None = None
-        self._output_dir: str | None = None
         self._extract_worker: ExtractWorker | None = None
         self._translate_worker: TranslateWorker | None = None
         self._inject_worker: InjectWorker | None = None
@@ -419,22 +411,11 @@ class MainWindow(QMainWindow):
         self._load_translated_button.setObjectName("secondaryButton")
         self._load_translated_button.clicked.connect(self._on_load_translated_project_clicked)
 
-        self._output_dir_edit = QLineEdit()
-        self._output_dir_edit.setPlaceholderText("翻译后的游戏工程输出到这里")
-        browse_output_button = QPushButton("浏览…")
-        browse_output_button.setObjectName("secondaryButton")
-        browse_output_button.clicked.connect(self._browse_output_dir)
-
-        output_dir_row = QHBoxLayout()
-        output_dir_row.addWidget(QLabel("输出目录:"))
-        output_dir_row.addWidget(self._output_dir_edit, stretch=1)
-        output_dir_row.addWidget(browse_output_button)
-
         self._inject_button = QPushButton("注入到游戏")
         self._inject_button.setEnabled(False)
         self._inject_button.clicked.connect(self._on_inject_clicked)
 
-        self._open_output_button = QPushButton("打开输出文件夹")
+        self._open_output_button = QPushButton("打开游戏文件夹")
         self._open_output_button.setObjectName("secondaryButton")
         self._open_output_button.setVisible(False)
         self._open_output_button.clicked.connect(self._on_open_output_clicked)
@@ -445,9 +426,11 @@ class MainWindow(QMainWindow):
         inject_row.addWidget(self._open_output_button)
         inject_row.addStretch(1)
 
-        inject_box = QGroupBox("3. 注入（把已翻译内容写回游戏工程，和翻译分开跑——写盘失败可以直接重试，不用重新翻译）")
+        inject_box = QGroupBox(
+            "3. 注入（直接把已翻译内容写回拖入的游戏工程本身，原文自动备份、"
+            "不会丢；写盘失败可以直接重试，不用重新翻译）"
+        )
         inject_layout = QVBoxLayout(inject_box)
-        inject_layout.addLayout(output_dir_row)
         inject_layout.addLayout(inject_row)
 
         self._switch_original_button = QPushButton("切换为原文")
@@ -476,7 +459,7 @@ class MainWindow(QMainWindow):
         share_row.addStretch(1)
 
         share_box = QGroupBox(
-            "4. 中日对照 / 分享给他人（切换只影响输出目录里的文本文件，不影响素材；"
+            "4. 中日对照 / 分享给他人（切换只影响游戏工程里的文本文件，不影响素材；"
             "翻译包是可分享的译文数据，不含游戏本体，对方同版本游戏可直接导入复用）"
         )
         share_layout = QVBoxLayout(share_box)
@@ -543,6 +526,9 @@ class MainWindow(QMainWindow):
             self._info_label.setText("未识别到支持的 RPG Maker 引擎")
             self._adapter = None
             self._start_button.setEnabled(False)
+            self._switch_original_button.setEnabled(False)
+            self._switch_translated_button.setEnabled(False)
+            self._open_output_button.setVisible(False)
             return
 
         try:
@@ -551,6 +537,9 @@ class MainWindow(QMainWindow):
             self._info_label.setText(f"扫描失败：{e}")
             self._adapter = None
             self._start_button.setEnabled(False)
+            self._switch_original_button.setEnabled(False)
+            self._switch_translated_button.setEnabled(False)
+            self._open_output_button.setVisible(False)
             return
 
         self._adapter = adapter
@@ -567,10 +556,13 @@ class MainWindow(QMainWindow):
         )
         self._start_button.setEnabled(True)
         self._inject_button.setEnabled(False)
-        self._open_output_button.setVisible(False)
         self._retry_failed_button.setVisible(False)
-        if not self._output_dir_edit.text().strip():
-            self._output_dir_edit.setText(str(default_output_dir(path)))
+        # 拖进来的目录如果之前已经原地注入过（比如汉化完之后关了软件重新拖进来，
+        # 或者想拿一个已经汉化好的游戏目录换回原文），这里就已经能拿到备份、不用
+        # 先跑一遍翻译/注入才能用"切换为原文/译文"。
+        self._open_output_button.setVisible(has_language_variant(path, "translated"))
+        self._switch_original_button.setEnabled(has_language_variant(path, "original"))
+        self._switch_translated_button.setEnabled(has_language_variant(path, "translated"))
 
     def _start_evb_unpack(self, exe_path: Path) -> None:
         """拖进来的目录没找到能直接识别的工程文件，但顶层有个 Enigma Virtual Box
@@ -901,13 +893,6 @@ class MainWindow(QMainWindow):
         self._log_message("正在停止（等待当前批次的请求跑完落盘）…")
         self._translate_worker.stop()
 
-    def _browse_output_dir(self) -> None:
-        directory = QFileDialog.getExistingDirectory(
-            self, "选择输出目录", self._output_dir_edit.text()
-        )
-        if directory:
-            self._output_dir_edit.setText(directory)
-
     def _on_load_translated_project_clicked(self) -> None:
         """跳过提取/翻译，直接选一个之前翻译过的游戏工程目录，注入它已经存在
         db 里的翻译结果——关掉软件重开、或者上次注入失败想换个目录重试，都不用
@@ -936,21 +921,15 @@ class MainWindow(QMainWindow):
         self._project_dir = project_dir
         self._db_path = db_path
         self._info_label.setText(f"已加载翻译记录：{project_dir}，共 {translated_count} 条已翻译")
-        if not self._output_dir_edit.text().strip():
-            self._output_dir_edit.setText(str(default_output_dir(project_dir)))
         self._inject_button.setEnabled(True)
-        self._open_output_button.setVisible(False)
+        self._open_output_button.setVisible(has_language_variant(project_dir, "translated"))
+        self._switch_original_button.setEnabled(has_language_variant(project_dir, "original"))
+        self._switch_translated_button.setEnabled(has_language_variant(project_dir, "translated"))
         self._log_message(f"已加载 {project_dir}，可以直接点击“注入到游戏”。")
 
     def _on_inject_clicked(self) -> None:
         if self._project_dir is None or self._db_path is None:
             return
-
-        output_dir_text = self._output_dir_edit.text().strip()
-        if not output_dir_text:
-            QMessageBox.warning(self, "未选择输出目录", "请先填写或浏览选择一个输出目录。")
-            return
-        output_dir = Path(output_dir_text)
 
         if not self._ensure_worker_stopped(self._inject_worker):
             QMessageBox.warning(
@@ -959,39 +938,35 @@ class MainWindow(QMainWindow):
             )
             return
 
-        qsettings = QSettings(ORG_NAME, APP_NAME)
-        qsettings.setValue("output_dir", output_dir_text)
-
         self._inject_button.setEnabled(False)
         self._log_message("写回中…")
 
-        self._inject_worker = InjectWorker(self._project_dir, self._db_path, output_dir)
+        self._inject_worker = InjectWorker(self._project_dir, self._db_path)
         self._inject_worker.finished_ok.connect(self._on_inject_done)
         self._inject_worker.failed.connect(self._on_inject_failed)
         self._inject_worker.start()
 
-    def _on_inject_done(self, unit_count: int, output_dir: str) -> None:
-        self._output_dir = output_dir
-        self._log_message(f"注入完成：{unit_count} 条文本，输出到 {output_dir}")
+    def _on_inject_done(self, unit_count: int) -> None:
+        project_dir = self._project_dir
+        self._log_message(f"注入完成：{unit_count} 条文本，已写回 {project_dir}")
         self._open_output_button.setVisible(True)
         self._inject_button.setEnabled(True)
-        output_path = Path(output_dir)
-        self._switch_original_button.setEnabled(has_language_variant(output_path, "original"))
-        self._switch_translated_button.setEnabled(has_language_variant(output_path, "translated"))
-        QMessageBox.information(self, "汉化完成", f"输出目录：{output_dir}")
+        self._switch_original_button.setEnabled(has_language_variant(project_dir, "original"))
+        self._switch_translated_button.setEnabled(has_language_variant(project_dir, "translated"))
+        QMessageBox.information(self, "汉化完成", f"已直接写入游戏工程：{project_dir}")
 
     def _on_inject_failed(self, message: str) -> None:
-        # 注入失败不影响已经翻译好、存在 db 里的内容——按钮保持可用，改改输出目录
-        # 或者解决权限/占用问题后可以直接再点一次重试，不用重新走一遍翻译。
+        # 注入失败不影响已经翻译好、存在 db 里的内容——按钮保持可用，解决权限/占用
+        # 问题后可以直接再点一次重试，不用重新走一遍翻译。
         self._log_message(f"注入出错：{message}")
         self._inject_button.setEnabled(True)
         QMessageBox.critical(self, "注入出错", message)
 
     def _on_switch_language(self, variant: str) -> None:
-        if not self._output_dir:
+        if self._project_dir is None:
             return
         try:
-            count = switch_language(Path(self._output_dir), variant)
+            count = switch_language(self._project_dir, variant)
         except FileNotFoundError as e:
             QMessageBox.warning(self, "切换失败", str(e))
             return
@@ -1067,5 +1042,5 @@ class MainWindow(QMainWindow):
         self._eta_label.setText("")
 
     def _on_open_output_clicked(self) -> None:
-        if self._output_dir:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self._output_dir))
+        if self._project_dir:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._project_dir)))

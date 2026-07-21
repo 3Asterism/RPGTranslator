@@ -55,12 +55,18 @@ def run_extract(project_dir: Path, db_path: Path) -> list[TextUnit]:
     return units
 
 
-def run_inject(project_dir: Path, db_path: Path, output_dir: Path) -> list[TextUnit]:
+def run_inject(project_dir: Path, db_path: Path, output_dir: Path | None = None) -> list[TextUnit]:
+    """把翻译结果写回游戏工程。output_dir 缺省就是 project_dir 本身——原地注入，
+    不再另外拷贝一份"汉化"目录（省一倍磁盘、也不用用户在两个文件夹之间找）。传入
+    一个不同的目录仍然可用（CLI 场景），行为和以前一样。"""
+    if output_dir is None:
+        output_dir = project_dir
     adapter = detect_adapter(project_dir)
     with Store(db_path) as store:
         units = store.list_units()
+    _stash_original_variant(project_dir, output_dir, units)
     adapter.inject(project_dir, units, output_dir)
-    _stash_language_variants(project_dir, output_dir, units)
+    _stash_translated_variant(output_dir, units)
     return units
 
 
@@ -72,19 +78,29 @@ def _backup_variant_dir(output_dir: Path, variant: LanguageVariant) -> Path:
     return output_dir / _BACKUP_DIR_NAME / variant
 
 
-def _stash_language_variants(project_dir: Path, output_dir: Path, units: list[TextUnit]) -> None:
-    """inject 完之后，把改动过的文本文件（不是整个工程——素材文件两个语言版本共用，
-    没必要重复占磁盘）分别留一份"原文"和"译文"快照，供 switch_language() 一键切换用。
-    方便中日对照校对，或者翻译效果有问题时先切回原文确认是不是翻译本身的锅，不用重新
-    跑一遍 inject。"""
+def _stash_original_variant(project_dir: Path, output_dir: Path, units: list[TextUnit]) -> None:
+    """在 adapter.inject() 覆盖文本之前，把还没被动过的原文快照一份，供
+    switch_language() 一键切换用。只在某个文件还没存过原文快照时才写入——原地注入
+    （output_dir == project_dir）场景下 project_dir 会被 inject 直接覆盖，如果每次
+    重新注入（比如又翻了一批新内容）都无条件重新快照，会把上一轮已经写进 project_dir
+    的译文误当成"原文"覆盖掉真正的原文备份。"""
     touched_files = sorted({u.file_path for u in units})
     for rel_path in touched_files:
-        original_src = project_dir / rel_path
-        if original_src.is_file():
-            dest = _backup_variant_dir(output_dir, "original") / rel_path
+        dest = _backup_variant_dir(output_dir, "original") / rel_path
+        if dest.exists():
+            continue
+        src = project_dir / rel_path
+        if src.is_file():
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(original_src, dest)
+            shutil.copy2(src, dest)
 
+
+def _stash_translated_variant(output_dir: Path, units: list[TextUnit]) -> None:
+    """inject 完之后，把刚写回的译文快照一份，供 switch_language() 一键切换用。
+    每次都覆盖式重新快照——它反映的是"最新一次注入之后"的状态，不像原文快照需要
+    保护第一次的值不被后续注入冲掉。"""
+    touched_files = sorted({u.file_path for u in units})
+    for rel_path in touched_files:
         translated_src = output_dir / rel_path
         if translated_src.is_file():
             dest = _backup_variant_dir(output_dir, "translated") / rel_path
@@ -242,7 +258,7 @@ async def run_translate(
 async def run_full(
     project_dir: Path,
     db_path: Path,
-    output_dir: Path,
+    output_dir: Path | None,
     api_key: str | None,
     base_url: str,
     model: str,
@@ -262,6 +278,8 @@ async def run_full(
     每次 LLM 调用成功后调用一次。三者都是可选的，GUI 用它们驱动进度条/日志/花费统计，
     CLI 不传。
     """
+    if output_dir is None:
+        output_dir = project_dir
     api_key = _require_api_key(api_key)
     adapter = detect_adapter(project_dir)
 
@@ -292,8 +310,9 @@ async def run_full(
 
     if on_stage is not None:
         on_stage("写回中…")
+    _stash_original_variant(project_dir, output_dir, all_units)
     adapter.inject(project_dir, all_units, output_dir)
-    _stash_language_variants(project_dir, output_dir, all_units)
+    _stash_translated_variant(output_dir, all_units)
     return all_units
 
 

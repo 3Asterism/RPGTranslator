@@ -179,25 +179,25 @@ class TranslateWorker(QThread):
 
 
 class InjectWorker(QThread):
-    """把 db_path 里已翻译的内容写回游戏工程。不需要 API Key、不需要重新翻译——
-    可以在 TranslateWorker 跑完后随时重试（比如上次写盘失败了，或者用户想换个
-    输出目录再导一次），已翻译的内容留在 db 里不会因为这一步失败而丢。
+    """把 db_path 里已翻译的内容原地写回游戏工程本身（不再复制出一份单独的"汉化"
+    目录，见 core/pipeline.run_inject）。不需要 API Key、不需要重新翻译——可以在
+    TranslateWorker 跑完后随时重试（比如上次写盘失败了），已翻译的内容留在 db 里
+    不会因为这一步失败而丢。
     """
 
-    finished_ok = Signal(int, str)  # (处理的 TextUnit 条数, 输出目录)
+    finished_ok = Signal(int)  # 处理的 TextUnit 条数
     failed = Signal(str)
 
-    def __init__(self, project_dir: Path, db_path: Path, output_dir: Path, parent=None):
+    def __init__(self, project_dir: Path, db_path: Path, parent=None):
         super().__init__(parent)
         self._project_dir = project_dir
         self._db_path = db_path
-        self._output_dir = output_dir
 
     def run(self) -> None:
         try:
-            units = run_inject(self._project_dir, self._db_path, self._output_dir)
+            units = run_inject(self._project_dir, self._db_path)
         except Exception as e:
             logger.exception("注入失败")
             self.failed.emit(str(e))
             return
-        self.finished_ok.emit(len(units), str(self._output_dir))
+        self.finished_ok.emit(len(units))

@@ -125,3 +125,57 @@ def test_switch_language_toggles_output_dir_between_original_and_translated(
 def test_switch_language_raises_clear_error_when_no_backup_exists(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         switch_language(tmp_path / "no_such_output", "original")
+
+
+def test_run_inject_defaults_to_in_place_no_separate_output_folder(mz_project: Path, tmp_path: Path):
+    """不再传 output_dir 就应该直接原地改写 project_dir 本身，不额外生成一个
+    "汉化" 目录——这是用户要求的"直接在原游戏里注入"的核心行为。"""
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        for unit in store.list_units():
+            store.update_translation(unit.id, f"[译]{unit.source_text}", status="translated")
+
+    run_inject(mz_project, db_path)
+
+    translated_map = (mz_project / "data" / "Map001.json").read_text(encoding="utf-8")
+    assert "[译]" in translated_map
+    assert has_language_variant(mz_project, "original")
+    assert has_language_variant(mz_project, "translated")
+
+    switch_language(mz_project, "original")
+    original_map = (mz_project / "data" / "Map001.json").read_text(encoding="utf-8")
+    assert "[译]" not in original_map
+    assert "こんにちは" in original_map
+
+
+def test_run_inject_in_place_preserves_true_original_across_reinject(
+    mz_project: Path, tmp_path: Path
+):
+    """原地注入场景下 project_dir 会被 inject 直接覆盖——如果第二次注入（比如又
+    翻了一批、或者改了译文重新写回）无脑重新快照"原文"，会把上一轮已经写进
+    project_dir 的译文误当成原文备份下来，用户"切换为原文"就再也找不回真正的
+    原文了。"""
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        units = store.list_units()
+        for unit in units:
+            store.update_translation(unit.id, f"[译1]{unit.source_text}", status="translated")
+
+    run_inject(mz_project, db_path)
+
+    with Store(db_path) as store:
+        for unit in store.list_units():
+            store.update_translation(unit.id, f"[译2]{unit.source_text}", status="translated")
+
+    run_inject(mz_project, db_path)
+
+    translated_map = (mz_project / "data" / "Map001.json").read_text(encoding="utf-8")
+    assert "[译2]" in translated_map
+
+    switch_language(mz_project, "original")
+    original_map = (mz_project / "data" / "Map001.json").read_text(encoding="utf-8")
+    assert "[译1]" not in original_map
+    assert "[译2]" not in original_map
+    assert "こんにちは" in original_map

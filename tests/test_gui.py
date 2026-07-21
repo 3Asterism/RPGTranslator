@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -12,7 +13,6 @@ from rpg_translator.gui.main_window import (
     MainWindow,
     _format_duration,
     db_path_for_project,
-    default_output_dir,
     resolve_dropped_path,
 )
 from rpg_translator.gui.settings_dialog import ENGINE_LOCAL, ENGINE_ONLINE, SettingsDialog
@@ -115,12 +115,6 @@ def test_drop_recognized_mz_project_enables_start_and_shows_engine(qapp, mz_proj
     assert window._adapter.engine_name == "mz"
     assert "RPG Maker MZ" in window._info_label.text()
     assert "14" in window._info_label.text()  # mz_project fixture 固定能扫出 14 条
-    assert window._output_dir_edit.text() == str(default_output_dir(mz_project))
-
-
-def test_default_output_dir_is_sibling_of_project_dir_not_cwd_relative(tmp_path: Path):
-    project_dir = tmp_path / "MyGame"
-    assert default_output_dir(project_dir) == tmp_path / "MyGame_汉化"
 
 
 def test_db_path_for_project_points_at_rpg_translator_units_db(tmp_path: Path):
@@ -198,7 +192,6 @@ def test_load_translated_project_with_existing_db_enables_inject(qapp, tmp_path:
     assert window._project_dir == tmp_path
     assert window._db_path == db_path
     assert "1 条已翻译" in window._info_label.text()
-    assert window._output_dir_edit.text() == str(default_output_dir(tmp_path))
 
 
 def test_drop_project_with_existing_progress_shows_resume_note(qapp, mz_project: Path):
@@ -318,11 +311,10 @@ def test_resolve_dropped_path_returns_folder_unchanged(tmp_path: Path):
     assert resolve_dropped_path(project_dir) == project_dir
 
 
-def test_settings_dialog_persists_model_concurrency_output_dir(qapp):
+def test_settings_dialog_persists_model_concurrency(qapp):
     dialog = SettingsDialog()
     dialog._model_combo.setCurrentText("deepseek-v4-pro")
     dialog._concurrency_spin.setValue(16)
-    dialog._output_dir_edit.setText("my_output")
     dialog._api_key_edit.setText("test-key-not-real")
     dialog._connectivity_transport = _mock_transport()
 
@@ -331,7 +323,6 @@ def test_settings_dialog_persists_model_concurrency_output_dir(qapp):
     reloaded = SettingsDialog()
     assert reloaded.model == "deepseek-v4-pro"
     assert reloaded.concurrency == 16
-    assert reloaded.output_dir == "my_output"
     assert reloaded._api_key_edit.text() == "test-key-not-real"
 
 
@@ -564,24 +555,24 @@ def test_translate_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):
 def test_inject_worker_writes_translated_units_without_needing_api_key(
     qapp, tmp_path: Path, mz_project: Path
 ):
-    """InjectWorker 不需要 API Key——纯粹是把 db 里已经翻译好的内容写回工程，
-    所以用手工构造的已翻译 Store 就能测，不用打真实 API 调用。"""
+    """InjectWorker 不需要 API Key——纯粹是把 db 里已经翻译好的内容原地写回工程本身
+    （不再复制出一份单独的"汉化"目录），所以用手工构造的已翻译 Store 就能测，
+    不用打真实 API 调用。"""
     from rpg_translator.core.pipeline import run_extract
     from rpg_translator.core.store import Store
 
     db_path = tmp_path / "units.db"
-    output_dir = tmp_path / "output"
     run_extract(mz_project, db_path)
 
     with Store(db_path) as store:
         for unit in store.list_units():
             store.update_translation(unit.id, f"[译]{unit.source_text}", status="translated")
 
-    results: list[tuple[int, str]] = []
+    results: list[int] = []
     errors: list[str] = []
 
-    worker = InjectWorker(mz_project, db_path, output_dir)
-    worker.finished_ok.connect(lambda count, out: results.append((count, out)))
+    worker = InjectWorker(mz_project, db_path)
+    worker.finished_ok.connect(results.append)
     worker.failed.connect(errors.append)
 
     worker.start()
@@ -590,5 +581,6 @@ def test_inject_worker_writes_translated_units_without_needing_api_key(
 
     assert finished_in_time
     assert errors == []
-    assert results == [(14, str(output_dir))]
-    assert (output_dir / "data" / "System.json").is_file()
+    assert results == [14]
+    translated_map = json.loads((mz_project / "data" / "Map001.json").read_text(encoding="utf-8"))
+    assert "[译]" in json.dumps(translated_map, ensure_ascii=False)
