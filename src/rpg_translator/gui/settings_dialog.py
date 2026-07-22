@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import httpx
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -21,6 +21,9 @@ from PySide6.QtWidgets import (
 
 from rpg_translator.config import (
     Settings,
+    clear_deepseek_api_key,
+    clear_fallback_api_key,
+    clear_local_api_key,
     get_deepseek_api_key,
     get_fallback_api_key,
     get_local_api_key,
@@ -59,6 +62,53 @@ ENGINE_ONLINE = "online"
 ENGINE_LOCAL = "local"
 
 
+class _ConnectivityCheckWorker(QThread):
+    """连接测试的 HTTP 请求跑在这个后台线程——原来直接在 _on_accept 里同步调用
+    httpx，网络慢或者地址填错时会把整个（模态）设置对话框卡住最多
+    _CONNECTIVITY_TIMEOUT_SECONDS 秒，和这个项目其它地方"耗时操作不占 GUI 线程"
+    的一贯做法不一致，也容易被用户误以为软件又双叒卡死了。"""
+
+    finished_check = Signal(bool, str)
+
+    def __init__(
+        self,
+        url: str,
+        base_url: str,
+        api_key: str,
+        timeout: float,
+        transport: httpx.BaseTransport | None,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self._url = url
+        self._base_url = base_url
+        self._api_key = api_key
+        self._timeout = timeout
+        self._transport = transport
+
+    def run(self) -> None:
+        try:
+            with httpx.Client(timeout=self._timeout, transport=self._transport) as http:
+                resp = http.get(self._url, headers={"Authorization": f"Bearer {self._api_key}"})
+        except httpx.HTTPError as e:
+            self.finished_check.emit(False, f"连不上 {self._base_url}：{e}")
+            return
+
+        # >=500 不当作"连通"：本机走系统代理（比如 Clash）时，代理本身能正常应答，
+        # 但代理连不上局域网里的目标地址（比如 Ollama 用了错的端口/IP）会回一个
+        # 502/504——这种情况客户端收到的确实是一个完整的 HTTP 响应，但真正要连的
+        # 那个地址其实没通，不能算检查通过。4xx（比如 401 key 错）说明请求确实到了
+        # 目标服务，只是 key/参数不对，这种算连通，交给真正翻译时的报错反馈。
+        if resp.status_code >= 500:
+            self.finished_check.emit(
+                False,
+                f"{self._base_url} 返回了错误状态码 {resp.status_code}，"
+                "目标服务可能没启动或地址不对。",
+            )
+            return
+        self.finished_check.emit(True, "")
+
+
 class SettingsDialog(QDialog):
     """API Key（keyring）、模型选择、并发数、输出目录——非敏感项走 QSettings，
     API Key 单独走 keyring，绝不落地明文文件。"""
@@ -68,9 +118,13 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("设置")
         self._qsettings = QSettings(ORG_NAME, APP_NAME)
         # 测试用注入点：换成 httpx.MockTransport 就能在不碰真实网络的情况下验证
-        # _check_connectivity 的请求/判断逻辑（同 llm_client.LLMClient 的 transports 参数）。
-        # 留空（默认）就是走真实网络。
+        # _ConnectivityCheckWorker 的请求/判断逻辑（同 llm_client.LLMClient 的 transports
+        # 参数）。留空（默认）就是走真实网络。
         self._connectivity_transport: httpx.BaseTransport | None = None
+        # 连接测试跑在后台线程期间为 True——用来在 reject()/关闭按钮里挡住"检测还没
+        # 回来就把对话框关掉"这条路径（销毁一个仍在运行的 QThread 会直接 native abort）。
+        self._busy = False
+        self._check_worker: _ConnectivityCheckWorker | None = None
 
         self._engine_combo = QComboBox()
         self._engine_combo.addItem("在线（云端 API，如 DeepSeek）", ENGINE_ONLINE)
@@ -156,18 +210,18 @@ class SettingsDialog(QDialog):
         self._fallback_box = QGroupBox("备用 Provider（可选，主服务连续出错时自动切换，仅在线引擎可用）")
         self._fallback_box.setLayout(fallback_form)
 
-        buttons = QDialogButtonBox(
+        self._button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
+        self._button_box.accepted.connect(self._on_accept)
+        self._button_box.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self._online_box)
         layout.addWidget(self._local_box)
         layout.addWidget(self._fallback_box)
-        layout.addWidget(buttons)
+        layout.addWidget(self._button_box)
 
         self._load()
         self._on_engine_changed()
@@ -185,6 +239,7 @@ class SettingsDialog(QDialog):
 
     def _load(self) -> None:
         existing_key = get_deepseek_api_key()
+        self._had_api_key = bool(existing_key)
         if existing_key:
             self._api_key_edit.setText(existing_key)
 
@@ -212,10 +267,12 @@ class SettingsDialog(QDialog):
         self._local_base_url_edit.setText(str(self._qsettings.value("local_base_url", "")))
         self._local_model_edit.setText(str(self._qsettings.value("local_model", "")))
         existing_local_key = get_local_api_key()
+        self._had_local_key = bool(existing_local_key)
         if existing_local_key:
             self._local_api_key_edit.setText(existing_local_key)
 
         existing_fallback_key = get_fallback_api_key()
+        self._had_fallback_key = bool(existing_fallback_key)
         if existing_fallback_key:
             self._fallback_api_key_edit.setText(existing_fallback_key)
         self._fallback_base_url_edit.setText(str(self._qsettings.value("fallback_base_url", "")))
@@ -226,62 +283,90 @@ class SettingsDialog(QDialog):
     # 这个地址"，不判断 key/模型名是否真的可用，那些错误留给真正翻译时的报错反馈。
     _CONNECTIVITY_TIMEOUT_SECONDS = 8.0
 
-    def _check_connectivity(self) -> tuple[bool, str]:
+    def _resolve_check_target(self) -> tuple[str, str] | None:
+        """只做字段本身的轻量校验（是否为空），不碰网络——这部分留在 GUI 线程同步做
+        没问题。返回 None 表示校验没过，对应的错误提示已经弹出，调用方直接放弃
+        这次保存，不需要再起后台线程。"""
         engine = self._engine_combo.currentData()
         if engine == ENGINE_LOCAL:
             base_url = self._local_base_url_edit.text().strip()
             if not base_url:
-                return False, "本地 Provider 的 Base URL 不能为空。"
+                self._show_connectivity_error("本地 Provider 的 Base URL 不能为空。")
+                return None
             api_key = self._local_api_key_edit.text().strip() or "sk-local"
         else:
             base_url = self._base_url_edit.text().strip() or Settings().deepseek_base_url
             api_key = self._api_key_edit.text().strip()
             if not api_key:
-                return False, "在线 Provider 需要填写 API Key。"
+                self._show_connectivity_error("在线 Provider 需要填写 API Key。")
+                return None
+        return base_url, api_key
 
-        url = base_url.rstrip("/") + "/models"
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            with httpx.Client(
-                timeout=self._CONNECTIVITY_TIMEOUT_SECONDS, transport=self._connectivity_transport
-            ) as http:
-                resp = http.get(url, headers={"Authorization": f"Bearer {api_key}"})
-        except httpx.HTTPError as e:
-            return False, f"连不上 {base_url}：{e}"
-        finally:
+    def _show_connectivity_error(self, error: str) -> None:
+        QMessageBox.warning(
+            self,
+            "连接测试失败",
+            f"{error}\n\n设置未保存，请检查地址/网络，或确认服务已启动后重试。",
+        )
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self._button_box.setEnabled(not busy)
+        if busy:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        else:
             QApplication.restoreOverrideCursor()
 
-        # >=500 不当作"连通"：本机走系统代理（比如 Clash）时，代理本身能正常应答，
-        # 但代理连不上局域网里的目标地址（比如 Ollama 用了错的端口/IP）会回一个
-        # 502/504——这种情况客户端收到的确实是一个完整的 HTTP 响应，但真正要连的
-        # 那个地址其实没通，不能算检查通过（实测踩过这个坑：错端口在有代理时会被
-        # 误判成"连得上"）。4xx（比如 401 key 错）说明请求确实到了目标服务，只是
-        # key/参数不对，这种算连通，交给真正翻译时的报错反馈。
-        if resp.status_code >= 500:
-            return False, f"{base_url} 返回了错误状态码 {resp.status_code}，目标服务可能没启动或地址不对。"
-        return True, ""
+    def reject(self) -> None:
+        # 连接测试的后台线程还没跑完时不放行关闭——Cancel 按钮、标题栏叉号、Esc
+        # 默认都会走到这个方法。对话框在检测线程还活着的时候被销毁，等同于销毁一个
+        # 仍在运行的 QThread，PySide 里这会在 C++ 层直接 abort（这个项目已经踩过
+        # 好几次这类无预兆闪退，见 main_window.py _open_settings 的说明）。检测本身
+        # 有 _CONNECTIVITY_TIMEOUT_SECONDS 封顶，等一下就会回来。
+        if self._busy:
+            return
+        super().reject()
 
     def _on_accept(self) -> None:
-        ok, error = self._check_connectivity()
-        if not ok:
-            QMessageBox.warning(
-                self,
-                "连接测试失败",
-                f"{error}\n\n设置未保存，请检查地址/网络，或确认服务已启动后重试。",
-            )
+        target = self._resolve_check_target()
+        if target is None:
             return
+        base_url, api_key = target
 
+        url = base_url.rstrip("/") + "/models"
+        self._set_busy(True)
+        self._check_worker = _ConnectivityCheckWorker(
+            url, base_url, api_key, self._CONNECTIVITY_TIMEOUT_SECONDS, self._connectivity_transport, self
+        )
+        self._check_worker.finished_check.connect(self._on_connectivity_checked)
+        self._check_worker.start()
+
+    def _on_connectivity_checked(self, ok: bool, error: str) -> None:
+        self._set_busy(False)
+        if not ok:
+            self._show_connectivity_error(error)
+            return
+        self._save_settings()
+        self.accept()
+
+    def _save_settings(self) -> None:
         api_key = self._api_key_edit.text().strip()
         if api_key:
             set_deepseek_api_key(api_key)
+        elif self._had_api_key:
+            clear_deepseek_api_key()
 
         fallback_key = self._fallback_api_key_edit.text().strip()
         if fallback_key:
             set_fallback_api_key(fallback_key)
+        elif self._had_fallback_key:
+            clear_fallback_api_key()
 
         local_key = self._local_api_key_edit.text().strip()
         if local_key:
             set_local_api_key(local_key)
+        elif self._had_local_key:
+            clear_local_api_key()
 
         self._qsettings.setValue("base_url", self._base_url_edit.text().strip())
         self._qsettings.setValue("model", self._model_combo.currentText())
@@ -293,7 +378,6 @@ class SettingsDialog(QDialog):
         self._qsettings.setValue("local_model", self._local_model_edit.text().strip())
         self._qsettings.setValue("fallback_base_url", self._fallback_base_url_edit.text().strip())
         self._qsettings.setValue("fallback_model", self._fallback_model_edit.text().strip())
-        self.accept()
 
     @property
     def model(self) -> str:

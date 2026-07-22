@@ -35,6 +35,14 @@ def test_parse_batch_response_missing_index_returns_none():
     assert _parse_batch_response(response, 2) is None
 
 
+def test_parse_batch_response_out_of_order_markers_returns_none():
+    """按位置严格校验（第 i 个匹配到的编号必须正好是 i+1），不是只看编号集合是否
+    等于 {1..N}——这个响应里 [1]/[2] 齐全但顺序颠倒，之前只按集合比较会误判成
+    "合法"，把内容错配给错误的编号；现在应该判失败走二分重试。"""
+    response = "[2] 再见\n\n[1] 你好"
+    assert _parse_batch_response(response, 2) is None
+
+
 def test_parse_batch_response_no_markers_returns_none():
     assert _parse_batch_response("完全不按格式回复的一段话", 3) is None
 
@@ -297,6 +305,24 @@ async def test_translate_units_restores_control_codes(tmp_path: Path):
 
         result = store.get_unit("1")
         assert "\\C[1]" in result.translated_text
+        assert "⟦CC" not in result.translated_text
+
+
+@pytest.mark.anyio
+async def test_translate_units_restores_embedded_real_newlines(tmp_path: Path):
+    r"""回归测试：数据库 description/note 这类字段常见的真实换行符（字面的 \x0A，
+    不是 \\n 反斜杠转义控制码）之前没有被 protect() 保护，模型翻译多段文字时经常
+    不老实保留原始换行/分段结构，导致本该分行显示的内容被揉成一整段回填进游戏
+    （表现为"字符堆叠在一起、不换行"）。"""
+    stub = _EchoStub()
+    with Store(tmp_path / "units.db") as store:
+        unit = _make_unit("1", "第一段。\n第二段，换了话题。")
+        store.upsert_units([unit])
+
+        await translate_units(stub, store, [unit], concurrency=4)
+
+        result = store.get_unit("1")
+        assert "\n" in result.translated_text
         assert "⟦CC" not in result.translated_text
 
 
@@ -689,6 +715,60 @@ async def test_translate_units_auto_retry_does_not_double_count_progress(tmp_pat
         assert progress_calls == [(1, 1)]  # 重试轮成功不再重复触发 on_progress
 
 
+class _FailTwiceThenSucceedForBareTextStub:
+    """对某个特定的裸文本（protected_text 精确等于 bare_text，没有上下文）前
+    fail_times 次调用报错、之后成功；其它内容（比如角色名翻译请求）永远直接成功。
+    用来复现"两个不同 Job 恰好有相同的 source_text，但属于不同的 (source_text,
+    result_prefix) 分组"这种碰撞场景——两个 Job 会发起两次内容完全相同的请求。"""
+
+    def __init__(self, bare_text: str, fail_times: int):
+        self.bare_text = bare_text
+        self.fail_times = fail_times
+        self.bare_call_count = 0
+        self.call_count = 0
+
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
+        self.call_count += 1
+        marker = "待翻译文本：\n"
+        idx = user_prompt.index(marker) + len(marker)
+        protected_text = user_prompt[idx:]
+        if protected_text == self.bare_text:
+            self.bare_call_count += 1
+            if self.bare_call_count <= self.fail_times:
+                raise RuntimeError("503 Service Unavailable")
+        return f"译:{protected_text}"
+
+
+@pytest.mark.anyio
+async def test_translate_units_retries_both_jobs_when_source_text_collides_across_groups(
+    tmp_path: Path,
+):
+    r"""回归测试：\n<角色名>正文 拆分出来的"正文"部分，可能跟另一条独立台词的原文
+    字面相同（比如都是"……"这种很短的常见台词）——此时两个 Job 的 source_text 相同，
+    但属于不同的 (source_text, result_prefix) 分组，理应被当成两次独立的翻译任务。
+    自动重试轮之前是按 source_text 反查 Job 对象再重新提交，两个 Job 会互相覆盖，
+    其中一个从此再也不会被重新提交，也不会出现在最终返回的 failures 里——注入阶段
+    又会用原文兜底，表现为这一条译文悄悄留成了日文原文，却没有任何失败提示。
+    修复后两个 Job 应该都被独立重试成功。"""
+    stub = _FailTwiceThenSucceedForBareTextStub(bare_text="X", fail_times=2)
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("plain", "X"),
+            _make_unit("tagged", "\\n<Name>X"),
+        ]
+        store.upsert_units(units)
+
+        failures = await translate_units(
+            stub, store, units, concurrency=4, batch_size=1, retry_wait_seconds=0
+        )
+
+        assert failures == []
+        assert store.get_unit("plain").status == "translated"
+        assert store.get_unit("tagged").status == "translated"
+        assert store.get_unit("plain").translated_text == "译:X"
+        assert store.get_unit("tagged").translated_text == "\\n<译:Name>译:X"
+
+
 @pytest.mark.anyio
 async def test_translate_units_auto_retry_exhausted_still_fails(tmp_path: Path):
     stub = _FlakyStub("こんにちは")  # 永远失败，模拟内容审核拒绝这类不可恢复的错误
@@ -854,10 +934,12 @@ async def test_translate_units_batching_works_against_real_provider(tmp_path: Pa
             call_count = 0
             original_chat = client.chat
 
-            async def _counting_chat(system_prompt: str, user_prompt: str) -> str:
+            async def _counting_chat(
+                system_prompt: str, user_prompt: str, extra_body: dict | None = None
+            ) -> str:
                 nonlocal call_count
                 call_count += 1
-                return await original_chat(system_prompt, user_prompt)
+                return await original_chat(system_prompt, user_prompt, extra_body)
 
             client.chat = _counting_chat
             await translate_units(client, store, units, concurrency=4, batch_size=10)
@@ -950,3 +1032,46 @@ async def test_translate_units_speaker_tag_survives_model_that_drops_placeholder
         # 这里只断言角色名标签部分没有引入额外的失败，不强求 \. 也免疫。
         for source_text, error in failures:
             assert "シャーロット" not in error and "じ" not in error
+
+
+class _WholePromptEchoStub:
+    """不依赖固定 marker 切分 prompt，直接记下完整的 user_prompt、原样加前缀吐回去——
+    用于只关心"发给模型的 prompt 文本里到底有没有出现某段话"的测试，不需要真的
+    按具体协议格式解析。"""
+
+    def __init__(self):
+        self.call_count = 0
+        self.prompts: list[str] = []
+
+    async def chat(self, system_prompt: str, user_prompt: str, extra_body: dict | None = None) -> str:
+        self.call_count += 1
+        self.prompts.append(user_prompt)
+        return f"译:{user_prompt}"
+
+
+@pytest.mark.anyio
+async def test_translate_units_speaker_name_batch_prompt_does_not_imply_dialogue_continuity(
+    tmp_path: Path,
+):
+    r"""回归测试：多个角色名字凑不满一次单独调用、按 batch_size 打包进同一次请求时，
+    之前复用跟正文台词一样的批量指令（_BATCH_INSTRUCTION）——那段指令里"如果连续
+    多条编号本身就是同一段场景里的连续台词，请让人名、称呼、术语在这些条目之间
+    前后保持一致"这句话，会让模型误以为一批互不相关的角色名字是同一段剧情的连续
+    台词，实测出现过把某个名字直接展开翻译成一整句话（相当于把"上下文"当正文
+    翻了）。这里断言发给模型翻译名字的 prompt 用的是专门的、明确说"这些名字互不
+    相关"的指令，不含旧指令里"同一段场景的连续台词"这句话。"""
+    stub = _WholePromptEchoStub()
+    with Store(tmp_path / "units.db") as store:
+        units = [
+            _make_unit("1", "\\n<爱丽丝>おはよう"),
+            _make_unit("2", "\\n<鲍勃>こんにちは"),
+        ]
+        store.upsert_units(units)
+
+        await translate_units(stub, store, units, concurrency=4, batch_size=25)
+
+        name_prompts = [p for p in stub.prompts if "爱丽丝" in p or "鲍勃" in p]
+        assert name_prompts, "没有捕获到翻译角色名的请求"
+        for prompt in name_prompts:
+            assert "同一段场景里的连续台词" not in prompt
+            assert "互不相关" in prompt

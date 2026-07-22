@@ -118,3 +118,40 @@ def test_data_persists_across_store_reopen(tmp_path: Path):
 
     with Store(db_path) as reopened:
         assert reopened.get_unit("u1") is not None
+
+
+def test_update_translation_and_set_memory_persist_without_explicit_commit(tmp_path: Path):
+    """update_translation/set_memory 不再各自内部 commit（大工程翻译时同一句高频
+    重复短句可能对应成百上千个 TextUnit，逐条 commit 会把 SQLite 的 fsync 开销放大
+    到不成比例，见 translate/batch_translator.py 的 _write_result）——但仍然必须在
+    Store 关闭时兜底提交一次，不能因为调用方忘了显式 commit() 就悄悄丢掉这些写入。"""
+    db_path = tmp_path / "units.db"
+    with Store(db_path) as store:
+        store.upsert_units([_make_unit("u1")])
+        store.update_translation("u1", "你好", status="translated")
+        store.set_memory(compute_source_hash("こんにちは"), "こんにちは", "你好")
+        # 故意不调用 store.commit()，验证 close()/__exit__ 会兜底提交
+
+    with Store(db_path) as reopened:
+        fetched = reopened.get_unit("u1")
+        assert fetched is not None
+        assert fetched.status == "translated"
+        assert fetched.translated_text == "你好"
+        assert reopened.get_memory(compute_source_hash("こんにちは")) == "你好"
+
+
+def test_explicit_commit_makes_writes_visible_from_a_different_connection(tmp_path: Path):
+    """batch_translator._write_result 每写完一个 job 就显式调用一次 store.commit()——
+    验证这个方法本身确实把改动落盘到磁盘上的数据库文件，而不只是停留在当前连接的
+    事务里。"""
+    db_path = tmp_path / "units.db"
+    with Store(db_path) as store:
+        store.upsert_units([_make_unit("u1")])
+        store.update_translation("u1", "你好", status="translated")
+        store.commit()
+
+        with Store(db_path) as other_connection:
+            fetched = other_connection.get_unit("u1")
+            assert fetched is not None
+            assert fetched.status == "translated"
+            assert fetched.translated_text == "你好"
