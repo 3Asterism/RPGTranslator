@@ -146,6 +146,28 @@ class Store:
             (translated_text, status, unit_id),
         )
 
+    def delete_missing(self, keep_ids: set[str]) -> int:
+        """删掉 text_units 里所有 id 不在 keep_ids 集合中的历史行——用于"重新提取一遍
+        当前游戏文本，把已经不再对应任何现存文本的旧行清掉"（见 pipeline.prune_stale_units）。
+        keep_ids 为空几乎不可能是"这工程真的一条文本都没有"，更可能是提取意外失败/传参
+        出错，这里直接拒绝，防止把整张表清空。返回实际删除的行数。"""
+        if not keep_ids:
+            raise ValueError("keep_ids 不能为空，拒绝清空整张 text_units 表")
+        rows = self._conn.execute("SELECT id FROM text_units").fetchall()
+        stale_ids = [row["id"] for row in rows if row["id"] not in keep_ids]
+        if stale_ids:
+            placeholders = ",".join("?" for _ in stale_ids)
+            self._conn.execute(
+                f"DELETE FROM text_units WHERE id IN ({placeholders})", stale_ids
+            )
+            self._conn.commit()
+        return len(stale_ids)
+
+    def vacuum(self) -> None:
+        """回收 delete_missing 之类的删除操作腾出的磁盘空间——sqlite 默认不会自动
+        收缩文件体积，DELETE 之后文件本身不会变小，需要显式 VACUUM 才会真正瘦身。"""
+        self._conn.execute("VACUUM")
+
     def get_memory(self, source_hash: str) -> str | None:
         row = self._conn.execute(
             "SELECT translated_text FROM translation_memory WHERE source_hash = ?",

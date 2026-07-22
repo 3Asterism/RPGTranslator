@@ -42,7 +42,7 @@ def _make_job(source_text: str, context: str = "", context_group: str = "") -> J
 
 
 def test_build_single_prompt_without_context_has_empty_history():
-    prompt = _build_single_prompt("こんにちは", "")
+    prompt = _build_single_prompt("こんにちは", "", {})
     assert "[History]" not in prompt
     assert "[Input]" not in prompt
     assert prompt.startswith("参考以下术语表")
@@ -50,15 +50,32 @@ def test_build_single_prompt_without_context_has_empty_history():
 
 
 def test_build_single_prompt_with_context_fills_history_slot():
-    prompt = _build_single_prompt("こんにちは", "村の入り口での会話")
+    prompt = _build_single_prompt("こんにちは", "村の入り口での会話", {})
     assert prompt.startswith("历史剧情：村の入り口での会話\n")
     assert prompt.endswith("こんにちは")
 
 
 def test_build_single_prompt_escapes_real_newlines():
-    prompt = _build_single_prompt("第一行\n第二行", "")
+    prompt = _build_single_prompt("第一行\n第二行", "", {})
     assert "第一行\\n第二行" in prompt
     assert "第一行\n第二行" not in prompt
+
+
+def test_build_single_prompt_fills_glossary_slot_with_name_hints():
+    prompt = _build_single_prompt("花子と話す", "", {"花子": "华子"})
+    assert "花子->华子 #人名" in prompt
+
+
+def test_build_batch_prompt_merges_name_hints_from_all_jobs():
+    jobs = [
+        _make_job("花子が来た", context="村の会話"),
+        _make_job("次郎も来た", context="村の会話"),
+    ]
+    jobs[0] = jobs[0]._replace(name_hints={"花子": "华子"})
+    jobs[1] = jobs[1]._replace(name_hints={"次郎": "次郎"})
+    prompt = _build_batch_prompt(jobs)
+    assert "花子->华子 #人名" in prompt
+    assert "次郎->次郎 #人名" in prompt
 
 
 def test_build_batch_prompt_joins_lines_and_uses_shared_job_context():

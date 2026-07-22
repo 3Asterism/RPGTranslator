@@ -7,13 +7,10 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFileDialog,
     QFormLayout,
     QGroupBox,
-    QHBoxLayout,
     QLineEdit,
     QMessageBox,
-    QPushButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -180,18 +177,10 @@ class SettingsDialog(QDialog):
             "只是变慢）。"
         )
 
-        self._output_dir_edit = QLineEdit()
-        browse_button = QPushButton("浏览…")
-        browse_button.clicked.connect(self._browse_output_dir)
-        output_dir_layout = QHBoxLayout()
-        output_dir_layout.addWidget(self._output_dir_edit)
-        output_dir_layout.addWidget(browse_button)
-
         form = QFormLayout()
         form.addRow("翻译引擎", self._engine_combo)
         form.addRow("并发数", self._concurrency_spin)
         form.addRow("批量大小", self._batch_size_spin)
-        form.addRow("输出目录", output_dir_layout)
 
         # 备用 provider：主 provider 连续报瞬时错误（429/5xx/连接失败）重试用尽后自动切过来
         # （见 translate/llm_client.py）。三个字段都留空就是不启用，行为和以前一样。
@@ -232,11 +221,6 @@ class SettingsDialog(QDialog):
         self._online_box.setVisible(not is_local)
         self._fallback_box.setVisible(not is_local)
 
-    def _browse_output_dir(self) -> None:
-        directory = QFileDialog.getExistingDirectory(self, "选择输出目录", self._output_dir_edit.text())
-        if directory:
-            self._output_dir_edit.setText(directory)
-
     def _load(self) -> None:
         existing_key = get_deepseek_api_key()
         self._had_api_key = bool(existing_key)
@@ -257,8 +241,6 @@ class SettingsDialog(QDialog):
 
         batch_size = int(self._qsettings.value("batch_size", DEFAULT_BATCH_SIZE))
         self._batch_size_spin.setValue(batch_size)
-
-        self._output_dir_edit.setText(str(self._qsettings.value("output_dir", "output")))
 
         engine = str(self._qsettings.value("engine", ENGINE_ONLINE))
         index = self._engine_combo.findData(engine)
@@ -372,7 +354,6 @@ class SettingsDialog(QDialog):
         self._qsettings.setValue("model", self._model_combo.currentText())
         self._qsettings.setValue("concurrency", self._concurrency_spin.value())
         self._qsettings.setValue("batch_size", self._batch_size_spin.value())
-        self._qsettings.setValue("output_dir", self._output_dir_edit.text())
         self._qsettings.setValue("engine", self._engine_combo.currentData())
         self._qsettings.setValue("local_base_url", self._local_base_url_edit.text().strip())
         self._qsettings.setValue("local_model", self._local_model_edit.text().strip())
@@ -394,10 +375,6 @@ class SettingsDialog(QDialog):
     @property
     def batch_size(self) -> int:
         return int(self._qsettings.value("batch_size", DEFAULT_BATCH_SIZE))
-
-    @property
-    def output_dir(self) -> str:
-        return str(self._qsettings.value("output_dir", "output"))
 
     @property
     def engine(self) -> str:
