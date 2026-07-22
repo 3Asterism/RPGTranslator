@@ -46,16 +46,30 @@ def _build_history(items: list[Job]) -> str:
     return f"历史剧情：{context}\n"
 
 
-def _build_single_prompt(protected_text: str, context: str) -> str:
+def _format_glossary(name_hints: dict[str, str]) -> str:
+    # GalTransl 官方术语表格式：一行一条 "src->dst #备注"（见 _TRANS_TEMPLATE 里的
+    # 格式说明）。这里的条目来自 batch_translator 已经翻好的角色名表（见
+    # translate_units 里从 "\n<角色名>" 说话人标签收集的 name_translations），只挑
+    # 这条/这批正文里实际提到的名字（_match_name_hints），不是整份工程的角色名单，
+    # 空的话原样保持模板里"可为空"的空 [Glossary] 行为不变。
+    if not name_hints:
+        return ""
+    return "\n".join(f"{name}->{translated} #人名" for name, translated in name_hints.items())
+
+
+def _build_single_prompt(protected_text: str, context: str, name_hints: dict[str, str]) -> str:
     history = f"历史剧情：{context}\n" if context else ""
     prompt = _TRANS_TEMPLATE.replace("[History]", history)
-    prompt = prompt.replace("[Glossary]", "")
+    prompt = prompt.replace("[Glossary]", _format_glossary(name_hints))
     return prompt.replace("[Input]", _escape_newlines(protected_text))
 
 
 def _build_batch_prompt(items: list[Job]) -> str:
+    merged_hints: dict[str, str] = {}
+    for job in items:
+        merged_hints.update(job.name_hints)
     prompt = _TRANS_TEMPLATE.replace("[History]", _build_history(items))
-    prompt = prompt.replace("[Glossary]", "")
+    prompt = prompt.replace("[Glossary]", _format_glossary(merged_hints))
     lines = [_escape_newlines(job.protected_text) for job in items]
     return prompt.replace("[Input]", "\n".join(lines))
 

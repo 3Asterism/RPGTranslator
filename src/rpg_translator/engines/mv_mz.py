@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 from pathlib import Path
 from typing import Any, ClassVar
 
 from rpg_translator.core.ir import EngineName, TextUnit, compute_text_unit_id
-from rpg_translator.engines.base import EngineAdapter
+from rpg_translator.engines.base import EngineAdapter, copy_project_if_different
 
 _DATABASE_FILES = [
     "Actors.json",
@@ -193,7 +192,7 @@ class _MVMZAdapterBase(EngineAdapter):
         return units
 
     def inject(self, project_dir: Path, units: list[TextUnit], output_dir: Path) -> None:
-        shutil.copytree(project_dir, output_dir, dirs_exist_ok=True)
+        copy_project_if_different(project_dir, output_dir)
 
         by_file: dict[str, list[TextUnit]] = {}
         for unit in units:

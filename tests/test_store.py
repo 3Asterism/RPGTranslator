@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from rpg_translator.core.ir import TextUnit, compute_source_hash
 from rpg_translator.core.store import Store
 
@@ -155,3 +157,32 @@ def test_explicit_commit_makes_writes_visible_from_a_different_connection(tmp_pa
             assert fetched is not None
             assert fetched.status == "translated"
             assert fetched.translated_text == "你好"
+
+
+def test_delete_missing_removes_rows_not_in_keep_ids(tmp_path: Path):
+    with Store(tmp_path / "units.db") as store:
+        store.upsert_units([_make_unit("u1"), _make_unit("u2"), _make_unit("u3")])
+
+        deleted = store.delete_missing({"u1", "u3"})
+
+        assert deleted == 1
+        assert {u.id for u in store.list_units()} == {"u1", "u3"}
+
+
+def test_delete_missing_rejects_empty_keep_ids(tmp_path: Path):
+    """keep_ids 为空几乎不可能是"这工程真的一条文本都没有"，更可能是重新提取意外
+    失败/传参出错——真按空集合清理会把整张表删空，这里必须直接拒绝而不是执行。"""
+    with Store(tmp_path / "units.db") as store:
+        store.upsert_units([_make_unit("u1")])
+
+        with pytest.raises(ValueError):
+            store.delete_missing(set())
+
+        assert len(store.list_units()) == 1
+
+
+def test_vacuum_does_not_raise_after_delete(tmp_path: Path):
+    with Store(tmp_path / "units.db") as store:
+        store.upsert_units([_make_unit("u1"), _make_unit("u2")])
+        store.delete_missing({"u1"})
+        store.vacuum()  # 只要不抛异常就算通过——VACUUM 本身没有可断言的返回值
