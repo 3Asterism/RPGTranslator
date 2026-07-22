@@ -15,7 +15,12 @@ from rpg_translator.gui.main_window import (
     default_output_dir,
     resolve_dropped_path,
 )
-from rpg_translator.gui.settings_dialog import ENGINE_LOCAL, ENGINE_ONLINE, SettingsDialog
+from rpg_translator.gui.settings_dialog import (
+    ENGINE_LOCAL,
+    ENGINE_ONLINE,
+    SettingsDialog,
+    _ConnectivityCheckWorker,
+)
 from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker
 
 
@@ -318,6 +323,18 @@ def test_resolve_dropped_path_returns_folder_unchanged(tmp_path: Path):
     assert resolve_dropped_path(project_dir) == project_dir
 
 
+def _accept_and_wait(dialog: SettingsDialog, qapp, timeout: int = 10_000) -> None:
+    """_on_accept 现在起一个后台 QThread 做连接测试就立刻返回（见 settings_dialog.py
+    _ConnectivityCheckWorker 的说明），测试要显式等这个线程跑完、再把 Qt 事件队列
+    里排队的跨线程信号处理掉，才能看到 _save_settings/accept() 真正执行完的效果。"""
+    dialog._on_accept()
+    worker = dialog._check_worker
+    assert worker is not None, "连接测试线程没有被创建（校验阶段被提前拒绝了？）"
+    finished_in_time = worker.wait(timeout)
+    qapp.processEvents()
+    assert finished_in_time, "连接测试线程没在超时内跑完"
+
+
 def test_settings_dialog_persists_model_concurrency_output_dir(qapp):
     dialog = SettingsDialog()
     dialog._model_combo.setCurrentText("deepseek-v4-pro")
@@ -326,7 +343,7 @@ def test_settings_dialog_persists_model_concurrency_output_dir(qapp):
     dialog._api_key_edit.setText("test-key-not-real")
     dialog._connectivity_transport = _mock_transport()
 
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
 
     reloaded = SettingsDialog()
     assert reloaded.model == "deepseek-v4-pro"
@@ -347,7 +364,7 @@ def test_settings_dialog_persists_base_url_and_fallback_provider(qapp):
     dialog._api_key_edit.setText("test-key-not-real")
     dialog._connectivity_transport = _mock_transport()
 
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
 
     reloaded = SettingsDialog()
     assert reloaded.base_url == "https://api.siliconflow.cn/v1"
@@ -379,7 +396,7 @@ def test_settings_dialog_selecting_online_engine_shows_online_box(qapp):
 
     dialog._api_key_edit.setText("test-key-not-real")
     dialog._connectivity_transport = _mock_transport()
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
     assert SettingsDialog().engine == ENGINE_ONLINE
 
 
@@ -396,7 +413,7 @@ def test_settings_dialog_persists_local_engine_config(qapp):
     dialog._local_model_edit.setText("sakura-galtransl")
     dialog._connectivity_transport = _mock_transport()
 
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
 
     reloaded = SettingsDialog()
     assert reloaded.engine == ENGINE_LOCAL
@@ -412,15 +429,31 @@ def _select_online_engine(dialog: SettingsDialog) -> None:
     dialog._engine_combo.setCurrentIndex(dialog._engine_combo.findData(ENGINE_ONLINE))
 
 
+def _run_connectivity_check(
+    qapp,
+    url: str = "https://example.invalid/v1/models",
+    base_url: str = "https://example.invalid/v1",
+    api_key: str = "test-key",
+    transport: httpx.BaseTransport | None = None,
+    timeout: int = 10_000,
+) -> tuple[bool, str]:
+    """直接跑 _ConnectivityCheckWorker（真正做网络请求判断的地方，见 settings_dialog.py），
+    不经过整个对话框的 accept 流程——纯粹验证"连通性判断本身"这一小块逻辑。"""
+    results: list[tuple[bool, str]] = []
+    worker = _ConnectivityCheckWorker(url, base_url, api_key, 8.0, transport)
+    worker.finished_check.connect(lambda ok, error: results.append((ok, error)))
+    worker.start()
+    finished_in_time = worker.wait(timeout)
+    qapp.processEvents()
+    assert finished_in_time, "连接测试线程没在超时内跑完"
+    assert len(results) == 1
+    return results[0]
+
+
 def test_settings_dialog_check_connectivity_succeeds_when_server_responds(qapp):
     """只要服务端有响应就算"连得上"，哪怕是 401（key 错）也不算连通性失败——
     key/模型名对不对是另一回事，留给真正翻译时的报错反馈。"""
-    dialog = SettingsDialog()
-    _select_online_engine(dialog)
-    dialog._api_key_edit.setText("wrong-key")
-    dialog._connectivity_transport = _mock_transport(status_code=401)
-
-    ok, error = dialog._check_connectivity()
+    ok, error = _run_connectivity_check(qapp, transport=_mock_transport(status_code=401))
 
     assert ok is True
     assert error == ""
@@ -429,52 +462,54 @@ def test_settings_dialog_check_connectivity_succeeds_when_server_responds(qapp):
 def test_settings_dialog_check_connectivity_fails_on_5xx_response(qapp):
     """502/504 这类网关错误不算"连通"——本机走系统代理时，代理能正常应答但连不上
     局域网里真正的目标地址会回这个，客户端确实收到了响应，但要连的地址其实没通。"""
-    dialog = SettingsDialog()
-    _select_online_engine(dialog)
-    dialog._api_key_edit.setText("test-key")
-    dialog._connectivity_transport = _mock_transport(status_code=502)
-
-    ok, error = dialog._check_connectivity()
+    ok, error = _run_connectivity_check(qapp, transport=_mock_transport(status_code=502))
 
     assert ok is False
     assert "502" in error
 
 
 def test_settings_dialog_check_connectivity_fails_on_transport_error(qapp):
-    dialog = SettingsDialog()
-    _select_online_engine(dialog)
-    dialog._api_key_edit.setText("test-key")
-    dialog._connectivity_transport = _unreachable_transport()
-
-    ok, error = dialog._check_connectivity()
+    ok, error = _run_connectivity_check(qapp, transport=_unreachable_transport())
 
     assert ok is False
     assert error  # 带上了具体的错误信息，不是空字符串
 
 
-def test_settings_dialog_check_connectivity_fails_when_online_api_key_empty(qapp):
+def test_settings_dialog_check_connectivity_fails_when_online_api_key_empty(qapp, monkeypatch):
+    """API Key/Base URL 是否为空这类轻量校验不需要起后台线程，直接同步拒绝——
+    见 settings_dialog.py 的 _resolve_check_target。"""
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", lambda parent, title, text, *a, **k: warnings.append(text)
+    )
     dialog = SettingsDialog()
     _select_online_engine(dialog)
     dialog._api_key_edit.setText("")
     dialog._connectivity_transport = _mock_transport()
 
-    ok, error = dialog._check_connectivity()
+    target = dialog._resolve_check_target()
 
-    assert ok is False
-    assert "API Key" in error
+    assert target is None
+    assert dialog._check_worker is None  # 校验没过，压根不该起后台线程
+    assert warnings and "API Key" in warnings[0]
 
 
-def test_settings_dialog_check_connectivity_fails_when_local_base_url_empty(qapp):
+def test_settings_dialog_check_connectivity_fails_when_local_base_url_empty(qapp, monkeypatch):
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", lambda parent, title, text, *a, **k: warnings.append(text)
+    )
     dialog = SettingsDialog()
     index = dialog._engine_combo.findData(ENGINE_LOCAL)
     dialog._engine_combo.setCurrentIndex(index)
     dialog._local_base_url_edit.setText("")
     dialog._connectivity_transport = _mock_transport()
 
-    ok, error = dialog._check_connectivity()
+    target = dialog._resolve_check_target()
 
-    assert ok is False
-    assert "Base URL" in error
+    assert target is None
+    assert dialog._check_worker is None
+    assert warnings and "Base URL" in warnings[0]
 
 
 def test_settings_dialog_on_accept_does_not_save_when_connectivity_check_fails(
@@ -489,10 +524,39 @@ def test_settings_dialog_on_accept_does_not_save_when_connectivity_check_fails(
     dialog._concurrency_spin.setValue(baseline + 1)
     dialog._connectivity_transport = _unreachable_transport()
 
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
 
     assert dialog.result() != int(QDialog.DialogCode.Accepted)
     assert SettingsDialog().concurrency == baseline
+
+
+def test_settings_dialog_reject_blocked_while_connectivity_check_in_flight(qapp):
+    """连接测试后台线程还没跑完时，Cancel/关闭不能真的关掉对话框——销毁一个仍在运行
+    的 QThread 会在 C++ 层直接 abort（这个项目已经踩过好几次这类无预兆闪退）。"""
+    dialog = SettingsDialog()
+    _select_online_engine(dialog)
+    dialog._api_key_edit.setText("test-key")
+    dialog._connectivity_transport = _mock_transport()
+
+    dialog._on_accept()
+    assert dialog._busy is True
+
+    _SENTINEL_RESULT = 42  # 跟 Accepted(1)/Rejected(0) 都不同，专门用来验证下面的
+    # reject() 到底有没有真的执行到 super().reject()（会把 result 改写成 Rejected）
+    dialog.done(_SENTINEL_RESULT)
+    assert dialog.result() == _SENTINEL_RESULT
+
+    dialog.reject()  # 检测还在飞，这次应该被挡住，不改变 result()
+    assert dialog.result() == _SENTINEL_RESULT
+
+    worker = dialog._check_worker
+    assert worker is not None
+    assert worker.wait(10_000), "连接测试线程没在超时内跑完"
+    qapp.processEvents()
+
+    assert dialog._busy is False
+    dialog.reject()  # 检测已经跑完，这次应该能正常关闭
+    assert dialog.result() == int(QDialog.DialogCode.Rejected)
 
 
 def test_extract_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):

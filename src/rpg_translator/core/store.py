@@ -51,7 +51,15 @@ class Store:
             )
 
     def close(self) -> None:
+        # update_translation/set_memory 不再各自 commit（见那两个方法的说明），改成
+        # 由调用方在合适的粒度上显式 commit()；这里在关闭连接前兜底提交一次剩余的
+        # 未提交事务——sqlite3 连接 close() 本身不会自动 commit，直接关掉会连同还没
+        # commit 的写入一起丢掉。
+        self._conn.commit()
         self._conn.close()
+
+    def commit(self) -> None:
+        self._conn.commit()
 
     def __enter__(self) -> Store:
         return self
@@ -129,11 +137,14 @@ class Store:
     def update_translation(
         self, unit_id: str, translated_text: str, status: TranslationStatus = "translated"
     ) -> None:
+        # 不在这里 commit：批量翻译时一个去重分组可能对应成百上千个 TextUnit（同一句
+        # 高频重复短句），逐条 commit 会把 SQLite 的 fsync 开销放大到不成比例——调用方
+        # 应该在写完一批相关的行之后自己调 commit()（见 translate/batch_translator.py
+        # 的 _write_result），或者依赖 close()/__exit__ 兜底提交。
         self._conn.execute(
             "UPDATE text_units SET translated_text = ?, status = ? WHERE id = ?",
             (translated_text, status, unit_id),
         )
-        self._conn.commit()
 
     def get_memory(self, source_hash: str) -> str | None:
         row = self._conn.execute(
@@ -143,6 +154,7 @@ class Store:
         return row["translated_text"] if row else None
 
     def set_memory(self, source_hash: str, source_text: str, translated_text: str) -> None:
+        # 同 update_translation：不在这里 commit，交给调用方按合适的粒度批量提交。
         self._conn.execute(
             """
             INSERT INTO translation_memory (source_hash, source_text, translated_text)
@@ -153,7 +165,6 @@ class Store:
             """,
             (source_hash, source_text, translated_text),
         )
-        self._conn.commit()
 
     @staticmethod
     def _row_to_unit(row: sqlite3.Row) -> TextUnit:

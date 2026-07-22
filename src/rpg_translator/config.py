@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 import keyring
+import keyring.errors
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -41,6 +42,10 @@ def set_deepseek_api_key(key: str) -> None:
     keyring.set_password(_KEYRING_SERVICE, _KEYRING_USERNAME, key)
 
 
+def clear_deepseek_api_key() -> None:
+    _clear_keyring_password(_KEYRING_SERVICE, _KEYRING_USERNAME)
+
+
 def get_fallback_api_key() -> str | None:
     """备用 provider 的 Key，同样走 keyring，本地调试兜底读 .env 的 FALLBACK_API_KEY。"""
     key = keyring.get_password(_KEYRING_SERVICE, _KEYRING_FALLBACK_USERNAME)
@@ -51,6 +56,10 @@ def get_fallback_api_key() -> str | None:
 
 def set_fallback_api_key(key: str) -> None:
     keyring.set_password(_KEYRING_SERVICE, _KEYRING_FALLBACK_USERNAME, key)
+
+
+def clear_fallback_api_key() -> None:
+    _clear_keyring_password(_KEYRING_SERVICE, _KEYRING_FALLBACK_USERNAME)
 
 
 def get_local_api_key() -> str | None:
@@ -64,3 +73,14 @@ def get_local_api_key() -> str | None:
 
 def set_local_api_key(key: str) -> None:
     keyring.set_password(_KEYRING_SERVICE, _KEYRING_LOCAL_USERNAME, key)
+
+
+def clear_local_api_key() -> None:
+    _clear_keyring_password(_KEYRING_SERVICE, _KEYRING_LOCAL_USERNAME)
+
+
+def _clear_keyring_password(service: str, username: str) -> None:
+    try:
+        keyring.delete_password(service, username)
+    except keyring.errors.PasswordDeleteError:
+        pass  # 本来就没存过，等价于已经清空

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, NamedTuple
 
 from rpg_translator.codec.control_codes import extract_codes, protect, restore
@@ -195,10 +195,15 @@ def _parse_batch_response(response: str, expected_count: int) -> dict[int, str] 
             index = int(m.group(1))
         except ValueError:
             return None
+        # 严格要求第 i 个匹配到的编号必须正好是 i+1（而不是只要求最终编号集合等于
+        # {1..expected_count}）：按位置校验能防住"译文正文里恰好也有一行长得像
+        # [数字] 开头"这种边界情况——如果只按集合比较，这类巧合有极小概率让某条
+        # 译文被从错误的位置切开，把后半段内容错配给下一条。按位置强制对齐后这种
+        # 巧合会直接触发解析失败走二分重试，不会静默产生错位的译文。
+        if index != i + 1:
+            return None
         result[index] = response[start:end].strip()
 
-    if set(result.keys()) != set(range(1, expected_count + 1)):
-        return None
     return result
 
 
@@ -239,6 +244,43 @@ DEFAULT_PROMPT_STRATEGY = PromptStrategy(
     build_batch_prompt=_build_batch_user_prompt,
     parse_batch_response=_parse_batch_response,
 )
+
+
+# "\n<角色名>正文" 拆分出来的角色名（见 _split_speaker_tag）批量翻译时走这套专门的
+# 批量指令，不复用 _BATCH_INSTRUCTION——真实事故：名字批次是把游戏里出现过的所有
+# 说话人名字（互不相关、没有 context_group）按 batch_size 硬凑成一批，
+# _BATCH_INSTRUCTION 里"如果连续多条编号本身就是同一段场景里的连续台词，请让人名、
+# 称呼、术语在这些条目之间前后保持一致"这句话会让模型误以为这批互不相关的名字是
+# 同一段剧情的连续台词，于是把某条"名字"当正文一样展开翻译/复述（实测出现过把一个
+# 人名翻成一整句话），而且译文通常不够长、不够"像"泄漏的上下文，触发不了
+# _looks_like_leaked_context 的长度阈值，会被当成正常译文直接落盘。这里换一套明确
+# 告诉模型"这些是互不相关的独立名字，不是连续剧情"的批量指令，从根上避免这种误导。
+# 只有多个不同名字凑批（batch_size 触发）时才会用到这份指令——单个名字（绝大多数
+# 情况）走的还是 build_single_prompt，跟名字翻译之前的行为完全一致，不需要改。
+_NAME_BATCH_INSTRUCTION = (
+    "下面是一组彼此独立、互不相关的游戏角色名字或称呼，它们不是同一段场景的连续"
+    "台词，不需要保持剧情/人称连贯。逐条把每个名字翻译或音译成中文，每条译文以 "
+    "[编号] 开头另起一行，编号需与输入一一对应，不合并、不跳号。每条只输出这个"
+    "名字翻译后的结果本身，不要输出解释、标点或任何其它内容。"
+)
+
+
+def _build_name_batch_prompt(items: list[Job]) -> str:
+    parts = [_NAME_BATCH_INSTRUCTION]
+    for i, job in enumerate(items, start=1):
+        parts.append(f"[{i}] {job.protected_text}")
+    return "\n\n".join(parts)
+
+
+# 只替换批量 prompt 的构造函数，single prompt/system_prompt/wrap_control_codes/
+# extra_body 都沿用调用方传入的 prompt_strategy 不变（目前实际只有
+# DEFAULT_PROMPT_STRATEGY 会走到这里——见 translate_units 里
+# `if prompt_strategy.wrap_control_codes` 的判断，SAKURA_PROMPT_STRATEGY 关掉了
+# wrap_control_codes，压根不会触发说话人拆分——但用 replace() 而不是硬编码
+# DEFAULT_PROMPT_STRATEGY，能保证以后任何新的 wrap_control_codes=True 策略走到这条
+# 路径时也能自动拿到这份专门的名字批量 prompt，不用各自记得再接一遍）。
+def _build_name_prompt_strategy(base: PromptStrategy) -> PromptStrategy:
+    return replace(base, build_batch_prompt=_build_name_batch_prompt)
 
 
 def _chunk_jobs_by_group(jobs: list[Job], batch_size: int) -> list[list[Job]]:
@@ -344,7 +386,7 @@ async def translate_units(
             client, store, name_units, concurrency,
             batch_size=batch_size, cancel_check=cancel_check,
             auto_retry_rounds=auto_retry_rounds, retry_wait_seconds=retry_wait_seconds,
-            prompt_strategy=prompt_strategy, on_log=on_log,
+            prompt_strategy=_build_name_prompt_strategy(prompt_strategy), on_log=on_log,
         )
         for name in distinct_names:
             cached = store.get_memory(compute_source_hash(name))
@@ -396,6 +438,14 @@ async def translate_units(
     total = len(jobs) + len(cache_hits)
     completed = 0
     failures: list[tuple[str, str]] = []
+    # 自动重试轮要重新提交的 Job 对象本身——不能只存 job.source_text 再反查，两个不同
+    # 的 Job 可能有相同的 source_text（比如"\n<角色名>正文"拆分出来的正文部分，跟另一条
+    # 独立台词/另一个角色名下的同一句正文，共享同一个 source_text 但 group/result_prefix
+    # 不同），按 source_text 建的反查表会把其中一个覆盖掉，导致那一条永远不会被重试、
+    # 也不会出现在最终返回的 failures 里，注入阶段又会拿它的 source_text（原文）兜底，
+    # 表现为这一条译文悄悄留在了日文原文，却完全没有任何失败提示。直接保留 Job 对象
+    # 本身，不经过 source_text 这一层，从根上避免这种碰撞。
+    failed_jobs: list[Job] = []
 
     def _write_result(
         group: list[TextUnit], translated_text: str, count_progress: bool = True
@@ -403,6 +453,12 @@ async def translate_units(
         nonlocal completed
         for unit in group:
             store.update_translation(unit.id, translated_text, status="translated")
+        # 每个 job 落盘一次 commit，而不是 group 里每个 TextUnit 各自 commit 一次——
+        # 同一个 job 的去重分组可能有成百上千个 TextUnit 共享同一句译文（游戏里常见
+        # 的高频重复短句），之前每个 TextUnit 各自触发一次 SQLite commit，大工程翻译
+        # 完之后这个 fsync 开销会被放大到几十万次。仍然是"翻完一个 job 就落盘一次"，
+        # 断点续传的粒度没变，只是不再按 TextUnit 数量线性放大提交次数。
+        store.commit()
         if count_progress:
             completed += 1
             if on_progress is not None:
@@ -411,6 +467,7 @@ async def translate_units(
     def _record_failure(job: Job, error: BaseException, count_progress: bool = True) -> None:
         nonlocal completed
         failures.append((job.source_text, str(error)))
+        failed_jobs.append(job)
         if on_log is not None:
             preview = job.source_text if len(job.source_text) <= 20 else job.source_text[:20] + "…"
             on_log(f"翻译失败，已跳过：{preview!r} - {error}")
@@ -533,7 +590,6 @@ async def translate_units(
     batches = _chunk_jobs_by_group(jobs, batch_size)
     await asyncio.gather(*(_translate_batch(batch) for batch in batches))
 
-    jobs_by_source = {job.source_text: job for job in jobs}
     for round_idx in range(auto_retry_rounds):
         if not failures or _cancelled():
             break
@@ -542,8 +598,9 @@ async def translate_units(
         await _interruptible_sleep(retry_wait_seconds, _cancelled)
         if _cancelled():
             break
-        retry_jobs = [jobs_by_source[source_text] for source_text, _error in failures]
+        retry_jobs = list(failed_jobs)
         failures.clear()
+        failed_jobs.clear()
         retry_batches = _chunk_jobs_by_group(retry_jobs, batch_size)
         await asyncio.gather(
             *(_translate_batch(batch, count_progress=False) for batch in retry_batches)
