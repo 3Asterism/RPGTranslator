@@ -164,75 +164,30 @@ async def test_chat_raises_last_error_when_all_providers_exhausted():
 
 
 @pytest.mark.anyio
-async def test_chat_retries_then_fails_over_on_empty_choices():
-    """响应是 2xx 但 choices 为空（比如网关内容审核拒绝却没有回退成 4xx）——之前
-    这里直接访问 data["choices"][0] 会抛 KeyError/IndexError，这两个都不是
-    httpx.HTTPStatusError/TransportError 的子类，会直接逃出 chat()、跳过还没试过
-    的 provider B。修复后应该走跟 5xx 一样的重试/换 provider 路径，最终从
-    provider B 拿到结果。"""
+@pytest.mark.parametrize(
+    "bad_response",
+    [
+        pytest.param(httpx.Response(200, json={"choices": []}), id="empty_choices"),
+        pytest.param(
+            httpx.Response(200, json={"choices": [{"message": {"content": None}}]}),
+            id="null_content",
+        ),
+        pytest.param(httpx.Response(200, content=b"not json at all"), id="invalid_json_body"),
+    ],
+)
+async def test_chat_retries_then_fails_over_on_malformed_2xx_response(bad_response):
+    """响应状态码是 2xx 但内容对不上预期形状——choices 为空（网关内容审核拒绝却
+    没有回退成 4xx）、content 为 None（混合思考模型只填了 reasoning_content）、
+    body 干脆不是合法 JSON（网关截断响应/返回错误页面却还是 200）。这三种情况
+    httpx 都不会抛异常（状态码本身是 2xx），之前要么直接访问 data["choices"][0]
+    抛 KeyError/IndexError、要么 response.json() 抛 json.JSONDecodeError——这些
+    都不是 httpx.HTTPStatusError/TransportError 的子类，会直接逃出 chat()、跳过
+    还没试过的 provider B（对 null_content 更糟：不抛异常，把 None 当成合法译文
+    静默返回，污染下游翻译结果）。修复后三种都应该走跟 5xx 一样的重试/换 provider
+    路径，最终从 provider B 拿到结果。"""
 
     async def handler_a(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"choices": []})
-
-    async def handler_b(request: httpx.Request) -> httpx.Response:
-        return _success_response("provider B 成功")
-
-    configs = [
-        LLMConfig(api_key="a", base_url="https://a.test", model="m"),
-        LLMConfig(api_key="b", base_url="https://b.test", model="m"),
-    ]
-    client = LLMClient(
-        configs,
-        max_retries_per_provider=1,
-        backoff_base_seconds=0.01,
-        transports=[httpx.MockTransport(handler_a), httpx.MockTransport(handler_b)],
-    )
-    try:
-        result = await client.chat("sys", "user")
-    finally:
-        await client.aclose()
-
-    assert result == "provider B 成功"
-
-
-@pytest.mark.anyio
-async def test_chat_retries_then_fails_over_on_null_content():
-    """content 为 None（混合思考模型只填了 reasoning_content 没填 content）——之前
-    会把 None 当成合法译文原样返回，静默污染下游翻译结果。修复后应该按无效响应
-    处理，走重试/换 provider。"""
-
-    async def handler_a(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"choices": [{"message": {"content": None}}]})
-
-    async def handler_b(request: httpx.Request) -> httpx.Response:
-        return _success_response("provider B 成功")
-
-    configs = [
-        LLMConfig(api_key="a", base_url="https://a.test", model="m"),
-        LLMConfig(api_key="b", base_url="https://b.test", model="m"),
-    ]
-    client = LLMClient(
-        configs,
-        max_retries_per_provider=1,
-        backoff_base_seconds=0.01,
-        transports=[httpx.MockTransport(handler_a), httpx.MockTransport(handler_b)],
-    )
-    try:
-        result = await client.chat("sys", "user")
-    finally:
-        await client.aclose()
-
-    assert result == "provider B 成功"
-
-
-@pytest.mark.anyio
-async def test_chat_retries_then_fails_over_on_invalid_json_body():
-    """2xx 但 body 不是合法 JSON（网关截断响应/返回错误页面却还是 200）——
-    response.json() 抛的 json.JSONDecodeError 不是 httpx.HTTPStatusError/
-    TransportError 的子类，之前会直接逃出 chat()。修复后应该走重试/换 provider。"""
-
-    async def handler_a(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"not json at all")
+        return bad_response
 
     async def handler_b(request: httpx.Request) -> httpx.Response:
         return _success_response("provider B 成功")
