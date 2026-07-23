@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QDialog, QMessageBox
 
 from rpg_translator.config import Settings, get_deepseek_api_key
@@ -16,12 +17,15 @@ from rpg_translator.gui.main_window import (
     resolve_dropped_path,
 )
 from rpg_translator.gui.settings_dialog import (
+    APP_NAME,
     ENGINE_LOCAL,
     ENGINE_ONLINE,
+    ORG_NAME,
     SettingsDialog,
     _ConnectivityCheckWorker,
 )
-from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker
+from rpg_translator.gui.workers import ExtractWorker, InjectWorker, LocalEngineStartWorker, TranslateWorker
+from rpg_translator.translate.local_engine import BundledEngine, LocalEngineProcess
 
 
 def _mock_transport(status_code: int = 200) -> httpx.MockTransport:
@@ -253,6 +257,116 @@ def test_stop_button_hidden_until_translation_starts_and_calls_worker_stop(qapp)
 
     assert stopped == [True]
     assert window._stop_button.isEnabled() is False
+
+
+def _set_local_engine_with_empty_config() -> None:
+    """走 QSettings 直接写——SettingsDialog 的保存路径会拒绝空 Base URL（见
+    _resolve_check_target），没法通过 UI 存出"engine=local 但字段全空"这个状态，
+    只能直接写 QSettings 模拟"用户选了本地模型但还没配置"这个真实会出现的组合。"""
+    qsettings = QSettings(ORG_NAME, APP_NAME)
+    qsettings.setValue("engine", ENGINE_LOCAL)
+    qsettings.setValue("local_base_url", "")
+    qsettings.setValue("local_model", "")
+
+
+def _reset_engine_to_online() -> None:
+    QSettings(ORG_NAME, APP_NAME).setValue("engine", ENGINE_ONLINE)
+
+
+def _track_warnings(monkeypatch) -> list[str]:
+    """记录 QMessageBox.warning 弹出的正文，不真的弹窗阻塞测试。"""
+    messages: list[str] = []
+
+    def fake_warning(parent, title, text, *args, **kwargs):
+        messages.append(text)
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "warning", fake_warning)
+    return messages
+
+
+def test_on_start_clicked_local_engine_without_config_and_no_bundle_warns(
+    qapp, mz_project: Path, monkeypatch
+):
+    """精简版（没有内置引擎文件）下，本地引擎没配置就点开始翻译，行为跟改动前
+    一样——弹出提示，不往下走。"""
+    _set_local_engine_with_empty_config()
+    monkeypatch.setattr("rpg_translator.gui.main_window.find_bundled_engine", lambda: None)
+    _track_warnings(monkeypatch)
+
+    window = MainWindow()
+    _drop_and_wait(window, mz_project, qapp)
+
+    window._on_start_clicked()
+
+    assert window._extract_worker is None
+    assert window._local_engine_start_worker is None
+    _reset_engine_to_online()
+
+
+def test_on_start_clicked_starts_bundled_engine_then_begins_extraction(
+    qapp, tmp_path: Path, mz_project: Path, monkeypatch
+):
+    """完全版（有内置引擎文件）下，本地引擎没手填配置不该再弹错——点开始翻译
+    应该先拉起内置子进程，就绪后自动继续走提取流程。"""
+    _set_local_engine_with_empty_config()
+    bundled = BundledEngine(exe_path=tmp_path / "llama-server.exe", model_path=tmp_path / "model.gguf")
+    monkeypatch.setattr("rpg_translator.gui.main_window.find_bundled_engine", lambda: bundled)
+    monkeypatch.setattr(LocalEngineProcess, "start", lambda self: "http://127.0.0.1:9999/v1")
+    monkeypatch.setattr(LocalEngineProcess, "wait_until_ready", lambda self, timeout: True)
+
+    window = MainWindow()
+    _drop_and_wait(window, mz_project, qapp)
+
+    window._on_start_clicked()
+
+    worker = window._local_engine_start_worker
+    assert worker is not None, "没有起 LocalEngineStartWorker"
+    assert worker.wait(5_000), "LocalEngineStartWorker 没在超时内跑完"
+    qapp.processEvents()
+
+    assert window._bundled_local_base_url == "http://127.0.0.1:9999/v1"
+    assert window._extract_worker is not None, "内置引擎就绪后应该自动继续走提取流程"
+    _reset_engine_to_online()
+
+
+def test_on_start_clicked_bundled_engine_start_failure_warns_and_reenables_button(
+    qapp, tmp_path: Path, mz_project: Path, monkeypatch
+):
+    _set_local_engine_with_empty_config()
+    bundled = BundledEngine(exe_path=tmp_path / "llama-server.exe", model_path=tmp_path / "model.gguf")
+    monkeypatch.setattr("rpg_translator.gui.main_window.find_bundled_engine", lambda: bundled)
+    monkeypatch.setattr(LocalEngineProcess, "start", lambda self: "http://127.0.0.1:9999/v1")
+    monkeypatch.setattr(LocalEngineProcess, "wait_until_ready", lambda self, timeout: False)
+    monkeypatch.setattr(LocalEngineProcess, "stop", lambda self: None)
+    warnings = _track_warnings(monkeypatch)
+
+    window = MainWindow()
+    _drop_and_wait(window, mz_project, qapp)
+
+    window._on_start_clicked()
+
+    worker = window._local_engine_start_worker
+    assert worker is not None
+    assert worker.wait(5_000)
+    qapp.processEvents()
+
+    assert window._extract_worker is None, "启动失败不该继续走提取流程"
+    assert window._start_button.isEnabled() is True
+    assert warnings, "启动失败应该弹出提示"
+    _reset_engine_to_online()
+
+
+def test_close_event_stops_bundled_local_engine_process(qapp, mz_project: Path):
+    window = MainWindow()
+    _drop_and_wait(window, mz_project, qapp)
+
+    stopped = []
+    window._local_engine_process = type("_FakeProc", (), {"stop": lambda self: stopped.append(True)})()
+
+    window.close()
+
+    assert stopped == [True]
 
 
 def test_export_translation_package_prompts_for_name_and_writes_file(

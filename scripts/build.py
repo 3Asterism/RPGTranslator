@@ -21,6 +21,7 @@ def main() -> int:
         "--onedir",
         "--noconsole",
         "--noconfirm",
+        "--noupx",  # UPX 压缩壳是杀毒软件对 PyInstaller exe 误报的常见诱因之一，关掉降低概率
         "--name",
         "RPGTranslator",
         "--paths",

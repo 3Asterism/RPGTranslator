@@ -143,6 +143,19 @@ API 费用的场景。走的是专门适配过 [SakuraLLM/GalTransl](https://git
 已知局限：本地小模型批量打包翻译时偶尔会输出行数对不上（自动退化成逐条重试，不会丢译文，
 只是变慢）；人名等专有名词的音译一致性不如在线大模型稳定（没有项目级术语表约束）。
 
+### 完全版：内置本地模型，免部署
+
+不想自己装 Ollama、下模型的话，[Releases](../../releases) 里的"完全版"（`RPGTranslator-full-*`，
+分卷压缩包，需要 NVIDIA 显卡）已经内置了 CUDA 版 llama.cpp 引擎和
+[SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF](https://huggingface.co/SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF)
+（q6k 量化）模型文件。设置面板切到「本地模型」、Base URL/模型名留空，点「开始翻译」会自动
+拉起内置引擎（首次加载模型进显存要等几十秒），不用手动配置。仍然可以手填 Base URL 指向别处
+部署的服务，填了就优先用手填的地址，不会被内置引擎抢占。
+
+内置的模型文件遵循 [CC-BY-NC-SA-4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 协议
+（署名-非商业性使用-相同方式共享），由 [SakuraLLM](https://github.com/SakuraLLM) 训练发布，
+本项目本身免费非商用分发。
+
 ## CLI（开发调试用，不是给最终用户的主入口）
 
 ```bash
@@ -169,6 +182,25 @@ rpg-translator run       <项目目录> --out <输出目录>
 
 产出 `dist/RPGTranslator/`（PyInstaller `--onedir` 模式）。目前只在开发机上验证过启动，
 还没在没装 Python 的干净 Windows 环境里实测过，分发前建议自行确认一遍。
+
+### 完全版（内置 CUDA 引擎 + 模型）
+
+```bash
+.venv\Scripts\python scripts\build_full.py
+```
+
+在上面精简版的基础上，额外下载 llama.cpp 官方预编译 CUDA 二进制和 Sakura GGUF 模型文件
+（合计 10GB+，第一次跑视网络情况要一段时间），组装进 `dist/RPGTranslator/resources/local_engine/`，
+再 7z 分卷打包成 `dist/RPGTranslator-full-v<version>.7z.001`、`.002`……（单卷不超过 1900MB，
+过 GitHub Release 单文件 2GB 的上限）。不在 CI/自动化测试里跑，是发布前手动跑一次的操作；
+`scripts/build_full.py` 顶部的版本号/校验值常量需要人工确认过新 build 能正常跑起来才能更新。
+
+下载支持断点续传 + 失败重试 + 本地缓存命中跳过，`--work-dir`（默认
+`dist/_build_full_cache`）下已经下过的文件重跑脚本不会重新拉一遍，除非加
+`--force-redownload`。大陆网络访问 GitHub Release/HuggingFace 经常不稳，可以配合：
+`HTTPS_PROXY`/`HTTP_PROXY`（httpx 默认读，配了系统代理不用改代码）、
+`LLAMA_CPP_RELEASE_BASE_URL`（替换成自建反代/镜像前缀）、
+`HF_ENDPOINT`（替换 HuggingFace 域名，比如 `https://hf-mirror.com`）。
 
 ## 已知局限
 
@@ -197,7 +229,8 @@ rpg-translator run       <项目目录> --out <输出目录>
   Map/CommonEvent/Database 三种文件（含当前编辑器版本默认的 LZ4 压缩格式、v3.5 版本的
   Page/Command 结构变化），仍明确不支持 WolfPro 加密保护和经典 XOR 加密的工程，遇到会直接
   报错而不是猜测/静默产出乱码
-- PyInstaller 打包出的 exe 可能被杀毒软件误报，是已知的普遍现象
+- PyInstaller 打包出的 exe 可能被杀毒软件误报，是已知的普遍现象；`scripts/build.py` 已加
+  `--noupx`（UPX 压缩壳是常见诱因之一）降低概率，但没有代码签名证书，不可能彻底消除
 - 单文件 exe 自动解包目前只认 Enigma Virtual Box 这一种打包方式（`evbunpack`），像
   VMProtect/Themida 这类加壳保护、或者把资源塞进 NSIS 安装包里的分发方式不在覆盖范围内，
   遇到这些会照常回退到"未识别到支持的引擎"
