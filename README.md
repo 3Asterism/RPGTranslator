@@ -6,8 +6,9 @@
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
 
 **RPG Maker / WOLF RPG エディター 游戏文本提取 → DeepSeek 翻译 → 回填工具。**
-把游戏文件夹拖进窗口，一键提取文本、调用 DeepSeek API 翻译、回填出一份可直接运行的
-汉化版拷贝——**不改动原工程**，随时能切回原文对照。
+把游戏文件夹拖进窗口，一键提取文本、调用 DeepSeek API 翻译、原地写回游戏工程本身——
+注入前自动备份原文版本，随时能用「切换为原文 / 切换为译文」中日对照，不用另外拷贝一份
+汉化目录。
 
 体验类似 MTool，但翻译记忆更细：相同原文默认复用同一个译名，QA 阶段会单独把"同一句话
 在不同语境下可能需要不同译法"的情况挑出来，而不是无脑全局替换。
@@ -78,7 +79,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 
 **流程**：拖入游戏文件夹（或 `Game.exe`）→ 自动识别引擎 → 点「开始翻译」→ 翻译跑在后台，
 随时可以点「停止」；有条目翻译失败会自动重试几轮，还失败的可以点「重试失败项」再跑一次 →
-点「注入到游戏」写回一份新的汉化拷贝，原工程不受影响 → 用「切换为
+点「注入到游戏」原地写回游戏工程（注入前自动备份原文版本）→ 用「切换为
 原文 / 切换为译文」中日对照，或者「导出翻译包」分享给同游戏的其他人。API Key 等设置在窗口
 右上角的「⚙ 设置」按钮里。
 
@@ -201,11 +202,10 @@ rpg-translator run       <项目目录> --out <输出目录>
   VMProtect/Themida 这类加壳保护、或者把资源塞进 NSIS 安装包里的分发方式不在覆盖范围内，
   遇到这些会照常回退到"未识别到支持的引擎"
 
-完整技术规格、每个里程碑的验收标准、逆向工程来源（WOLF 部分参考了
-[wolftrans](https://github.com/elizagamedev/wolftrans)、
+WOLF 格式的逆向工程来源：[wolftrans](https://github.com/elizagamedev/wolftrans)、
 [WolfTL](https://github.com/Sinflower/WolfTL)、
-[rewolf-trans](https://github.com/KCFindstr/rewolf-trans) 三个社区项目的格式研究成果）都记录在
-[`galgame_rpgmaker_translator_spec (1).md`](<galgame_rpgmaker_translator_spec (1).md>)。
+[rewolf-trans](https://github.com/KCFindstr/rewolf-trans) 三个社区项目的格式研究成果，
+交叉验证后移植（详见 `engines/wolf_binary.py` 顶部注释）。
 
 ## 技术栈
 
