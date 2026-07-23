@@ -20,6 +20,8 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pyinstaller>=6.0",
+    "py7zr>=0.21",       # scripts/build_full.py：完全版 7z 分卷打包
+    "multivolumefile>=0.2.3",  # 同上，py7zr 的分卷 API 依赖这个包直接调用
 ]
 
 [project.scripts]

@@ -47,11 +47,18 @@ from rpg_translator.gui.workers import (
     ExtractWorker,
     ImportPackageWorker,
     InjectWorker,
+    LocalEngineStartWorker,
     SwitchLanguageWorker,
     TranslateWorker,
     UnpackWorker,
 )
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY
+from rpg_translator.translate.local_engine import (
+    LOCAL_ENGINE_MODEL_ALIAS,
+    BundledEngine,
+    LocalEngineProcess,
+    find_bundled_engine,
+)
 from rpg_translator.translate.pricing import estimate_cost_cny
 from rpg_translator.translate.sakura_prompt import SAKURA_PROMPT_STRATEGY
 
@@ -309,6 +316,13 @@ class MainWindow(QMainWindow):
         self._switch_language_worker: SwitchLanguageWorker | None = None
         self._import_package_worker: ImportPackageWorker | None = None
         self._cleanup_db_worker: CleanupDbWorker | None = None
+        self._local_engine_start_worker: LocalEngineStartWorker | None = None
+        # 完全版内置引擎的子进程句柄（精简版下永远是 None）；点「开始翻译」时
+        # 按需创建，一旦起来了后续「重试失败项」复用，不重复加载模型。
+        self._local_engine_process: LocalEngineProcess | None = None
+        # 本次启动内置引擎实际拿到的 base_url（每次启动端口都不同，不写进
+        # QSettings，只在这次运行的进程内存里存着）。
+        self._bundled_local_base_url: str | None = None
         self._pending_adapter: EngineAdapter | None = None
         self._pending_switch_variant: str | None = None
         self._WORKER_STOP_TIMEOUT_MS = 5000
@@ -541,6 +555,7 @@ class MainWindow(QMainWindow):
             self._switch_language_worker,
             self._import_package_worker,
             self._cleanup_db_worker,
+            self._local_engine_start_worker,
         )
 
     def _any_worker_running(self) -> bool:
@@ -720,10 +735,17 @@ class MainWindow(QMainWindow):
         if qsettings.value("engine", "online") == ENGINE_LOCAL:
             _, local_base_url, local_model = resolve_local_config(qsettings)
             if not local_base_url or not local_model:
-                QMessageBox.warning(
-                    self, "未配置本地模型",
-                    "请先在设置里配置本地模型的 Base URL 和模型名。",
-                )
+                # 用户没手填本地服务地址——完全版内置了引擎+模型文件的话，不用
+                # 报错拦住，点开始翻译这一刻才真正拉起子进程（见
+                # docs/superpowers/specs/2026-07-23-bundled-local-model-design.md）。
+                bundled = find_bundled_engine()
+                if bundled is None:
+                    QMessageBox.warning(
+                        self, "未配置本地模型",
+                        "请先在设置里配置本地模型的 Base URL 和模型名。",
+                    )
+                    return
+                self._start_bundled_local_engine(bundled)
                 return
         else:
             api_key = get_deepseek_api_key()
@@ -731,6 +753,37 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "未配置 API Key", "请先在设置里配置 DeepSeek API Key。")
                 return
 
+        self._begin_extract_and_translate()
+
+    def _start_bundled_local_engine(self, bundled: BundledEngine) -> None:
+        """已经起过、还活着就直接复用（模型加载进显存有实打实的耗时，没必要
+        每次点开始翻译都重来）；没起过或者上次的子进程已经退出，起一个新的。"""
+        if self._local_engine_process is not None and self._local_engine_process.is_running():
+            self._bundled_local_base_url = self._local_engine_process.base_url
+            self._begin_extract_and_translate()
+            return
+
+        if self._local_engine_start_worker is not None and self._local_engine_start_worker.isRunning():
+            return  # 已经在起了，重复点击不重复触发
+
+        self._local_engine_process = LocalEngineProcess(bundled)
+        self._start_button.setEnabled(False)
+        self._log_message("正在启动内置本地模型（首次加载模型进显存可能要几十秒）…")
+        self._local_engine_start_worker = LocalEngineStartWorker(self._local_engine_process)
+        self._local_engine_start_worker.finished_ok.connect(self._on_local_engine_started)
+        self._local_engine_start_worker.failed.connect(self._on_local_engine_start_failed)
+        self._local_engine_start_worker.start()
+
+    def _on_local_engine_started(self, base_url: str) -> None:
+        self._bundled_local_base_url = base_url
+        self._log_message("内置本地模型已就绪。")
+        self._begin_extract_and_translate()
+
+    def _on_local_engine_start_failed(self, error: str) -> None:
+        self._start_button.setEnabled(True)
+        QMessageBox.warning(self, "内置本地模型启动失败", error)
+
+    def _begin_extract_and_translate(self) -> None:
         if not self._ensure_worker_stopped(self._extract_worker) or not self._ensure_worker_stopped(
             self._translate_worker
         ):
@@ -782,6 +835,9 @@ class MainWindow(QMainWindow):
             # 那套自由格式；也不启用备用 provider——故障转移是为云端服务瞬时报错设计
             # 的，本地服务连不上通常是配置错了，切去 DeepSeek 反而会误导排查方向。
             api_key, base_url, model = resolve_local_config(qsettings)
+            if (not base_url or not model) and self._bundled_local_base_url:
+                base_url = self._bundled_local_base_url
+                model = LOCAL_ENGINE_MODEL_ALIAS
             fallback_api_key = fallback_base_url = fallback_model = None
             prompt_strategy = SAKURA_PROMPT_STRATEGY
             # 本地量化小模型处理一批几十条的请求天然比云端 API 慢（实测局域网测试机
@@ -939,6 +995,7 @@ class MainWindow(QMainWindow):
         「再等等」的机会，而不是硬关闭把还活着的线程带走。"""
         running = [worker for worker in self._all_workers() if worker is not None and worker.isRunning()]
         if not running:
+            self._stop_local_engine()
             event.accept()
             return
 
@@ -957,7 +1014,14 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
+        self._stop_local_engine()
         event.accept()
+
+    def _stop_local_engine(self) -> None:
+        """完全版内置引擎的子进程不是 QThread，不受上面那套 worker 收尾逻辑
+        管——关窗口前顺手杀掉，避免 llama-server.exe 变成孤儿进程占着显存。"""
+        if self._local_engine_process is not None:
+            self._local_engine_process.stop()
 
     def _on_stop_clicked(self) -> None:
         if self._translate_worker is None:

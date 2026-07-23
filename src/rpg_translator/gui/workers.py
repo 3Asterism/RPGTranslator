@@ -20,6 +20,7 @@ from rpg_translator.core.pipeline import (
 )
 from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY, PromptStrategy
+from rpg_translator.translate.local_engine import LocalEngineProcess
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +280,38 @@ class TranslateWorker(QThread):
             return
         self._flush_log_buffer()
         self.finished_ok.emit(len(translated), failures)
+
+
+class LocalEngineStartWorker(QThread):
+    """拉起内置 llama-server.exe 子进程并等它就绪。模型加载进显存有实打实的
+    耗时（6.25GB 的 q6k 量化，实测几秒到几十秒不等，取决于显卡/磁盘速度），
+    跟其它 Worker 一样不能占 GUI 线程。"""
+
+    finished_ok = Signal(str)  # base_url
+    failed = Signal(str)
+
+    _READY_TIMEOUT_SECONDS = 90.0
+
+    def __init__(self, engine_process: LocalEngineProcess, parent=None):
+        super().__init__(parent)
+        self._engine_process = engine_process
+
+    def run(self) -> None:
+        try:
+            base_url = self._engine_process.start()
+        except Exception as e:
+            logger.exception("内置本地模型子进程启动失败")
+            self.failed.emit(str(e))
+            return
+
+        if not self._engine_process.wait_until_ready(self._READY_TIMEOUT_SECONDS):
+            log_path = self._engine_process.log_path
+            self._engine_process.stop()
+            detail = f"，日志见 {log_path}" if log_path is not None else ""
+            self.failed.emit(f"内置本地模型没能在 {self._READY_TIMEOUT_SECONDS:.0f} 秒内就绪{detail}")
+            return
+
+        self.finished_ok.emit(base_url)
 
 
 class InjectWorker(QThread):
