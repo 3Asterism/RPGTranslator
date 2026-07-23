@@ -192,6 +192,54 @@ def test_wolf_binary_database_utf8_roundtrip(tmp_path: Path):
     assert reloaded.types[0].data[0].string_values[0] == "Hello, world -- ユニコード"
 
 
+def test_wolf_database_write_upgrades_cp932_to_utf8_when_text_cannot_encode(tmp_path: Path):
+    """经典（cp932）WOLF 工程写回简体中文译文时，cp932 编不出大多数汉字——之前
+    这里直接 UnicodeEncodeError 崩溃（真机几乎必然触发，因为任何真实中文句子都
+    可能撞上 cp932 编不出来的字）。修复后应该自动把这份文件升级成 UTF-8（标记位
+    翻转成 0x55）重新写一遍，而不是崩溃或者产出损坏的文件。"""
+    field_name = wb.Field(name="Name", type=0, index_info=wb._FIELD_STRING_START + 0)
+    # "这" (U+8FD9) 不在 cp932 里，编码时必然抛 UnicodeEncodeError。
+    record = wb.DataRecord(name="0", int_values=[], string_values=["这是中文"])
+    db_type = wb.DbType(
+        name="Items", fields=[field_name], data=[record], description="", field_type_list_size=1
+    )
+    db = wb.WolfDatabase(types=[db_type], is_utf8=False)
+
+    project_path = tmp_path / "Items.project"
+    dat_path = tmp_path / "Items.dat"
+    db.write(project_path, dat_path)
+
+    assert db.is_utf8 is True, "编不进 cp932 时应该自动升级成 UTF-8，而不是保持 False 再崩溃"
+    raw = dat_path.read_bytes()
+    assert raw[1 + wb._DAT_UTF8_INDEX] == 0x55
+
+    reloaded = wb.WolfDatabase.read(project_path, dat_path)
+    assert reloaded.is_utf8 is True
+    assert reloaded.types[0].data[0].string_values[0] == "这是中文"
+
+
+def test_wolf_map_write_upgrades_cp932_to_utf8_when_text_cannot_encode(tmp_path: Path):
+    game_map = wb.WolfMap(
+        tileset_id=0,
+        width=1,
+        height=1,
+        tiles=b"\x00" * (1 * 1 * wb._MAP_DEFAULT_LAYER_COUNT * 4),
+        events=[],
+        header_stamp="这是中文",
+        is_utf8=False,
+    )
+    map_path = tmp_path / "Map001.mps"
+    game_map.write(map_path)
+
+    assert game_map.is_utf8 is True
+    raw = map_path.read_bytes()
+    assert raw[wb._MAP_UTF8_INDEX] == 0x55
+
+    reloaded = wb.WolfMap.read(map_path)
+    assert reloaded.is_utf8 is True
+    assert reloaded.header_stamp == "这是中文"
+
+
 def test_wolf_binary_common_event_without_optional_tail_roundtrips(tmp_path: Path):
     """CommonEvent's unknown10/unknown12 are only present when the trailing
     indicator byte is 0x92 instead of 0x91 -- exercise the simpler (no

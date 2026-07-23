@@ -646,7 +646,13 @@ async def translate_units(
         await _interruptible_sleep(retry_wait_seconds, _cancelled)
         if _cancelled():
             break
-        retry_jobs = list(failed_jobs)
+        # failed_jobs 是并发批次各自失败时异步追加的，到达顺序取决于哪个请求先返回，
+        # 同一个 context_group 的 job 在这个列表里大概率是不相邻的（穿插着其它分组的
+        # 失败项）。_chunk_jobs_by_group 只按"相邻元素的 context_group 是否相同"切批，
+        # 直接拿这份乱序列表去切会把本该合并的同分组 job 拆成一堆单条批次，白白丢失
+        # 分组打包的意义。这里按 context_group 做一次稳定排序（stable sort 保证同分组
+        # 内部仍保持原有相对顺序），恢复"同分组尽量分进同一批"的设计初衷。
+        retry_jobs = sorted(failed_jobs, key=lambda job: job.context_group)
         failures.clear()
         failed_jobs.clear()
         retry_batches = _chunk_jobs_by_group(retry_jobs, batch_size)

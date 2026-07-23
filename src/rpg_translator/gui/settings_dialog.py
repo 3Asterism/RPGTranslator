@@ -90,6 +90,16 @@ class _ConnectivityCheckWorker(QThread):
         except httpx.HTTPError as e:
             self.finished_check.emit(False, f"连不上 {self._base_url}：{e}")
             return
+        except Exception as e:  # noqa: BLE001 - 必须兜底，否则线程静默死掉、_busy 永远 True
+            # 只 catch httpx.HTTPError catch 不住这类：比如 API Key/Base URL 里混进了
+            # 全角字符（中文输入法误触很常见），拼 Authorization header 时 httpx 在
+            # 请求还没真正发出前就因为头部非 ASCII 抛 UnicodeEncodeError，不是
+            # httpx.HTTPError 的子类。不兜底的话这个 QThread 直接跑死，finished_check
+            # 永远不发，_on_accept 里设的 self._busy 永远是 True——对话框的 OK 按钮
+            # 保持禁用、reject()（取消/Esc/关闭）也被 _busy 挡住，整个应用的忙碌光标
+            # 也恢复不了，用户只能强杀进程。
+            self.finished_check.emit(False, f"连接测试出错：{e}")
+            return
 
         # >=500 不当作"连通"：本机走系统代理（比如 Clash）时，代理本身能正常应答，
         # 但代理连不上局域网里的目标地址（比如 Ollama 用了错的端口/IP）会回一个
