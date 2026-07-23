@@ -239,6 +239,33 @@ def test_vxace_after_inject_appends_runtime_patch_when_translated(tmp_path: Path
     ]
 
 
+def test_vxace_after_inject_does_not_duplicate_patch_on_repeated_inject(
+    tmp_path: Path, vxace_project: Path
+):
+    """inject 会在同一个工程上重复跑（先翻一部分注入一次，续译剩余部分再注入一次
+    很常见）——之前每次都无条件 append 一份运行时换行补丁脚本，第二次注入会往
+    Scripts.rvdata2 里再追加一份同名脚本，而这份脚本是靠 alias 原 process_character
+    实现的，重复注入会形成 alias 链式嵌套（第二次 alias 的是第一次已经打过补丁的
+    版本），表现为消息框换行/等待随注入次数越叠越多。已经注入过就不该再来一次。"""
+    _write_fake_scripts_file(
+        vxace_project / "Data" / "Scripts.rvdata2",
+        [(1, "Vocab", "module Vocab\nend\n")],
+    )
+
+    adapter = VXAceAdapter()
+    units = adapter.extract(vxace_project)
+    units[0].translated_text = "已翻译"
+
+    output_dir = tmp_path / "output"
+    adapter.inject(vxace_project, units, output_dir)
+    # 第二次注入模拟"续译后再写回一次"：直接对同一个 output_dir 再 inject 一遍。
+    adapter.inject(output_dir, units, output_dir)
+
+    entries = read_scripts(output_dir / "Data" / "Scripts.rvdata2")
+    patch_entries = [e for e in entries if e.name == RUNTIME_LINE_WRAP_SCRIPT_NAME]
+    assert len(patch_entries) == 1, "重复 inject 不应该重复追加运行时换行补丁脚本"
+
+
 def test_vxace_after_inject_skips_patch_when_nothing_translated(tmp_path: Path, vxace_project: Path):
     """纯预览/未翻译的 inject 不该碰 Scripts.rvdata2——保持 M1/M4 的
     "未翻译回填逐字节不变" 回归校验成立。"""

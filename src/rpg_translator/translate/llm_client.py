@@ -42,6 +42,28 @@ def _normalize_base_url(base_url: str) -> str:
     return base_url.rstrip("/") + "/"
 
 
+class _InvalidResponseError(RuntimeError):
+    """2xx 响应但内容对不上预期形状：非法 JSON（网关返回 200 但 body 被截断/是错误
+    页面）、choices 为空（内容审核拒绝但没有回退成 4xx）、或 content 不是字符串
+    （混合思考模型只填了 reasoning_content、或者返回的是工具调用而不是文本）。这些
+    情况 httpx 不会抛异常（状态码本身是 2xx），如果不主动识别出来，要么会在
+    data["choices"][0] 这类访问上直接抛 KeyError/IndexError 逃出 chat()、跳过剩余
+    fallback provider，要么会把 None 当成合法译文静默返回。这里统一包装成一个能
+    被 chat() 按跟 httpx.TransportError 同样方式重试/换 provider 的异常类型。"""
+
+
+def _extract_message_content(data: dict) -> str:
+    choices = data.get("choices")
+    if not choices:
+        raise _InvalidResponseError("响应里 choices 为空（可能是内容审核拒绝或网关返回了错误格式）")
+    content = (choices[0].get("message") or {}).get("content")
+    if not isinstance(content, str):
+        raise _InvalidResponseError(
+            f"响应缺少合法的 choices[0].message.content（可能是纯思考/工具调用响应）：{content!r}"
+        )
+    return content
+
+
 class LLMClient:
     """OpenAI 兼容协议的聊天补全客户端（面向 DeepSeek，也兼容其他同协议服务商）。
 
@@ -152,7 +174,11 @@ class LLMClient:
                         },
                     )
                     response.raise_for_status()
-                    data = response.json()
+                    try:
+                        data = response.json()
+                    except ValueError as e:
+                        raise _InvalidResponseError(f"响应不是合法 JSON：{e}") from e
+                    content = _extract_message_content(data)
                     self._consecutive_rate_limit_hits[provider_idx] = 0
                     if self._on_usage is not None:
                         usage = data.get("usage") or {}
@@ -161,7 +187,14 @@ class LLMClient:
                             usage.get("prompt_tokens", 0),
                             usage.get("completion_tokens", 0),
                         )
-                    return data["choices"][0]["message"]["content"]
+                    return content
+                except _InvalidResponseError as e:
+                    last_error = e
+                    if self._on_log is not None:
+                        self._on_log(
+                            f"{config.model} 响应格式异常（{e}），"
+                            f"第 {attempt + 1}/{self._max_retries} 次重试"
+                        )
                 except httpx.HTTPStatusError as e:
                     last_error = e
                     if e.response.status_code == 429:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from rpg_translator.codec.rvdata2_codec import read_rvdata2
 from rpg_translator.core.ir import TextUnit
 from rpg_translator.engines.xp_vx import VXAdapter, XPAdapter
@@ -100,6 +102,21 @@ def test_xp_inject_translated_text_encodes_back_to_bytes(tmp_path: Path, xp_proj
     reloaded = XPAdapter().extract(output_dir)
     reloaded_unit = _by_locator(reloaded, "Data/Actors.rxdata", "1/@name")
     assert reloaded_unit.source_text == "红"
+
+
+def test_encode_like_raises_clear_error_when_translation_cannot_fit_cp932():
+    """经典 XP/VX 工程的字符串字段是老版本 Ruby 的 cp932（Shift-JIS）字节，没有
+    per-string 编码标记可以切换（不像 VX Ace 的 ivar 编码标记，也不像 WOLF 文件
+    格式自带的 UTF-8/cp932 标记位）。真实中文译文几乎必然包含 cp932 编不出来的
+    字——之前这里是裸 UnicodeEncodeError 崩溃，现在应该是一个说清楚原因的
+    ValueError，而不是让调用方摸不着头脑的崩溃。上面的 test_xp_inject_translated_
+    text_encodes_back_to_bytes 测不到这条路径，因为它的 fixture 原文是 ASCII，
+    正好也能当 UTF-8 解出来，走的是 UTF-8 分支，不会碰到这里。"""
+    from rpg_translator.engines._rgss_common import _encode_like
+
+    original_cp932_bytes = "村".encode("cp932")  # 真实 Shift-JIS 字节，不是合法 UTF-8
+    with pytest.raises(ValueError, match="cp932"):
+        _encode_like(original_cp932_bytes, "这是中文")
 
 
 def test_xp_inject_does_not_mutate_source_project(tmp_path: Path, xp_project: Path):

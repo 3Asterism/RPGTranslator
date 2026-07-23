@@ -138,7 +138,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import lz4.block
 
@@ -151,6 +151,14 @@ class WolfFormatError(Exception):
     classic-layout) structure this module supports -- including when it
     looks like a WolfPro-protected or classic-XOR-protected file (see the
     module docstring's SCOPE section, gaps 1-2)."""
+
+
+class _StringEncodeError(Exception):
+    """Internal signal raised by `ByteWriter.write_string` when `value` can't
+    be encoded in the writer's current encoding -- caught by
+    `_build_with_utf8_upgrade` (see there for why this is recoverable for
+    WOLF specifically, unlike the RGSS/XP-VX adapters) and never meant to
+    escape to a caller."""
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +273,26 @@ def lz4_pack(payload: bytes) -> bytes:
     return struct.pack("<ii", len(payload), len(compressed)) + compressed
 
 
+def _build_with_utf8_upgrade(is_utf8: bool, build: Callable[[bool], bytes]) -> tuple[bytes, bool]:
+    """经典（cp932）WOLF 工程写回译文时，如果译文包含 cp932 编不出来的字符——
+    真实中文句子几乎必然如此，cp932/Shift-JIS 这个经典日文编码本身就编不出
+    绝大多数简体中文字——跟 XP/VX（_rgss_common.py._encode_like）不同，这里
+    不需要只能硬报错：WOLF 文件格式本身就有逐文件的 UTF-8/cp932 标记位（见
+    `verify_magic_utf8_aware`），运行时是按这个标记位决定怎么解码字符串的，
+    不是像 RGSS 引擎那样整个运行时固定绑死一种编码。所以遇到编不出来的字符，
+    直接把这份文件升级成 UTF-8 格式（标记位 + 所有字符串都改用 UTF-8）重新写
+    一遍，而不是放弃。`build(is_utf8)` 应该是一次完整的、无副作用的构建（失败
+    了可以安全重来一遍），返回值是 (最终写出的字节, 是否升级成了 UTF-8)。"""
+    try:
+        return build(is_utf8), is_utf8
+    except _StringEncodeError as e:
+        if is_utf8:
+            # UTF-8 能表示几乎所有真实文本，这里还失败极不寻常（比如译文里混进了
+            # 孤立的 surrogate 字符）——不再有更高层的编码可以升级，老实报错。
+            raise WolfFormatError(f"无法把译文编码进这份 WOLF 文件：{e}") from e
+        return build(True), True
+
+
 class ByteWriter:
     def __init__(self, encoding: str = CP932):
         self._buf = bytearray()
@@ -283,7 +311,10 @@ class ByteWriter:
         self._buf.extend(struct.pack("<i", value))
 
     def write_string(self, value: str) -> None:
-        encoded = value.encode(self.encoding)
+        try:
+            encoded = value.encode(self.encoding)
+        except UnicodeEncodeError as e:
+            raise _StringEncodeError(f"cannot encode as {self.encoding}: {value!r}: {e}") from e
         self.write_int(len(encoded) + 1)
         self.write(encoded)
         self.write_byte(0)
@@ -692,38 +723,44 @@ class WolfMap:
         )
 
     def write(self, path: Path) -> None:
-        encoding = UTF8 if self.is_utf8 else CP932
-        header = ByteWriter()
-        magic = bytearray(_MAP_MAGIC)
-        if self.is_utf8:
-            magic[_MAP_UTF8_INDEX] = 0x55
-        header.write(bytes(magic))
-        header.write_int(self.version)
-        header.write_byte(self.unknown2)
+        def _build(is_utf8: bool) -> bytes:
+            encoding = UTF8 if is_utf8 else CP932
+            header = ByteWriter()
+            magic = bytearray(_MAP_MAGIC)
+            if is_utf8:
+                magic[_MAP_UTF8_INDEX] = 0x55
+            header.write(bytes(magic))
+            header.write_int(self.version)
+            header.write_byte(self.unknown2)
 
-        body = ByteWriter(encoding=encoding)
-        body.write_string(self.header_stamp)
-        body.write_int(self.tileset_id)
-        body.write_int(self.width)
-        body.write_int(self.height)
-        body.write_int(len(self.events))
-        if self.v35:
-            body.write_int(self.unknown4)
-            body.write_int(self.layer_cnt)
-        if self.is_utf8 and not self.has_tiles:
-            body.write_int(-1)
-        else:
-            body.write(self.tiles)
-        for e in self.events:
-            body.write_byte(_EVENT_INDICATOR)
-            e.write(body, self.v35)
-        body.write_byte(_EVENT_FINISH_INDICATOR)
+            body = ByteWriter(encoding=encoding)
+            body.write_string(self.header_stamp)
+            body.write_int(self.tileset_id)
+            body.write_int(self.width)
+            body.write_int(self.height)
+            body.write_int(len(self.events))
+            if self.v35:
+                body.write_int(self.unknown4)
+                body.write_int(self.layer_cnt)
+            if is_utf8 and not self.has_tiles:
+                body.write_int(-1)
+            else:
+                body.write(self.tiles)
+            for e in self.events:
+                body.write_byte(_EVENT_INDICATOR)
+                e.write(body, self.v35)
+            body.write_byte(_EVENT_FINISH_INDICATOR)
 
-        if self.version >= _MAP_LZ4_VERSION_THRESHOLD:
-            header.write(lz4_pack(body.getvalue()))
-        else:
-            header.write(body.getvalue())
-        path.write_bytes(header.getvalue())
+            if self.version >= _MAP_LZ4_VERSION_THRESHOLD:
+                header.write(lz4_pack(body.getvalue()))
+            else:
+                header.write(body.getvalue())
+            return header.getvalue()
+
+        data, upgraded_to_utf8 = _build_with_utf8_upgrade(self.is_utf8, _build)
+        if upgraded_to_utf8:
+            self.is_utf8 = True
+        path.write_bytes(data)
 
 
 # ---------------------------------------------------------------------------
@@ -914,33 +951,45 @@ class WolfDatabase:
         return cls(types, version, is_utf8)
 
     def write(self, project_path: Path, dat_path: Path) -> None:
-        encoding = UTF8 if self.is_utf8 else CP932
+        def _build(is_utf8: bool) -> tuple[bytes, bytes]:
+            encoding = UTF8 if is_utf8 else CP932
 
-        pw = ByteWriter(encoding=encoding)
-        pw.write_int(len(self.types))
-        for t in self.types:
-            t.write_project(pw)
-        project_path.write_bytes(pw.getvalue())
+            pw = ByteWriter(encoding=encoding)
+            pw.write_int(len(self.types))
+            for t in self.types:
+                t.write_project(pw)
 
-        header = ByteWriter()
-        header.write_byte(0)
-        magic = bytearray(_DAT_MAGIC_CP932)
-        if self.is_utf8:
-            magic[_DAT_UTF8_INDEX] = 0x55
-        header.write(bytes(magic))
-        header.write_byte(self.version)
+            header = ByteWriter()
+            header.write_byte(0)
+            magic = bytearray(_DAT_MAGIC_CP932)
+            if is_utf8:
+                magic[_DAT_UTF8_INDEX] = 0x55
+            header.write(bytes(magic))
+            header.write_byte(self.version)
 
-        body = ByteWriter(encoding=encoding)
-        body.write_int(len(self.types))
-        for t in self.types:
-            t.write_dat(body)
-        body.write_byte(self.version)
+            body = ByteWriter(encoding=encoding)
+            body.write_int(len(self.types))
+            for t in self.types:
+                t.write_dat(body)
+            body.write_byte(self.version)
 
-        if self.version == _DAT_V35_VERSION:
-            header.write(lz4_pack(body.getvalue()))
-        else:
-            header.write(body.getvalue())
-        dat_path.write_bytes(header.getvalue())
+            if self.version == _DAT_V35_VERSION:
+                header.write(lz4_pack(body.getvalue()))
+            else:
+                header.write(body.getvalue())
+            return pw.getvalue(), header.getvalue()
+
+        # _build 一次产出两份文件的内容——升级重试必须两份一起重来，不能只重建
+        # 其中一份，否则 .project 和 .dat 会各自记着不一致的编码假设。
+        try:
+            project_bytes, dat_bytes = _build(self.is_utf8)
+        except _StringEncodeError as e:
+            if self.is_utf8:
+                raise WolfFormatError(f"无法把译文编码进这份 WOLF 文件：{e}") from e
+            project_bytes, dat_bytes = _build(True)
+            self.is_utf8 = True
+        project_path.write_bytes(project_bytes)
+        dat_path.write_bytes(dat_bytes)
 
 
 def translatable_fields(db_type: DbType) -> list[Field]:
@@ -1111,26 +1160,32 @@ class WolfCommonEvents:
         return cls(events, version, terminator, is_utf8)
 
     def write(self, path: Path) -> None:
-        encoding = UTF8 if self.is_utf8 else CP932
-        header = ByteWriter()
-        header.write_byte(0)
-        magic = bytearray(_CE_MAGIC_CP932)
-        if self.is_utf8:
-            magic[_CE_UTF8_INDEX] = 0x55
-        header.write(bytes(magic))
-        header.write_byte(self.version)
+        def _build(is_utf8: bool) -> bytes:
+            encoding = UTF8 if is_utf8 else CP932
+            header = ByteWriter()
+            header.write_byte(0)
+            magic = bytearray(_CE_MAGIC_CP932)
+            if is_utf8:
+                magic[_CE_UTF8_INDEX] = 0x55
+            header.write(bytes(magic))
+            header.write_byte(self.version)
 
-        body = ByteWriter(encoding=encoding)
-        body.write_int(len(self.events))
-        for e in self.events:
-            e.write(body, self.v35)
-        body.write_byte(self.terminator)
+            body = ByteWriter(encoding=encoding)
+            body.write_int(len(self.events))
+            for e in self.events:
+                e.write(body, self.v35)
+            body.write_byte(self.terminator)
 
-        if self.v35:
-            header.write(lz4_pack(body.getvalue()))
-        else:
-            header.write(body.getvalue())
-        path.write_bytes(header.getvalue())
+            if self.v35:
+                header.write(lz4_pack(body.getvalue()))
+            else:
+                header.write(body.getvalue())
+            return header.getvalue()
+
+        data, upgraded_to_utf8 = _build_with_utf8_upgrade(self.is_utf8, _build)
+        if upgraded_to_utf8:
+            self.is_utf8 = True
+        path.write_bytes(data)
 
 
 # ---------------------------------------------------------------------------

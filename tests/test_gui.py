@@ -43,6 +43,21 @@ def _unreachable_transport() -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
+def _drop_and_wait(window: MainWindow, path: Path, qapp, timeout: int = 10_000) -> None:
+    """_on_path_dropped 识别到引擎后，预览扫描（adapter.extract()）跑在后台
+    ExtractPreviewWorker 里就立刻返回（见 main_window.py 的说明），测试要显式等
+    这个线程跑完、再把 Qt 事件队列里排队的跨线程信号处理掉，才能看到
+    _on_preview_extract_done 真正执行完之后的按钮状态/提示文字。没识别到引擎的
+    路径（UnknownEngineError）不会起 worker，_preview_worker 保持上一次的值或
+    None，调用方不需要也不应该在那种场景下调用这个 helper。"""
+    window._on_path_dropped(path)
+    worker = window._preview_worker
+    assert worker is not None, "预览扫描线程没有被创建（识别引擎失败了？）"
+    finished_in_time = worker.wait(timeout)
+    qapp.processEvents()
+    assert finished_in_time, "预览扫描线程没在超时内跑完"
+
+
 def test_main_window_constructs_with_start_disabled(qapp):
     window = MainWindow()
     assert window._start_button.isEnabled() is False
@@ -113,7 +128,7 @@ def test_main_window_on_progress_changed_bursts_do_not_inflate_sample_count(qapp
 
 def test_drop_recognized_mz_project_enables_start_and_shows_engine(qapp, mz_project: Path):
     window = MainWindow()
-    window._on_path_dropped(mz_project)
+    _drop_and_wait(window, mz_project, qapp)
 
     assert window._start_button.isEnabled() is True
     assert window._adapter is not None
@@ -128,7 +143,7 @@ def test_db_path_for_project_points_at_rpg_translator_units_db(tmp_path: Path):
 
 def test_drop_recognized_vxace_project_enables_start_and_shows_engine(qapp, vxace_project: Path):
     window = MainWindow()
-    window._on_path_dropped(vxace_project)
+    _drop_and_wait(window, vxace_project, qapp)
 
     assert window._start_button.isEnabled() is True
     assert window._adapter is not None
@@ -213,14 +228,14 @@ def test_drop_project_with_existing_progress_shows_resume_note(qapp, mz_project:
         store.update_translation(first_unit.id, "已翻译的内容", status="translated")
 
     window = MainWindow()
-    window._on_path_dropped(mz_project)
+    _drop_and_wait(window, mz_project, qapp)
 
     assert "已翻译 1/14" in window._info_label.text()
 
 
 def test_drop_project_without_prior_progress_shows_no_resume_note(qapp, mz_project: Path):
     window = MainWindow()
-    window._on_path_dropped(mz_project)
+    _drop_and_wait(window, mz_project, qapp)
 
     assert "已翻译" not in window._info_label.text()
 
@@ -297,6 +312,10 @@ def test_import_translation_package_button_imports_and_enables_inject(
     monkeypatch.setattr("rpg_translator.gui.main_window.QMessageBox.information", lambda *a, **k: None)
 
     window._on_import_package_clicked()
+    worker = window._import_package_worker
+    assert worker is not None, "导入线程没有被创建"
+    assert worker.wait(10_000), "导入线程没在超时内跑完"
+    qapp.processEvents()
 
     assert window._inject_button.isEnabled() is True
     with Store(window._db_path) as store:

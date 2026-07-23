@@ -68,5 +68,15 @@ class VXAceAdapter(RGSSAdapterBase):
             return
         if has_conflicting_message_system(entries):
             return
+        if any(e.name == RUNTIME_LINE_WRAP_SCRIPT_NAME for e in entries):
+            # inject 会在同一个工程上重复跑（先翻一部分注入一次，之后续译剩余部分
+            # 再注入一次很常见，见 pipeline.run_inject 的用法）——不判重的话每次
+            # 都会往 Scripts.rvdata2 追加一份新脚本，而这份脚本本身是靠
+            # `alias rpgtranslator_orig_process_character process_character` 包一层
+            # 别名链：第二次注入 alias 的是第一次已经打过补丁的 process_character，
+            # 第三次又叠一层……N 次注入后一个溢出字符会触发 process_new_line 跑 N
+            # 次，表现为消息框里多余换行/等待随翻译会话数量越叠越多，还会让脚本
+            # 文件无限膨胀。已经注入过就不用再来一次。
+            return
         next_id = max((e.id for e in entries), default=0) + 1
         append_script(scripts_path, next_id, RUNTIME_LINE_WRAP_SCRIPT_NAME, RUNTIME_LINE_WRAP_SOURCE)

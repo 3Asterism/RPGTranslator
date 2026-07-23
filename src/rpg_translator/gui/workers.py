@@ -9,10 +9,113 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from rpg_translator.core.evb_unpack import unpack_evb
-from rpg_translator.core.pipeline import run_extract, run_inject, run_translate
+from rpg_translator.core.pipeline import (
+    LanguageVariant,
+    import_translation_package,
+    prune_stale_units,
+    run_extract,
+    run_inject,
+    run_translate,
+    switch_language,
+)
+from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY, PromptStrategy
 
 logger = logging.getLogger(__name__)
+
+
+class ExtractPreviewWorker(QThread):
+    """拖入工程时的预览扫描：只是为了在 UI 上显示"识别到文本约 N 条"和续译进度提示，
+    不落库（真正落库是用户点「开始翻译」时的 ExtractWorker）。之前这一步直接同步跑在
+    _on_path_dropped 里，大工程下 adapter.extract() 本身耗时明显，会让刚拖进来的
+    窗口卡住到看起来像没反应，跟这个项目其它地方"耗时操作不占 GUI 线程"的做法不
+    一致。"""
+
+    finished_ok = Signal(list)  # list[TextUnit]
+    failed = Signal(str)
+
+    def __init__(self, adapter: EngineAdapter, project_dir: Path, parent=None):
+        super().__init__(parent)
+        self._adapter = adapter
+        self._project_dir = project_dir
+
+    def run(self) -> None:
+        try:
+            units = self._adapter.extract(self._project_dir)
+        except Exception as e:
+            logger.exception("拖入预览扫描失败")
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(units)
+
+
+class SwitchLanguageWorker(QThread):
+    """在原文/译文两份备份之间切换游戏工程当前生效的文件——涉及按文件挨个 copy2，
+    工程文件多时不是瞬时操作，同样不能占 GUI 线程。"""
+
+    finished_ok = Signal(int)  # 切换的文件数
+    failed = Signal(str)
+
+    def __init__(self, output_dir: Path, variant: LanguageVariant, parent=None):
+        super().__init__(parent)
+        self._output_dir = output_dir
+        self._variant = variant
+
+    def run(self) -> None:
+        try:
+            count = switch_language(self._output_dir, self._variant)
+        except Exception as e:
+            logger.exception("切换语言版本失败")
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(count)
+
+
+class ImportPackageWorker(QThread):
+    """导入翻译包：先在本地重新跑一遍 extract（保证两边算出来的 TextUnit id 对得
+    上），再导入包里的译文——重新 extract 这一步就是 ExtractWorker 单独跑时同样的
+    耗时操作，不能同步跑在 GUI 线程。"""
+
+    finished_ok = Signal(int, int)  # (成功导入, 版本不匹配跳过)
+    failed = Signal(str)
+
+    def __init__(self, project_dir: Path, db_path: Path, package_path: Path, parent=None):
+        super().__init__(parent)
+        self._project_dir = project_dir
+        self._db_path = db_path
+        self._package_path = package_path
+
+    def run(self) -> None:
+        try:
+            run_extract(self._project_dir, self._db_path)
+            imported, skipped = import_translation_package(self._db_path, self._package_path)
+        except Exception as e:
+            logger.exception("导入翻译包失败")
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(imported, skipped)
+
+
+class CleanupDbWorker(QThread):
+    """按当前工程重新扫描一遍文本，删掉数据库里不再对应任何现存文本的历史记录并
+    VACUUM 回收磁盘空间——重新扫描 + VACUUM（整份 db 文件重写）都不是瞬时操作。"""
+
+    finished_ok = Signal(int)  # 删除的历史记录条数
+    failed = Signal(str)
+
+    def __init__(self, project_dir: Path, db_path: Path, parent=None):
+        super().__init__(parent)
+        self._project_dir = project_dir
+        self._db_path = db_path
+
+    def run(self) -> None:
+        try:
+            deleted = prune_stale_units(self._project_dir, self._db_path)
+        except Exception as e:
+            logger.exception("清理数据库失败")
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(deleted)
 
 
 class UnpackWorker(QThread):
