@@ -28,6 +28,7 @@ from rpg_translator.core.evb_unpack import find_evb_candidate
 from rpg_translator.core.pipeline import (
     UnknownEngineError,
     detect_adapter,
+    export_mtool_json,
     export_translation_package,
     has_language_variant,
 )
@@ -477,6 +478,10 @@ class MainWindow(QMainWindow):
         self._import_package_button.setObjectName("secondaryButton")
         self._import_package_button.clicked.connect(self._on_import_package_clicked)
 
+        self._export_mtool_button = QPushButton("导出 MTool 格式…")
+        self._export_mtool_button.setObjectName("secondaryButton")
+        self._export_mtool_button.clicked.connect(self._on_export_mtool_clicked)
+
         self._cleanup_db_button = QPushButton("清理数据库…")
         self._cleanup_db_button.setObjectName("secondaryButton")
         self._cleanup_db_button.clicked.connect(self._on_cleanup_db_clicked)
@@ -486,6 +491,7 @@ class MainWindow(QMainWindow):
         share_row.addWidget(self._switch_translated_button)
         share_row.addWidget(self._export_package_button)
         share_row.addWidget(self._import_package_button)
+        share_row.addWidget(self._export_mtool_button)
         share_row.addWidget(self._cleanup_db_button)
         share_row.addStretch(1)
 
@@ -1158,6 +1164,36 @@ class MainWindow(QMainWindow):
             return
         self._log_message(f"翻译包已导出：{package_path}")
         QMessageBox.information(self, "导出完成", f"已生成：{package_path}\n\n可以直接分享给拿到同一个游戏的人。")
+
+    def _on_export_mtool_clicked(self) -> None:
+        if self._db_path is None or self._project_dir is None:
+            QMessageBox.warning(self, "还没有翻译内容", "请先拖入工程并跑一遍翻译。")
+            return
+
+        dest_dir = QFileDialog.getExistingDirectory(
+            self, "选择 ManualTransFile.json 保存位置", str(self._project_dir.parent)
+        )
+        if not dest_dir:
+            return
+
+        try:
+            mtool_path, conflicts = export_mtool_json(self._db_path, Path(dest_dir))
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+            return
+
+        self._log_message(f"MTool 格式已导出：{mtool_path}")
+        message = (
+            f"已生成：{mtool_path}\n\n"
+            "把这个文件放到游戏根目录，配合 MTool 客户端使用（运行时替换文本，"
+            "不经过本工具的注入流程，不会改动游戏原文件）。"
+        )
+        if conflicts:
+            message += (
+                f"\n\n注意：有 {conflicts} 处同一原文在本工具里对应了不同译文，"
+                "MTool 格式只能按原文本身做 key，已保留每处的首次出现译文。"
+            )
+        QMessageBox.information(self, "导出完成", message)
 
     def _on_import_package_clicked(self) -> None:
         if self._project_dir is None:
