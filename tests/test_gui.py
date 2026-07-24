@@ -402,6 +402,35 @@ def test_export_translation_package_prompts_for_name_and_writes_file(
     assert (dest_dir / "我的游戏.rpgtrans.json").is_file()
 
 
+def test_export_mtool_json_button_writes_manual_trans_file(
+    qapp, tmp_path: Path, mz_project: Path, monkeypatch
+):
+    from rpg_translator.core.pipeline import run_extract
+    from rpg_translator.core.store import Store
+
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        unit = store.list_units()[0]
+        store.update_translation(unit.id, "译文", status="translated")
+
+    window = MainWindow()
+    window._project_dir = mz_project
+    window._db_path = db_path
+
+    dest_dir = tmp_path / "mtool_dest"
+    dest_dir.mkdir()
+    monkeypatch.setattr(
+        "rpg_translator.gui.main_window.QFileDialog.getExistingDirectory",
+        lambda *a, **k: str(dest_dir),
+    )
+    monkeypatch.setattr("rpg_translator.gui.main_window.QMessageBox.information", lambda *a, **k: None)
+
+    window._on_export_mtool_clicked()
+
+    assert (dest_dir / "ManualTransFile.json").is_file()
+
+
 def test_import_translation_package_button_imports_and_enables_inject(
     qapp, tmp_path: Path, mz_project: Path, monkeypatch
 ):
