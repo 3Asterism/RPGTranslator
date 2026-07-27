@@ -109,6 +109,39 @@ def test_main_window_compute_eta_text_all_done_has_no_remaining_text(qapp):
     assert "还剩" not in text
 
 
+def test_main_window_on_usage_changed_accumulates_cost_for_known_model(qapp):
+    window = MainWindow()
+    window._on_usage_changed("deepseek-v4-flash", 1_000_000, 500_000)
+
+    assert "预估花费 ¥2.00" in window._usage_label.text()
+    assert "仅供参考" not in window._usage_label.text()
+
+
+def test_main_window_on_usage_changed_notes_approx_price_for_unknown_model(qapp):
+    """价目表里没有的型号现在会用粗略均价给一个费用数量级参考（见
+    translate/pricing.py），但不能让用户误以为这是精确账单——状态栏要明确标注
+    这是估算。"""
+    window = MainWindow()
+    window._on_usage_changed("some-unlisted-model", 1_000_000, 1_000_000)
+
+    text = window._usage_label.text()
+    assert "预估花费 ¥" in text
+    assert "按同类模型均价粗略估算" in text
+
+
+def test_main_window_on_usage_changed_skips_cost_for_local_engine(qapp):
+    """本地引擎没有 API 调用费用——切到本地引擎之后的用量不该计进预估花费，
+    也不该被当成"型号未收录定价"提示用户去查价目表。"""
+    window = MainWindow()
+    window._current_engine_is_local = True
+    window._on_usage_changed("sakura-7b-qwen2.5-v1.0-q6k", 1_000_000, 1_000_000)
+
+    text = window._usage_label.text()
+    assert "预估花费 ¥0.00" in text
+    assert "本地模型用量" in text
+    assert "按同类模型均价粗略估算" not in text
+
+
 def test_main_window_on_progress_changed_updates_eta_label(qapp):
     window = MainWindow()
     window._on_progress_changed(0, 10)

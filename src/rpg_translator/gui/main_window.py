@@ -342,7 +342,14 @@ class MainWindow(QMainWindow):
         self._session_prompt_tokens = 0
         self._session_completion_tokens = 0
         self._session_cost_cny = 0.0
-        self._session_has_unpriced_model = False
+        self._session_has_approx_priced_model = False
+        # 本次会话有没有跑过本地引擎——本地模型跑在用户自己显卡上，没有 API 调用
+        # 费用，这部分 token 不该被计进"预估花费"，也不该被当成"型号未收录定价"
+        # 提示用户去查价目表（那张表本来就不管本地模型）。每次起 TranslateWorker
+        # 时按当前选的引擎刷新（见 _start_translate_worker），反映的是"最近一次
+        # 翻译跑的是哪个引擎"，不是"本次会话曾经用过哪个引擎"的历史并集。
+        self._current_engine_is_local = False
+        self._session_has_local_usage = False
 
         # 翻译速度/剩余时间预估：只在当前这一次 TranslateWorker 运行期间有意义，每次
         # 重新起 worker（首次翻译、重试失败项）都要清空，不能带着上一轮的速度残留。
@@ -530,11 +537,14 @@ class MainWindow(QMainWindow):
     def _on_usage_changed(self, model: str, prompt_tokens: int, completion_tokens: int) -> None:
         self._session_prompt_tokens += prompt_tokens
         self._session_completion_tokens += completion_tokens
-        cost = estimate_cost_cny(model, prompt_tokens, completion_tokens)
-        if cost is None:
-            self._session_has_unpriced_model = True
+        if self._current_engine_is_local:
+            # 本地引擎没有 API 调用费用——token 数照记，但不查价目表、不计入花费。
+            self._session_has_local_usage = True
         else:
+            cost, exact = estimate_cost_cny(model, prompt_tokens, completion_tokens)
             self._session_cost_cny += cost
+            if not exact:
+                self._session_has_approx_priced_model = True
         self._refresh_usage_label()
 
     def _refresh_usage_label(self) -> None:
@@ -544,8 +554,13 @@ class MainWindow(QMainWindow):
             f"输出 {self._session_completion_tokens:,}（共 {total:,}） · "
             f"预估花费 ¥{self._session_cost_cny:.2f}"
         )
-        if self._session_has_unpriced_model:
-            text += "（含未知计价模型，费用为部分预估，仅供参考）"
+        notes = []
+        if self._session_has_approx_priced_model:
+            notes.append("部分型号未收录官方定价，按同类模型均价粗略估算")
+        if self._session_has_local_usage:
+            notes.append("含本地模型用量，本地部分不计入费用")
+        if notes:
+            text += f"（{'；'.join(notes)}，仅供参考）"
         self._usage_label.setText(text)
 
     def _all_workers(self) -> tuple[QThread | None, ...]:
@@ -809,7 +824,8 @@ class MainWindow(QMainWindow):
         concurrency = int(qsettings.value("concurrency", 4))
         batch_size = int(qsettings.value("batch_size", DEFAULT_BATCH_SIZE))
 
-        if qsettings.value("engine", "online") == ENGINE_LOCAL:
+        self._current_engine_is_local = qsettings.value("engine", "online") == ENGINE_LOCAL
+        if self._current_engine_is_local:
             # 本地模型走专门适配过的 prompt 模板（见 sakura_prompt.py），不走 DeepSeek
             # 那套自由格式；也不启用备用 provider——故障转移是为云端服务瞬时报错设计
             # 的，本地服务连不上通常是配置错了，切去 DeepSeek 反而会误导排查方向。
