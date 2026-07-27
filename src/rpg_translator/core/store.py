@@ -33,6 +33,18 @@ class Store:
     def __init__(self, db_path: str | Path):
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
+        # 默认的 rollback journal 模式下，每次 commit() 都要对主数据库文件做一次
+        # fsync；批量翻译时 batch_translator._write_result 按 job（去重分组）粒度
+        # commit，大工程下是几千到几万次这样的调用，且这些调用是在 asyncio 事件
+        # 循环线程里同步执行的（sqlite3 没有 await 版本），每次 fsync 期间会连带
+        # 卡住其它并发批次的调度、GUI 侧进度/日志信号的处理。WAL 模式把提交写进
+        # 一个只追加的 WAL 文件（不需要为每次提交同步主文件），配合
+        # synchronous=NORMAL（WAL 模式下官方推荐的搭配）能把这部分 fsync 开销降
+        # 一个数量级，代价仅仅是"操作系统本身崩溃"这种极端情况下可能丢最后几次
+        # 提交（应用崩溃/断电但系统还活着的常规场景下 WAL 依然保证已提交数据不丢），
+        # 对翻译记忆这类可重新生成的本地缓存数据完全可以接受。
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -111,6 +123,19 @@ class Store:
             rows,
         )
         self._conn.commit()
+
+    def list_unit_ids(self, exclude_status: TranslationStatus | None = None) -> set[str]:
+        """只取 id 列，不构造完整 TextUnit（跳过 control_code_map/extra_locators 两个
+        JSON 字段的解析）——GUI 拖入工程时用来算"已翻译 X/Y"续译提示只需要知道哪些
+        id 不是 pending，之前借道 list_units() 整表读出来再在 Python 里过滤，大工程
+        （几万行）下要为每一行多余地跑两次 json.loads，只是为了扔掉结果。"""
+        query = "SELECT id FROM text_units"
+        params: list[str] = []
+        if exclude_status is not None:
+            query += " WHERE status != ?"
+            params.append(exclude_status)
+        rows = self._conn.execute(query, params).fetchall()
+        return {row["id"] for row in rows}
 
     def get_unit(self, unit_id: str) -> TextUnit | None:
         row = self._conn.execute(

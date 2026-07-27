@@ -11,6 +11,7 @@ from PySide6.QtCore import QThread, Signal
 from rpg_translator.core.evb_unpack import unpack_evb
 from rpg_translator.core.pipeline import (
     LanguageVariant,
+    db_path_for_project,
     import_translation_package,
     prune_stale_units,
     run_extract,
@@ -18,6 +19,7 @@ from rpg_translator.core.pipeline import (
     run_translate,
     switch_language,
 )
+from rpg_translator.core.store import Store
 from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY, PromptStrategy
 from rpg_translator.translate.local_engine import LocalEngineProcess
@@ -30,15 +32,22 @@ class ExtractPreviewWorker(QThread):
     不落库（真正落库是用户点「开始翻译」时的 ExtractWorker）。之前这一步直接同步跑在
     _on_path_dropped 里，大工程下 adapter.extract() 本身耗时明显，会让刚拖进来的
     窗口卡住到看起来像没反应，跟这个项目其它地方"耗时操作不占 GUI 线程"的做法不
-    一致。"""
+    一致。
 
-    finished_ok = Signal(list)  # list[TextUnit]
+    续译进度提示（"已翻译 X/Y"）需要读一遍已有的 units.db——这一步原来是在
+    _on_preview_extract_done 里、扫描线程跑完之后，同步跑在 GUI 线程上的：老工程
+    的 db 可能有几万行，即使只是为了数个数也要挨个构造 TextUnit（含两次 json.loads），
+    真机上这一下能让刚扫完的窗口又卡一截。这里顺路在同一个后台线程里把这一步也做掉，
+    GUI 线程拿到结果时只剩下摆按钮/改文字这类几乎零耗时的操作。"""
+
+    finished_ok = Signal(list, str)  # (list[TextUnit], resume_note)
     failed = Signal(str)
 
-    def __init__(self, adapter: EngineAdapter, project_dir: Path, parent=None):
+    def __init__(self, adapter: EngineAdapter, project_dir: Path, db_path: Path, parent=None):
         super().__init__(parent)
         self._adapter = adapter
         self._project_dir = project_dir
+        self._db_path = db_path
 
     def run(self) -> None:
         try:
@@ -47,7 +56,25 @@ class ExtractPreviewWorker(QThread):
             logger.exception("拖入预览扫描失败")
             self.failed.emit(str(e))
             return
-        self.finished_ok.emit(units)
+        resume_note = self._resume_progress_note(units)
+        self.finished_ok.emit(units, resume_note)
+
+    def _resume_progress_note(self, units: list) -> str:
+        """如果这个工程之前已经翻译过一部分（db 文件存在），返回一句续译进度提示；
+        读取失败（比如上次的 db 文件损坏/被占用）只是锦上添花的提示丢了，不该拦住
+        整个拖拽识别流程，记下日志、退化成空字符串。"""
+        if not self._db_path.is_file():
+            return ""
+        try:
+            with Store(self._db_path) as store:
+                done_ids = store.list_unit_ids(exclude_status="pending")
+        except Exception:
+            logger.exception("读取续译进度失败：%s", self._project_dir)
+            return ""
+        done = sum(1 for u in units if u.id in done_ids)
+        if done == 0:
+            return ""
+        return f"，已翻译 {done}/{len(units)}（点击「开始翻译」续译剩余部分）"
 
 
 class SwitchLanguageWorker(QThread):

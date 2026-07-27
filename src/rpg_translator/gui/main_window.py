@@ -27,6 +27,7 @@ from rpg_translator.config import get_deepseek_api_key
 from rpg_translator.core.evb_unpack import find_evb_candidate
 from rpg_translator.core.pipeline import (
     UnknownEngineError,
+    db_path_for_project,
     detect_adapter,
     export_mtool_json,
     export_translation_package,
@@ -240,10 +241,6 @@ QLabel#usageLabel {
 def resolve_dropped_path(path: Path) -> Path:
     """拖 exe 时自动定位到其所在目录，拖文件夹则原样返回。"""
     return path.parent if path.is_file() else path
-
-
-def db_path_for_project(project_dir: Path) -> Path:
-    return project_dir / ".rpg_translator" / "units.db"
 
 
 def _format_duration(seconds: float) -> str:
@@ -614,24 +611,17 @@ class MainWindow(QMainWindow):
         self._switch_original_button.setEnabled(False)
         self._switch_translated_button.setEnabled(False)
         self._open_output_button.setVisible(False)
-        self._preview_worker = ExtractPreviewWorker(adapter, path)
+        self._preview_worker = ExtractPreviewWorker(adapter, path, db_path_for_project(path))
         self._preview_worker.finished_ok.connect(self._on_preview_extract_done)
         self._preview_worker.failed.connect(self._on_preview_extract_failed)
         self._preview_worker.start()
         return True
 
-    def _on_preview_extract_done(self, units: list) -> None:
+    def _on_preview_extract_done(self, units: list, resume_note: str) -> None:
         path = self._project_dir
         adapter = self._pending_adapter
         self._adapter = adapter
         engine_label = _ENGINE_LABELS.get(adapter.engine_name, adapter.engine_name)
-        try:
-            resume_note = self._resume_progress_note(path, units)
-        except Exception:
-            # 断点续传进度只是锦上添花的提示，读取失败（比如上次的 db 文件损坏/被占用）
-            # 不该拦住整个拖拽识别流程——记下日志，提示照常显示，只是不带续译进度。
-            logger.exception("读取续译进度失败：%s", path)
-            resume_note = ""
         self._info_label.setText(
             f"识别到引擎：{engine_label}，扫描到文本约 {len(units)} 条{resume_note}"
         )
@@ -703,23 +693,6 @@ class MainWindow(QMainWindow):
         self._start_button.setEnabled(False)
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
-
-    @staticmethod
-    def _resume_progress_note(project_dir: Path, units: list) -> str:
-        """如果这个工程之前已经翻译过一部分（db 文件存在），提示已完成的进度——
-        断点续传对用户可见，不用重新点了"开始翻译"才发现原来接着上次的进度在跑。"""
-        db_path = db_path_for_project(project_dir)
-        if not db_path.is_file():
-            return ""
-
-        from rpg_translator.core.store import Store
-
-        with Store(db_path) as store:
-            done_ids = {u.id for u in store.list_units() if u.status != "pending"}
-        done = sum(1 for u in units if u.id in done_ids)
-        if done == 0:
-            return ""
-        return f"，已翻译 {done}/{len(units)}（点击「开始翻译」续译剩余部分）"
 
     def _open_settings(self) -> None:
         # 原来 SettingsDialog(self).exec() 没接住返回的对象——exec() 一返回这行

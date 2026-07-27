@@ -32,6 +32,10 @@ REGISTERED_ADAPTERS: list[type[EngineAdapter]] = [
 ]
 
 
+def db_path_for_project(project_dir: Path) -> Path:
+    return project_dir / ".rpg_translator" / "units.db"
+
+
 class UnknownEngineError(Exception):
     pass
 
