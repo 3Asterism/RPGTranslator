@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from rpg_translator.translate.batch_translator import Job, PromptStrategy
 
 # SakuraLLM/GalTransl 官方 prompt 模板（来自 GalTransl 项目 Backend/Prompts.py 的
@@ -57,21 +59,40 @@ def _format_glossary(name_hints: dict[str, str]) -> str:
     return "\n".join(f"{name}->{translated} #人名" for name, translated in name_hints.items())
 
 
+_PLACEHOLDER_RE = re.compile(r"\[History\]|\[Glossary\]|\[Input\]")
+
+
+def _render_template(values: dict[str, str]) -> str:
+    # 一次性按原始模板位置替换（re.sub 不会重新扫描替换进去的内容），不能像
+    # 链式 .replace() 那样一个个顺序替换——史剧情/术语表里如果凑巧包含了字面的
+    # "[Glossary]"/"[Input]" 这类还没轮到替换的占位符文本，链式替换会把这些
+    # "意外命中"也当成模板占位符替换掉，静默改变发给模型的 prompt 结构。
+    return _PLACEHOLDER_RE.sub(lambda m: values[m.group(0)], _TRANS_TEMPLATE)
+
+
 def _build_single_prompt(protected_text: str, context: str, name_hints: dict[str, str]) -> str:
     history = f"历史剧情：{context}\n" if context else ""
-    prompt = _TRANS_TEMPLATE.replace("[History]", history)
-    prompt = prompt.replace("[Glossary]", _format_glossary(name_hints))
-    return prompt.replace("[Input]", _escape_newlines(protected_text))
+    return _render_template(
+        {
+            "[History]": history,
+            "[Glossary]": _format_glossary(name_hints),
+            "[Input]": _escape_newlines(protected_text),
+        }
+    )
 
 
 def _build_batch_prompt(items: list[Job]) -> str:
     merged_hints: dict[str, str] = {}
     for job in items:
         merged_hints.update(job.name_hints)
-    prompt = _TRANS_TEMPLATE.replace("[History]", _build_history(items))
-    prompt = prompt.replace("[Glossary]", _format_glossary(merged_hints))
     lines = [_escape_newlines(job.protected_text) for job in items]
-    return prompt.replace("[Input]", "\n".join(lines))
+    return _render_template(
+        {
+            "[History]": _build_history(items),
+            "[Glossary]": _format_glossary(merged_hints),
+            "[Input]": "\n".join(lines),
+        }
+    )
 
 
 def _parse_batch_response(response: str, expected_count: int) -> dict[int, str] | None:

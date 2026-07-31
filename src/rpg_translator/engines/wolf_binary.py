@@ -878,10 +878,16 @@ class DbType:
         fields_size = r.read_int()
         if self.unknown1 == _DAT_STRING_INDICATOR:
             self.unknown2 = r.read_string()
-        if fields_size != len(self.fields):
+        if fields_size < len(self.fields):
             self.fields = self.fields[:fields_size]
-        for f in self.fields:
-            f.index_info = r.read_int()
+        # .dat 的 index_info 数量以 fields_size 为准，不管它跟 .project 读出来的
+        # len(self.fields) 是否对得上都要精确消费 fields_size 个 int 保持流对齐——
+        # 之前 fields_size > len(self.fields) 时只按 len(self.fields) 读，多出来的
+        # int 留在流里没读，后面 data_size 就读到错位的字节上，整段解析悄悄跑飞。
+        for i in range(fields_size):
+            index_info = r.read_int()
+            if i < len(self.fields):
+                self.fields[i].index_info = index_info
         data_size = r.read_int()
         if data_size != len(self.data):
             self.data = self.data[:data_size]

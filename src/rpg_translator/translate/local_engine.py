@@ -116,26 +116,28 @@ class LocalEngineProcess:
         self._log_path = Path(log_file.name)
 
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        self._process = subprocess.Popen(
-            [
-                str(self._engine.exe_path),
-                "-m",
-                str(self._engine.model_path),
-                "--host",
-                _LOCAL_ENGINE_HOST,
-                "--port",
-                str(port),
-                "-c",
-                str(_CONTEXT_SIZE),
-                "--n-gpu-layers",
-                str(_GPU_LAYERS),
-            ],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
-        log_file.close()
+        try:
+            self._process = subprocess.Popen(
+                [
+                    str(self._engine.exe_path),
+                    "-m",
+                    str(self._engine.model_path),
+                    "--host",
+                    _LOCAL_ENGINE_HOST,
+                    "--port",
+                    str(port),
+                    "-c",
+                    str(_CONTEXT_SIZE),
+                    "--n-gpu-layers",
+                    str(_GPU_LAYERS),
+                ],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+        finally:
+            log_file.close()
         return self._base_url
 
     def wait_until_ready(self, timeout: float) -> bool:
@@ -154,7 +156,7 @@ class LocalEngineProcess:
             try:
                 with httpx.Client(timeout=2.0, transport=self._transport) as client:
                     resp = client.get(url)
-                if resp.status_code < 500:
+                if resp.status_code == 200:
                     return True
             except httpx.HTTPError:
                 pass

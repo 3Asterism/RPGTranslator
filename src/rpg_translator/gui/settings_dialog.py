@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import httpx
+import keyring.errors
 from PySide6.QtCore import QSettings, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication,
@@ -338,27 +339,36 @@ class SettingsDialog(QDialog):
         if not ok:
             self._show_connectivity_error(error)
             return
-        self._save_settings()
-        self.accept()
+        if self._save_settings():
+            self.accept()
 
-    def _save_settings(self) -> None:
+    def _save_settings(self) -> bool:
+        """返回 False 表示系统密钥库写入失败、这次设置整体没保存——调用方不应该
+        再放行关闭对话框（accept()），否则用户会以为改动已经生效。"""
         api_key = self._api_key_edit.text().strip()
-        if api_key:
-            set_deepseek_api_key(api_key)
-        elif self._had_api_key:
-            clear_deepseek_api_key()
-
         fallback_key = self._fallback_api_key_edit.text().strip()
-        if fallback_key:
-            set_fallback_api_key(fallback_key)
-        elif self._had_fallback_key:
-            clear_fallback_api_key()
-
         local_key = self._local_api_key_edit.text().strip()
-        if local_key:
-            set_local_api_key(local_key)
-        elif self._had_local_key:
-            clear_local_api_key()
+        try:
+            if api_key:
+                set_deepseek_api_key(api_key)
+            elif self._had_api_key:
+                clear_deepseek_api_key()
+
+            if fallback_key:
+                set_fallback_api_key(fallback_key)
+            elif self._had_fallback_key:
+                clear_fallback_api_key()
+
+            if local_key:
+                set_local_api_key(local_key)
+            elif self._had_local_key:
+                clear_local_api_key()
+        except keyring.errors.KeyringError as e:
+            QMessageBox.critical(
+                self, "保存密钥失败",
+                f"系统密钥库不可用，API Key 未保存，请检查系统凭据管理器后重试。\n\n{e}",
+            )
+            return False
 
         self._qsettings.setValue("base_url", self._base_url_edit.text().strip())
         self._qsettings.setValue("model", self._model_combo.currentText())
@@ -369,6 +379,7 @@ class SettingsDialog(QDialog):
         self._qsettings.setValue("local_model", self._local_model_edit.text().strip())
         self._qsettings.setValue("fallback_base_url", self._fallback_base_url_edit.text().strip())
         self._qsettings.setValue("fallback_model", self._fallback_model_edit.text().strip())
+        return True
 
     @property
     def model(self) -> str:

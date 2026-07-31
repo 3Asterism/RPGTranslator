@@ -240,7 +240,7 @@ def append_script(path: Path, script_id: int, name: str, source: str) -> None:
     if not data.startswith(_MARSHAL_HEADER):
         raise ScriptsFormatError(f"{path}: missing Marshal 4.8 header")
     header_end = len(_MARSHAL_HEADER)
-    if data[header_end] != _TAG_ARRAY:
+    if len(data) <= header_end or data[header_end] != _TAG_ARRAY:
         raise ScriptsFormatError(f"{path}: expected top-level Array")
 
     c = _Cursor(data)

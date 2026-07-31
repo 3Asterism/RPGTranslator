@@ -1035,6 +1035,12 @@ class MainWindow(QMainWindow):
         self._load_translated_project(Path(directory))
 
     def _load_translated_project(self, project_dir: Path) -> None:
+        if self._any_worker_running():
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还有任务在跑（提取/翻译/写回/解包），请等它跑完或点「停止」后再加载新工程。",
+            )
+            return
         db_path = db_path_for_project(project_dir)
         if not db_path.is_file():
             QMessageBox.warning(
@@ -1188,6 +1194,12 @@ class MainWindow(QMainWindow):
         if self._project_dir is None:
             QMessageBox.warning(self, "还没有选择工程", "请先把游戏文件夹拖进来，再导入翻译包。")
             return
+        if self._any_worker_running():
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还有任务在跑，会跟导入同时读写数据库，请等它跑完或点「停止」后再导入。",
+            )
+            return
 
         package_file, _ = QFileDialog.getOpenFileName(
             self, "选择翻译包", str(self._project_dir.parent), "翻译包 (*.rpgtrans.json)"
@@ -1236,6 +1248,12 @@ class MainWindow(QMainWindow):
         这是手动触发的瘦身入口，不会自动执行，避免误删还有用的翻译记录。"""
         if self._project_dir is None or self._db_path is None:
             QMessageBox.warning(self, "还没有选择工程", "请先拖入工程并跑一遍翻译。")
+            return
+        if self._any_worker_running():
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还有任务在跑，会跟清理同时读写数据库，请等它跑完或点「停止」后再清理。",
+            )
             return
 
         reply = QMessageBox.question(
