@@ -140,9 +140,21 @@ def download(
                         break  # 服务器说 Range 起点超出文件范围——说明之前其实已经下完了
                     resp.raise_for_status()
                     resumed = resume_from > 0 and resp.status_code == 206
+                    total = resume_from + int(resp.headers.get("content-length", 0))
+                    written = resume_from
+                    last_report = time.monotonic()
                     with part_path.open("ab" if resumed else "wb") as f:
                         for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
                             f.write(chunk)
+                            written += len(chunk)
+                            now = time.monotonic()
+                            if now - last_report >= 10:
+                                print(
+                                    f"[build_full] {dest.name} 已下载 {written / 1_048_576:.0f}MB"
+                                    f"{f'/{total / 1_048_576:.0f}MB' if total else ''}",
+                                    flush=True,
+                                )
+                                last_report = now
                 break
             except (httpx.TransportError, httpx.HTTPStatusError) as e:
                 if attempt == retries:
