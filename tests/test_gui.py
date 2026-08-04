@@ -843,3 +843,160 @@ def test_inject_worker_writes_translated_units_without_needing_api_key(
     assert results == [14]
     translated_map = json.loads((mz_project / "data" / "Map001.json").read_text(encoding="utf-8"))
     assert "[译]" in json.dumps(translated_map, ensure_ascii=False)
+
+
+def _make_unity_project(tmp_path: Path) -> Path:
+    """跟 tests/test_unity_detect.py 里的假 Mono 工程构造方式一致，供 GUI 层
+    拖拽识别测试用。"""
+    import struct
+
+    game_dir = tmp_path / "UnityGame"
+    game_dir.mkdir()
+    exe = game_dir / "Game.exe"
+    dos_header = bytearray(64)
+    dos_header[0:2] = b"MZ"
+    struct.pack_into("<I", dos_header, 0x3C, 64)
+    pe_header = b"PE\x00\x00" + struct.pack("<H", 0x8664) + b"\x00" * 18
+    exe.write_bytes(bytes(dos_header) + pe_header)
+    data_dir = game_dir / "Game_Data"
+    (data_dir / "Managed").mkdir(parents=True)
+    (data_dir / "globalgamemanagers").write_bytes(b"\x00")
+    (data_dir / "Managed" / "Assembly-CSharp.dll").write_bytes(b"\x00")
+    return game_dir
+
+
+def test_drop_unity_project_shows_unity_panel_instead_of_rpgmaker_panel(qapp, tmp_path: Path):
+    window = MainWindow()
+    unity_project = _make_unity_project(tmp_path)
+
+    recognized = window._on_path_dropped(unity_project)
+
+    assert recognized is True
+    assert window._unity_target is not None
+    assert window._unity_target.backend == "mono"
+    # 用 isHidden() 不用 isVisible()——window 在测试里没 show() 过，子控件的
+    # isVisible() 恒为 False（依赖祖先是否可见），isHidden() 才反映 setVisible()
+    # 实际设的值（同 test_gui.py 里 SettingsDialog 那批测试的既有写法）。
+    assert not window._unity_deploy_box.isHidden()
+    assert window._translate_box.isHidden()
+    assert window._inject_box.isHidden()
+
+
+def test_drop_rpgmaker_project_after_unity_hides_unity_panel(qapp, tmp_path: Path, mz_project: Path):
+    """反过来的场景：先拖 Unity 工程再拖 RPG Maker 工程，Unity 面板不该残留。"""
+    window = MainWindow()
+    unity_project = _make_unity_project(tmp_path)
+    window._on_path_dropped(unity_project)
+    assert not window._unity_deploy_box.isHidden()
+
+    _drop_and_wait(window, mz_project, qapp)
+
+    assert window._unity_target is None
+    assert window._unity_deploy_box.isHidden()
+    assert not window._translate_box.isHidden()
+
+
+def test_unity_deploy_button_calls_deploy_and_starts_shim_server(qapp, tmp_path: Path, monkeypatch):
+    window = MainWindow()
+    unity_project = _make_unity_project(tmp_path)
+    window._on_path_dropped(unity_project)
+
+    from rpg_translator.unity.deploy import DeployResult
+
+    fake_result = DeployResult(
+        manifest_path=tmp_path / "manifest.json", config_path=tmp_path / "config.ini", deployed_files=["a"]
+    )
+    called = {}
+
+    def fake_deploy(target, shim_port, resources_root):
+        called["target"] = target
+        called["shim_port"] = shim_port
+        return fake_result
+
+    monkeypatch.setattr("rpg_translator.gui.main_window.deploy", fake_deploy)
+    monkeypatch.setattr(
+        "rpg_translator.gui.main_window.TranslateShimServer.start", lambda self: 54321
+    )
+    monkeypatch.setattr("rpg_translator.gui.main_window.get_deepseek_api_key", lambda: "sk-test")
+
+    window._on_unity_deploy_clicked()
+
+    assert called["target"] is window._unity_target
+    assert called["shim_port"] == 54321
+    assert "1" in window._unity_status_label.text()
+
+
+def test_unity_deploy_button_warns_when_online_api_key_missing(qapp, tmp_path: Path, monkeypatch):
+    window = MainWindow()
+    unity_project = _make_unity_project(tmp_path)
+    window._on_path_dropped(unity_project)
+
+    monkeypatch.setattr("rpg_translator.gui.main_window.get_deepseek_api_key", lambda: None)
+    warnings = _track_warnings(monkeypatch)
+
+    window._on_unity_deploy_clicked()
+
+    assert warnings
+    assert "API Key" in warnings[0]
+
+
+def test_unity_remove_button_calls_remove_and_stops_shim_server(qapp, tmp_path: Path, monkeypatch):
+    window = MainWindow()
+    unity_project = _make_unity_project(tmp_path)
+    window._on_path_dropped(unity_project)
+
+    from rpg_translator.unity.deploy import RemoveResult
+
+    called = {}
+
+    def fake_remove(game_dir):
+        called["game_dir"] = game_dir
+        return RemoveResult(removed=["a"], restored=[])
+
+    monkeypatch.setattr("rpg_translator.gui.main_window.remove", fake_remove)
+    stop_called = []
+    window._unity_shim_server = type("FakeShim", (), {"stop": lambda self: stop_called.append(True)})()
+
+    window._on_unity_remove_clicked()
+
+    assert called["game_dir"] == unity_project
+    assert stop_called == [True]
+
+
+def test_unity_panel_shows_sakura_warning_when_local_engine_selected(qapp, tmp_path: Path):
+    qsettings = QSettings(ORG_NAME, APP_NAME)
+    qsettings.setValue("engine", ENGINE_LOCAL)
+    try:
+        window = MainWindow()
+        unity_project = _make_unity_project(tmp_path)
+        window._on_path_dropped(unity_project)
+
+        assert "Sakura" in window._unity_sakura_warning_label.text()
+        assert not window._unity_sakura_warning_label.isHidden()
+    finally:
+        qsettings.remove("engine")
+
+
+def test_unity_panel_hides_sakura_warning_when_online_engine_selected(qapp, tmp_path: Path):
+    qsettings = QSettings(ORG_NAME, APP_NAME)
+    qsettings.setValue("engine", ENGINE_ONLINE)
+    try:
+        window = MainWindow()
+        unity_project = _make_unity_project(tmp_path)
+        window._on_path_dropped(unity_project)
+
+        assert window._unity_sakura_warning_label.isHidden()
+    finally:
+        qsettings.remove("engine")
+
+
+def test_close_event_stops_unity_shim_server(qapp, tmp_path: Path):
+    window = MainWindow()
+    stop_called = []
+    window._unity_shim_server = type("FakeShim", (), {"stop": lambda self: stop_called.append(True)})()
+
+    from PySide6.QtGui import QCloseEvent
+
+    window.closeEvent(QCloseEvent())
+
+    assert stop_called == [True]
