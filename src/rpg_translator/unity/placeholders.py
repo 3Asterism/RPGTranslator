@@ -1,11 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 
 # 用私有区字符（U+E000/U+E001）包裹 token 编号——这两个码点属于 Unicode 私有
 # 使用区，游戏原文/译文正常情况下不会出现，冲突概率可忽略。
-_TOKEN_OPEN = "\uE000"
-_TOKEN_CLOSE = "\uE001"
+_TOKEN_OPEN = ""
+_TOKEN_CLOSE = ""
 _TOKEN_RE = re.compile(f"{_TOKEN_OPEN}(\\d+){_TOKEN_CLOSE}")
 
 # 第一版只做通用兜底，覆盖最常见的四类：TMP 富文本标签、花括号占位符、printf

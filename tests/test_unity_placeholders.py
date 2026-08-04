@@ -41,6 +41,15 @@ def test_protect_multiple_consecutive_placeholders_do_not_cross_contaminate():
     assert restore(protected, tokens) == original
 
 
+def test_protect_adjacent_tag_and_brace_do_not_merge_into_one_match():
+    """标签紧跟花括号（中间没有分隔符）——两条规则的边界不该互相吞掉对方，
+    各自作为独立 token。"""
+    original = "<b>{name}</b>"
+    protected, tokens = protect(original)
+    assert tokens == ["<b>", "{name}", "</b>"]
+    assert restore(protected, tokens) == original
+
+
 def test_restore_leaves_unknown_token_index_untouched():
     """还原时如果译文里的 token 编号超出已记录范围（理论上不该发生，但要防
     LLM 输出异常导致 IndexError 崩掉整个请求），原样保留该 token 文本，不抛异常。"""

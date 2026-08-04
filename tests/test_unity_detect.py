@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from rpg_translator.unity.detect import UnityTarget, detect_unity
+from rpg_translator.unity.detect import InvalidPEFileError, UnityTarget, _detect_arch, detect_unity
 
 
 def _pe_bytes(machine: int) -> bytes:
@@ -94,8 +94,10 @@ def test_detect_unity_returns_none_when_backend_unknown(tmp_path: Path):
 
 def test_detect_unity_skips_non_unity_exe_and_finds_real_one(tmp_path: Path):
     """目录下可能有多个 exe（比如 crash handler），第一个配不上 _Data 目录的
-    要跳过，继续找下一个。"""
-    crash_handler = tmp_path / "UnityCrashHandler64.exe"
+    要跳过，继续找下一个。命名成 "Crash.exe"（排序在 "Game.exe" 之前，'C' < 'G'）
+    且不建对应的 _Data 目录——glob 按字母序遍历时会先试到它、判定不匹配、继续
+    找下一个，这样才是真的在测"跳过"这条分支，不是凑巧第一个就试中。"""
+    crash_handler = tmp_path / "Crash.exe"
     _write_exe(crash_handler, 0x8664)
 
     _make_mono_project(tmp_path)
@@ -104,3 +106,45 @@ def test_detect_unity_skips_non_unity_exe_and_finds_real_one(tmp_path: Path):
 
     assert target is not None
     assert target.exe_path == tmp_path / "Game.exe"
+
+
+def test_detect_arch_raises_for_missing_mz_header(tmp_path: Path):
+    exe = tmp_path / "Bad.exe"
+    exe.write_bytes(b"\x00" * 70)
+
+    with pytest.raises(InvalidPEFileError, match="MZ"):
+        _detect_arch(exe)
+
+
+def test_detect_arch_raises_for_missing_pe_signature(tmp_path: Path):
+    exe = tmp_path / "Bad.exe"
+    dos_header = bytearray(64)
+    dos_header[0:2] = b"MZ"
+    struct.pack_into("<I", dos_header, 0x3C, 64)
+    exe.write_bytes(bytes(dos_header) + b"NOPE\x00\x00")
+
+    with pytest.raises(InvalidPEFileError, match="PE"):
+        _detect_arch(exe)
+
+
+def test_detect_arch_raises_for_unsupported_machine(tmp_path: Path):
+    exe = tmp_path / "Bad.exe"
+    # 0x01C4 是 ARM，本项目只支持 x86/x64。
+    _write_exe(exe, 0x01C4)
+
+    with pytest.raises(InvalidPEFileError, match="不支持的架构"):
+        _detect_arch(exe)
+
+
+def test_detect_unity_returns_none_when_exe_has_invalid_pe_header(tmp_path: Path):
+    """detect_unity 对外的公开行为：PE 头解析失败时吞掉 InvalidPEFileError，
+    整体判定为"不是能处理的 Unity 工程"（返回 None），不向调用方抛异常——GUI
+    拖拽识别流程不该因为一个损坏/非常规的 exe 头就崩掉。"""
+    exe = tmp_path / "Game.exe"
+    exe.write_bytes(b"not a real exe")
+    data_dir = tmp_path / "Game_Data"
+    (data_dir / "Managed").mkdir(parents=True)
+    (data_dir / "globalgamemanagers").write_bytes(b"\x00")
+    (data_dir / "Managed" / "Assembly-CSharp.dll").write_bytes(b"\x00")
+
+    assert detect_unity(tmp_path) is None

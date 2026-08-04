@@ -26,7 +26,7 @@ class InvalidPEFileError(ValueError):
 def _find_unity_data_dir(project_dir: Path) -> tuple[Path, Path] | None:
     """找 <ExeName>.exe 同级的 <ExeName>_Data/ 目录，且其中含 globalgamemanagers
     或 data.unity3d 才算数（避免把同名普通文件夹误判）。目录下可能有多个 exe
-    （比如自带的 UnityCrashHandler64.exe），逐个试，第一个配对成功的即为主程序。"""
+    （比如自带的 crash handler），逐个试，第一个配对成功的即为主程序。"""
     for exe_path in sorted(project_dir.glob("*.exe")):
         data_dir = project_dir / f"{exe_path.stem}_Data"
         if not data_dir.is_dir():
