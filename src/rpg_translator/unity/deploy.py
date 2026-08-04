@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +67,16 @@ def _to_posix(rel: Path) -> str:
     return str(rel).replace("\\", "/")
 
 
+def _ensure_writable(path: Path) -> None:
+    """BepInEx 官方发行包里有文件本身是只读的（比如 .doorstop_version，Unix
+    权限位 444）；shutil.copy2 会把这个只读属性也一起复制过去。Windows 上覆写
+    或删除只读文件会直接报 PermissionError（scripts/fetch_unity_mod_assets.py
+    的 extract_all 已经实测复现过同类问题）。这里在任何可能覆写/删除已存在
+    文件之前先确保它可写，不假设游戏目录下的文件权限一定正常。"""
+    if path.exists():
+        path.chmod(stat.S_IWRITE | stat.S_IREAD)
+
+
 def _write_config(config_path: Path, shim_port: int) -> None:
     """BepInEx/config/AutoTranslatorConfig.ini 是社区广泛验证过的实际路径，
     但没有被 XUnity 第一方 README 逐字确认过——第一次真机部署要单独验证 XUnity
@@ -110,6 +121,10 @@ def _backup_if_genuinely_original(
 
 
 def deploy(target: UnityTarget, shim_port: int, resources_root: Path) -> DeployResult:
+    """resources_root 是项目的 resources/ 目录本身（内部会拼 resources_root /
+    "unity_mod" / <variant>），不是 app 根目录——调用方要传
+    translate.local_engine.get_app_root() / "resources"，不是 get_app_root()
+    原样传入（两者只差一层，混淆的话会找错目录，报 FileNotFoundError）。"""
     variant_dir = _variant_dir(target, resources_root)
     if not variant_dir.is_dir():
         raise FileNotFoundError(
@@ -128,12 +143,14 @@ def deploy(target: UnityTarget, shim_port: int, resources_root: Path) -> DeployR
         dest = game_dir / rel
         _backup_if_genuinely_original(dest, rel_posix, backup_dir, previously_deployed)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_writable(dest)
         shutil.copy2(src, dest)
         deployed.append(rel_posix)
 
     config_path = game_dir / _CONFIG_RELATIVE_PATH
     config_rel = _to_posix(_CONFIG_RELATIVE_PATH)
     _backup_if_genuinely_original(config_path, config_rel, backup_dir, previously_deployed)
+    _ensure_writable(config_path)
     _write_config(config_path, shim_port)
     if config_rel not in deployed:
         deployed.append(config_rel)
@@ -172,10 +189,13 @@ def remove(game_dir: Path) -> RemoveResult:
         backup_src = backup_dir / rel
         if backup_src.is_file():
             dest.parent.mkdir(parents=True, exist_ok=True)
+            _ensure_writable(dest)
             shutil.copy2(backup_src, dest)
+            _ensure_writable(backup_src)
             backup_src.unlink()
             restored.append(rel)
         elif dest.is_file():
+            _ensure_writable(dest)
             dest.unlink()
             removed.append(rel)
 

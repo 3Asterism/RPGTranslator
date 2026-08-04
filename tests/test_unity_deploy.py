@@ -142,6 +142,46 @@ def test_deploy_twice_on_clean_dir_never_creates_backup_of_our_own_mod_files(tmp
     assert not (game_dir / ".rpg_translator_backup").exists()
 
 
+def test_deploy_overwrites_readonly_destination_file(tmp_path: Path):
+    """BepInEx 官方 zip 里有些文件本身是只读的（比如 .doorstop_version，Unix
+    权限位 444），shutil.copy2 部署时会把这个只读属性也带过去；第二次部署
+    覆盖这类文件时，Windows 会因为目标只读直接拒绝写入——这是实测复现过的
+    真实 PermissionError（见 scripts/fetch_unity_mod_assets.py 的同类修复），
+    不是假设场景。"""
+    resources_root = tmp_path / "resources_root"
+    variant_dir = _make_variant_dir(resources_root, "mono_x64")
+    (variant_dir / ".doorstop_version").write_text("1", encoding="utf-8")
+    target = _make_target(tmp_path)
+    game_dir = target.exe_path.parent
+
+    deploy(target, shim_port=1, resources_root=resources_root)
+    (game_dir / ".doorstop_version").chmod(0o444)
+
+    # 不该抛 PermissionError。
+    deploy(target, shim_port=2, resources_root=resources_root)
+
+    assert (game_dir / ".doorstop_version").read_text(encoding="utf-8") == "1"
+
+
+def test_remove_restores_over_readonly_destination_and_deletes_readonly_backup(tmp_path: Path):
+    """卸载还原同样可能撞见只读文件：还原目标只读、或者备份文件本身只读
+    （游戏原始文件恰好是只读的，比如某些只读打包资源）都不该让 remove() 崩掉。"""
+    resources_root = tmp_path / "resources_root"
+    _make_variant_dir(resources_root, "mono_x64")
+    target = _make_target(tmp_path)
+    game_dir = target.exe_path.parent
+    (game_dir / "winhttp.dll").write_bytes(b"original-readonly-winhttp")
+    (game_dir / "winhttp.dll").chmod(0o444)
+
+    deploy(target, shim_port=1, resources_root=resources_root)
+    (game_dir / "winhttp.dll").chmod(0o444)  # 部署覆盖后的文件也标成只读，模拟最坏情况
+
+    result = remove(game_dir)
+
+    assert (game_dir / "winhttp.dll").read_bytes() == b"original-readonly-winhttp"
+    assert "winhttp.dll" in result.restored
+
+
 def test_remove_deletes_pure_additions_and_restores_backed_up_files(tmp_path: Path):
     resources_root = tmp_path / "resources_root"
     _make_variant_dir(resources_root, "mono_x64")
