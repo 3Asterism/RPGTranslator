@@ -148,7 +148,12 @@ def remove(game_dir: Path) -> RemoveResult:
 
 `find_bundled_engine` 那套"frozen 用 exe 目录、开发环境用项目根目录"的 `app_root` 解析方式直接照搬到 `resources/unity_mod/` 的定位上。
 
-**已知限制**：IL2CPP 路径依赖 BepInEx 6 pre-release（v5 稳定版没有 IL2CPP 支持），比 Mono 路径（BepInEx 5 稳定版）成熟度低，出问题概率更高，这是上游生态现状，不是本设计能绕开的。
+**已知限制**：IL2CPP 路径依赖 BepInEx 6 pre-release（v5 稳定版没有 IL2CPP 支持），比 Mono 路径（BepInEx 5 稳定版）成熟度低，出问题概率更高，这是上游生态现状，不是本设计能绕开的。IL2CPP 变体因为要带一份 .NET 运行时（`dotnet/` 目录）体积明显更大（231 个文件、75MB+，Mono 版只有 22 个文件不到 2MB）。
+
+**实测拉取后确认的几个点**（写部署代码前先摸过一遍真实 zip 内容，见 `resources/unity_mod/SOURCES.md`）：
+- `doorstop_config.ini` 由 BepInEx 官方 zip 自带，Mono/IL2CPP 两版内容不同（`target_assembly` 指向的 dll 不同，IL2CPP 版多一个 `[Il2Cpp]` 段指向 `dotnet/coreclr.dll`），部署时原样复制、不用我们生成，`deploy()` 的"整棵目录树原样复制"逻辑天然覆盖这点，不需要特殊处理。
+- 没有任何一个官方 zip 自带 `BepInEx/config/AutoTranslatorConfig.ini`——插件自己的说明只写"配置文件在游戏启动时自动生成"，没有在文档里显式给出这个路径。`BepInEx/config/AutoTranslatorConfig.ini` 是社区广泛验证过的实际路径，但这份第一方 README 本身没有逐字背书，`deploy()` 按这个路径写入是有依据的最佳判断，不是编造，但**需要在真机部署一次实测确认**——XUnity 首次启动时是直接读取这份已存在的 ini，还是会用默认值覆盖它，这是唯一没有把握、必须实测才能确认的点。
+- XUnity 插件 zip 里除了 `XUnity.AutoTranslator/` 还带了一个独立插件 `XUnity.ResourceRedirector/`（贴图/字体资源重定向，跟翻译无关）。BepInEx 会自动加载 `plugins/` 下所有 dll，带着这个等于多启用一个本设计不需要的插件，不符合"侵入性最低"的原则——`fetch_unity_mod_assets.py` 合并 XUnity zip 时显式跳过这个子目录。
 
 ## 测试
 
