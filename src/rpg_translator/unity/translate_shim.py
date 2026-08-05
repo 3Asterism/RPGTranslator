@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -16,12 +15,6 @@ from rpg_translator.unity.prompt import SYSTEM_PROMPT, build_user_prompt
 logger = logging.getLogger(__name__)
 
 _HOST = "127.0.0.1"
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((_HOST, 0))
-        return sock.getsockname()[1]
 
 
 async def translate_text(
@@ -114,9 +107,13 @@ class TranslateShimServer:
             assert self._port is not None
             return self._port
 
-        port = _find_free_port()
+        # 端口 0 直接交给 ThreadingHTTPServer 绑定，事后读 server_address 拿到
+        # 操作系统实际分配的端口——不先用一个临时 socket 探测空闲端口再关掉
+        # 重新 bind（探测和真正 bind 之间有个理论窗口期，端口可能被别的进程
+        # 抢先占用），一步到位没有这个 TOCTOU 缺口。
         handler_cls = _make_handler(self._config, self._transport)
-        server = ThreadingHTTPServer((_HOST, port), handler_cls)
+        server = ThreadingHTTPServer((_HOST, 0), handler_cls)
+        port = server.server_address[1]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
 
