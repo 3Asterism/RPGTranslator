@@ -707,6 +707,16 @@ class MainWindow(QMainWindow):
         self._translate_box.setVisible(False)
         self._inject_box.setVisible(False)
         self._unity_deploy_box.setVisible(True)
+        # RPG Maker 分支的状态/按钮不会因为 self._translate_box/_inject_box 被
+        # 隐藏就自动失效——share_box（切换原文/译文、导出/导入翻译包）常驻可见，
+        # 不重置的话，先拖一个已经注入过的 RPG Maker 工程、再拖 Unity 目录，
+        # "切换为原文/译文"仍然可点，点下去会在 Unity 目录里找不到备份，弹一个
+        # 跟眼前操作对不上的错误框。照抄"未识别到支持的引擎"分支的重置动作。
+        self._adapter = None
+        self._start_button.setEnabled(False)
+        self._switch_original_button.setEnabled(False)
+        self._switch_translated_button.setEnabled(False)
+        self._open_output_button.setVisible(False)
         backend_label = {"mono": "Mono", "il2cpp": "IL2CPP"}[target.backend]
         self._info_label.setText(
             f"识别到 Unity 工程（{backend_label} / {target.arch}）：{target.exe_path.name}"
@@ -745,20 +755,27 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "缺少 API Key", str(e))
             return
 
-        if self._unity_shim_server is None:
-            self._unity_shim_server = TranslateShimServer(config)
+        # 每次点「部署」都停掉旧 shim、拿新配置重新起一个——不复用已有实例。
+        # 用户很可能是"部署过一次 -> 发现翻译引擎配错了 -> 去设置里改 -> 回来
+        # 重新点部署"，旧实例的 config 是部署时那一刻的快照，闭包在
+        # TranslateShimServer 内部改不了，必须整个换新的才能让新配置生效。
+        self._stop_unity_shim_server()
+        self._unity_shim_server = TranslateShimServer(config)
         port = self._unity_shim_server.start()
 
         try:
-            result = deploy(self._unity_target, port, get_app_root() / "resources")
+            result: DeployResult = deploy(self._unity_target, port, get_app_root() / "resources")
         except Exception as e:
             logger.exception("Unity mod 部署失败")
             QMessageBox.critical(self, "部署失败", str(e))
+            self._stop_unity_shim_server()
             return
 
         self._unity_status_label.setText(
             f"部署完成，共写入/覆盖 {len(result.deployed_files)} 个文件。"
             "请自行启动游戏（Steam/直接运行 exe 均可）。"
+            "翻译在本程序和游戏都运行期间才生效——关闭本程序或重新部署后，"
+            "需要重启游戏才能连上新的翻译地址。"
         )
 
     def _on_unity_remove_clicked(self) -> None:
@@ -766,7 +783,7 @@ class MainWindow(QMainWindow):
             return
         game_dir = self._unity_target.exe_path.parent
         try:
-            result = remove(game_dir)
+            result: RemoveResult = remove(game_dir)
         except Exception as e:
             logger.exception("Unity mod 卸载失败")
             QMessageBox.critical(self, "卸载失败", str(e))
@@ -779,6 +796,7 @@ class MainWindow(QMainWindow):
     def _stop_unity_shim_server(self) -> None:
         if self._unity_shim_server is not None:
             self._unity_shim_server.stop()
+            self._unity_shim_server = None
 
     def _on_preview_extract_done(self, units: list, resume_note: str) -> None:
         path = self._project_dir

@@ -882,6 +882,28 @@ def test_drop_unity_project_shows_unity_panel_instead_of_rpgmaker_panel(qapp, tm
     assert window._inject_box.isHidden()
 
 
+def test_drop_unity_project_resets_stale_rpgmaker_button_state(qapp, tmp_path: Path):
+    """先拖一个已经注入过的 RPG Maker 工程（"切换为原文/译文"被 enable、
+    「打开游戏文件夹」可见）、再拖 Unity 目录——RPG Maker 那侧的按钮状态不该
+    残留。不重置的话，share_box（第 4 段，常驻可见不受 _translate_box/
+    _inject_box 隐藏影响）里的按钮还能点，点下去会在 Unity 目录里找不到
+    RPG Maker 的备份，弹一个跟眼前操作对不上的错误框。"""
+    window = MainWindow()
+    window._switch_original_button.setEnabled(True)
+    window._switch_translated_button.setEnabled(True)
+    window._open_output_button.setVisible(True)
+    window._start_button.setEnabled(True)
+
+    unity_project = _make_unity_project(tmp_path)
+    window._on_path_dropped(unity_project)
+
+    assert window._adapter is None
+    assert not window._switch_original_button.isEnabled()
+    assert not window._switch_translated_button.isEnabled()
+    assert window._open_output_button.isHidden()
+    assert not window._start_button.isEnabled()
+
+
 def test_drop_rpgmaker_project_after_unity_hides_unity_panel(qapp, tmp_path: Path, mz_project: Path):
     """反过来的场景：先拖 Unity 工程再拖 RPG Maker 工程，Unity 面板不该残留。"""
     window = MainWindow()
@@ -911,6 +933,7 @@ def test_unity_deploy_button_calls_deploy_and_starts_shim_server(qapp, tmp_path:
     def fake_deploy(target, shim_port, resources_root):
         called["target"] = target
         called["shim_port"] = shim_port
+        called["resources_root"] = resources_root
         return fake_result
 
     monkeypatch.setattr("rpg_translator.gui.main_window.deploy", fake_deploy)
@@ -923,7 +946,64 @@ def test_unity_deploy_button_calls_deploy_and_starts_shim_server(qapp, tmp_path:
 
     assert called["target"] is window._unity_target
     assert called["shim_port"] == 54321
+    # deploy() 内部拼 resources_root / "unity_mod" / <variant>——传 app 根目录
+    # 而不是 app 根目录下的 resources/ 子目录会少一层，实测复现过这个坑
+    # （见 deploy() 的 docstring），这里断言调用方传对了。
+    assert called["resources_root"].name == "resources"
     assert "1" in window._unity_status_label.text()
+
+
+def test_unity_deploy_button_stops_shim_server_when_deploy_fails(qapp, tmp_path: Path, monkeypatch):
+    """部署失败（比如游戏目录没权限写）不该把已经起好的 shim server 晾在那，
+    占着端口、持有一份马上要作废的配置。"""
+    window = MainWindow()
+    unity_project = _make_unity_project(tmp_path)
+    window._on_path_dropped(unity_project)
+
+    monkeypatch.setattr("rpg_translator.gui.main_window.get_deepseek_api_key", lambda: "sk-test")
+    monkeypatch.setattr("rpg_translator.gui.main_window.TranslateShimServer.start", lambda self: 54321)
+
+    def failing_deploy(target, shim_port, resources_root):
+        raise FileNotFoundError("simulated: mod 素材目录不存在")
+
+    monkeypatch.setattr("rpg_translator.gui.main_window.deploy", failing_deploy)
+    # _track_warnings 只 patch QMessageBox.warning，这里走的是 .critical 分支
+    # （部署失败用 critical 不是 warning，见 _on_unity_deploy_clicked），必须
+    # 单独 patch 掉，不然真弹一个 QMessageBox 会把测试卡住（实测复现过）。
+    monkeypatch.setattr(QMessageBox, "critical", lambda *a, **kw: QMessageBox.StandardButton.Ok)
+
+    window._on_unity_deploy_clicked()
+
+    assert window._unity_shim_server is None
+
+
+def test_unity_redeploy_replaces_shim_server_with_fresh_config(qapp, tmp_path: Path, monkeypatch):
+    """先部署一次，再点一次部署（模拟"部署后发现引擎配错了，去设置里改完
+    回来重新部署"）——第二次必须换一个新的 TranslateShimServer 实例，不能
+    复用第一次那个（配置在构造时就固化了，改不了）。"""
+    from rpg_translator.unity.deploy import DeployResult
+
+    window = MainWindow()
+    unity_project = _make_unity_project(tmp_path)
+    window._on_path_dropped(unity_project)
+
+    monkeypatch.setattr("rpg_translator.gui.main_window.get_deepseek_api_key", lambda: "sk-test")
+    monkeypatch.setattr("rpg_translator.gui.main_window.TranslateShimServer.start", lambda self: 54321)
+    monkeypatch.setattr(
+        "rpg_translator.gui.main_window.deploy",
+        lambda target, shim_port, resources_root: DeployResult(
+            manifest_path=tmp_path / "m.json", config_path=tmp_path / "c.ini", deployed_files=["a"]
+        ),
+    )
+
+    window._on_unity_deploy_clicked()
+    first_shim = window._unity_shim_server
+    window._on_unity_deploy_clicked()
+    second_shim = window._unity_shim_server
+
+    assert first_shim is not None
+    assert second_shim is not None
+    assert first_shim is not second_shim
 
 
 def test_unity_deploy_button_warns_when_online_api_key_missing(qapp, tmp_path: Path, monkeypatch):
