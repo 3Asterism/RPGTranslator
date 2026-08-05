@@ -15,4 +15,10 @@ logs/
 game/
 .scratch/
 .superpowers/
-resources/unity_mod/
+# resources/unity_mod/ 下都是运行时下载的第三方二进制，不进 git；SOURCES.md
+# 例外——它记录 fetch_unity_mod_assets.py 里那几个 sha256 的下载来源/时间，
+# 是这个目录唯一值得进 git 的东西。注意用 "目录/*" 而不是 "目录/" 通配整个
+# 目录——git 不允许在已经整体排除的目录里再用 "!" 单独放行某个文件（man
+# gitignore 明确写了这条），用 "*" 只排除直接子项才能让下面的例外规则生效。
+resources/unity_mod/*
+!resources/unity_mod/SOURCES.md
