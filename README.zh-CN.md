@@ -33,6 +33,7 @@
 
 - [✨ 核心特性](#-核心特性)
 - [🎮 支持引擎](#-支持引擎)
+- [🧩 Unity 游戏支持](#-unity-游戏支持)
 - [🚀 快速开始](#-快速开始)
 - [⚙️ 配置翻译引擎：在线 API / 本地模型](#️-配置翻译引擎在线-api--本地模型)
 - [🧑‍💻 开发者向：CLI / 测试 / 打包](#‍-开发者向cli--测试--打包)
@@ -85,6 +86,7 @@
 | RPG Maker VX | ✅ | 和 XP 共用一套适配器代码；已用真实 VX 工程（GitHub 上的开源同人游戏 ambratolm-games/flower-in-pain）验证并修复一个 Ruby Marshal 写入库的对象引用 bug（见下方[已知局限](#️-已知局限)） |
 | WOLF RPG エディター（ウディタ） | ✅ | 已用 WOLF RPG Editor 官方自带示例工程验证过（Map/CommonEvent/Database 三种文件全覆盖，含当前编辑器版本默认的 LZ4 压缩格式）；仍不支持 WolfPro 加密保护和经典 XOR 加密的工程 |
 | RPG Maker 2000/2003 | ❌ | 完全不同的格式，明确排除在范围外 |
+| Unity（IL2CPP / Mono） | 🧪 实验性 | 机制完全不同——运行时外挂翻译（部署 BepInEx + XUnity.AutoTranslator），不做提取/回填，见下方 [🧩 Unity 游戏支持](#-unity-游戏支持) |
 
 > **拖进来的是单文件 exe、没有散落的工程文件？** 不少 RPG Maker MV/MZ 游戏用
 > [Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html) 把 `www` 资源目录和
@@ -92,6 +94,39 @@
 > 到几 GB 的 exe）。拖进这类文件夹时，如果正常识别失败、又在顶层找到一个这样打包的 exe，
 > 会自动解包到同级的 `<原目录名>_已解包` 目录（体积大的话要等一会），解包完自动重新识别
 > 引擎——不挑具体是 MV/MZ 还是 VX Ace/XP/VX/WOLF，解包这一步和引擎种类无关。
+
+---
+
+## 🧩 Unity 游戏支持
+
+**实验性功能**，跟上面的 RPG Maker/WOLF RPG 完全是两套机制。Unity 游戏文本大多编译进
+资源文件/IL2CPP 元数据，没有能直接读写的工程文件，做不到"提取 → 翻译 → 回填"。这里走的是
+业界成熟的运行时 mod 注入方案：拖入 Unity 游戏目录后自动判断 Mono/IL2CPP、x86/x64，部署
+对应的 [BepInEx](https://github.com/BepInEx/BepInEx) +
+[XUnity.AutoTranslator](https://github.com/bbepis/XUnity.AutoTranslator)，游戏运行时实时
+截获界面文本、转发给本程序内置的本地翻译服务、原地替换显示——不改游戏文件本体，随时可以
+点「卸载还原」精确清掉部署时新增的文件。
+
+已经用 Unity 官方开源的 [Chop Chop](https://github.com/UnityTechnologies/open-project-1)
+demo（真实 IL2CPP 游戏）实机验证过完整链路：部署 → 游戏正常启动不崩溃 → XUnity 正确读取
+预写入的翻译语言配置 → 卸载后目录精确恢复。
+
+### 使用方式
+
+1. 跑一遍 `scripts/fetch_unity_mod_assets.py` 准备 mod 素材（BepInEx/XUnity 是第三方
+   二进制，不随仓库分发，需要联网下载一次）
+2. 拖入 Unity 游戏文件夹（或 exe）→ 自动识别为 Unity 工程，切到独立的部署面板
+3. 点「部署翻译外挂」→ 自行启动游戏（Steam/直接运行 exe 都行）。**翻译期间本程序需要
+   保持开着**——游戏通过本机端口实时请求翻译，关掉本程序或重新部署后要重启游戏才能连上
+   新地址
+4. 不想要了点「卸载还原」，游戏本体分毫不动
+
+### 已知限制
+
+- IL2CPP 路径依赖 [BepInEx 6 pre-release](https://github.com/BepInEx/BepInEx/releases)
+  （v5 稳定版没有 IL2CPP 支持），成熟度不如 Mono 路径
+- 占位符保护（TMP 富文本标签、`{0}` 花括号、`%d` 格式符、转义换行）第一版只做通用兜底，
+  没覆盖到的游戏特定标记可能偶尔漏保护
 
 ---
 
@@ -264,6 +299,16 @@ rpg-translator run       <项目目录> --out <输出目录>
 `HTTPS_PROXY`/`HTTP_PROXY`（httpx 默认读，配了系统代理不用改代码）、
 `LLAMA_CPP_RELEASE_BASE_URL`（替换成自建反代/镜像前缀）、
 `HF_ENDPOINT`（替换 HuggingFace 域名，比如 `https://hf-mirror.com`）。
+
+#### Unity mod 素材（BepInEx + XUnity.AutoTranslator）
+
+```bash
+.venv\Scripts\python scripts\fetch_unity_mod_assets.py
+```
+
+下载 [🧩 Unity 游戏支持](#-unity-游戏支持)需要的四种变体（Mono/IL2CPP × x86/x64）落到
+`resources/unity_mod/`，供 `scripts/build.py` 打包进产物。第三方二进制不进 git；Mono
+版每种几 MB，IL2CPP 版因为要带一份 .NET 运行时到 `dotnet/` 目录，每种 70MB+。
 
 </details>
 

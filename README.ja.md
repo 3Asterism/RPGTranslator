@@ -34,6 +34,7 @@ MTool に近い使用感ですが、翻訳メモリはより細かく管理し�
 
 - [✨ 主な特徴](#main-features)
 - [🎮 対応エンジン](#supported-engines)
+- [🧩 Unity ゲーム対応](#unity-support)
 - [🚀 クイックスタート](#quick-start)
 - [⚙️ 翻訳エンジンの設定：オンライン API / ローカルモデル](#configure-engine)
 - [🧑‍💻 開発者向け：CLI / テスト / パッケージング](#dev-guide)
@@ -97,6 +98,7 @@ MTool に近い使用感ですが、翻訳メモリはより細かく管理し�
 | RPG Maker VX | ✅ | XP と同じアダプターコードを共有。実際の VX プロジェクト（GitHub 上のオープンソース二次創作ゲーム ambratolm-games/flower-in-pain）で検証し、Ruby Marshal 書き込みライブラリのオブジェクト参照バグを 1 件修正済み（詳細は下記[既知の制限事項](#known-limitations)）。 |
 | WOLF RPG エディター（ウディタ） | ✅ | WOLF RPG Editor 公式同梱のサンプルプロジェクトで検証済み（Map/CommonEvent/Database の 3 種類のファイルを全カバー、現行エディタバージョンのデフォルトである LZ4 圧縮形式にも対応）。WolfPro による暗号化保護、および従来の XOR 暗号化を施したプロジェクトには非対応。 |
 | RPG Maker 2000/2003 | ❌ | まったく異なる形式のため、明確に対象外としています。 |
+| Unity（IL2CPP / Mono） | 🧪 実験的 | 上記とはまったく異なる仕組み——ランタイム Mod 注入方式の翻訳（BepInEx + XUnity.AutoTranslator をデプロイ）で、抽出/書き戻しは行いません。詳細は下記の[🧩 Unity ゲーム対応](#unity-support)を参照してください。 |
 
 > **ドロップしたのが単一 exe で、プロジェクトファイルが散らばっていない場合は？** 多くの
 > RPG Maker MV/MZ ゲームは [Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html)
@@ -106,6 +108,49 @@ MTool に近い使用感ですが、翻訳メモリはより細かく管理し�
 > が見つかった場合、自動的に同階層の `<元のフォルダ名>_unpacked`（アンパック済み）ディレクトリ
 > へ展開し（サイズが大きいと少し時間がかかります）、展開後は自動的にエンジンを再判定します。
 > MV/MZ か VX Ace/XP/VX/WOLF かを問わず、このアンパック処理はエンジンの種類に依存しません。
+
+---
+
+<a id="unity-support"></a>
+## 🧩 Unity ゲーム対応
+
+**実験的機能です。** 上記の RPG Maker/WOLF RPG 対応とはまったく異なる仕組みです。Unity
+ゲームのテキストは大半がアセットバンドルや IL2CPP メタデータにコンパイルされており、直接
+読み書きできるプロジェクトファイルが存在しないため、「抽出 → 翻訳 → 書き戻し」はできません。
+代わりに、Mod コミュニティで実績のあるランタイム Mod 注入方式を採用しています。Unity
+ゲームフォルダをドロップすると Mono/IL2CPP と x86/x64 を自動判定し、対応する
+[BepInEx](https://github.com/BepInEx/BepInEx) と
+[XUnity.AutoTranslator](https://github.com/bbepis/XUnity.AutoTranslator) をデプロイします。
+ゲーム実行中に画面上のテキストをリアルタイムで捕捉し、本アプリ内蔵のローカル翻訳サービスへ
+転送、その場で表示を差し替えます——ゲーム本体のファイルは一切変更されず、「アンインストール」
+をクリックすればデプロイ時に追加したものだけを正確に削除できます。
+
+Unity 公式のオープンソース [Chop Chop](https://github.com/UnityTechnologies/open-project-1)
+デモ（実際の IL2CPP ゲーム）で一連の流れを実機検証済みです：デプロイ → ゲームがクラッシュ
+せず正常に起動 → XUnity が事前に書き込んだ翻訳言語設定を正しく読み込む → アンインストール後
+ディレクトリが正確に元通りになる、まで確認しています。
+
+### 使い方
+
+1. `scripts/fetch_unity_mod_assets.py` を一度実行して Mod 素材を準備します
+   （BepInEx/XUnity はサードパーティのバイナリで本リポジトリには含まれておらず、初回のみ
+   ダウンロードが必要です）
+2. Unity ゲームフォルダ（または exe）をドラッグ＆ドロップ → Unity プロジェクトとして自動
+   判定され、専用のデプロイパネルに切り替わります
+3. 「翻訳 Mod をデプロイ」をクリック → 自分でゲームを起動します（Steam 経由でも exe
+   直接でも構いません）。**プレイ中は本アプリを起動したままにしておく必要があります**——
+   ゲームはローカルポート経由でリアルタイムに翻訳をリクエストするため、本アプリを閉じたり
+   再デプロイしたりした場合は、新しいアドレスに接続するためにゲームを再起動する必要があります
+4. 不要になったら「アンインストール」をクリック——ゲーム本体はそのまま残ります
+
+### 既知の制限事項
+
+- IL2CPP 対応は [BepInEx 6 の pre-release](https://github.com/BepInEx/BepInEx/releases) に
+  依存しています（安定版の v5 系には IL2CPP 対応がありません）。そのため Mono 対応ほど
+  成熟していません
+- プレースホルダー保護（TMP のリッチテキストタグ、`{0}` の波括弧プレースホルダー、`%d`
+  形式指定子、エスケープされた改行）は第一版として汎用的な保護のみを行っており、これらの
+  パターン外のゲーム固有のマークアップは保護されないことがあります
 
 ---
 
@@ -308,6 +353,17 @@ GitHub Release/HuggingFace へのアクセスは不安定なことが多いた�
 いればコード変更は不要）、`LLAMA_CPP_RELEASE_BASE_URL`（自前のリバースプロキシ/ミラーの
 プレフィックスに置き換え）、`HF_ENDPOINT`（HuggingFace のドメインを置き換え、例えば
 `https://hf-mirror.com`）。
+
+#### Unity mod 素材（BepInEx + XUnity.AutoTranslator）
+
+```bash
+.venv\Scripts\python scripts\fetch_unity_mod_assets.py
+```
+
+[🧩 Unity ゲーム対応](#unity-support) に必要な 4 種類のバリアント（Mono/IL2CPP ×
+x86/x64）を `resources/unity_mod/` にダウンロードし、`scripts/build.py` がパッケージに
+組み込みます。サードパーティのバイナリのため git にはコミットされません。Mono 版は各数
+MB、IL2CPP 版は `dotnet/` 配下に .NET ランタイムを同梱するため各 70MB 以上あります。
 
 </details>
 

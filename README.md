@@ -36,6 +36,7 @@ every occurrence globally.
 
 - [✨ Core Features](#core-features)
 - [🎮 Supported Engines](#supported-engines)
+- [🧩 Unity Game Support](#unity-support)
 - [🚀 Quick Start](#quick-start)
 - [⚙️ Configure Translation Engine: Online API / Local Model](#configure-engine)
 - [🧑‍💻 Developer Guide: CLI / Testing / Packaging](#dev-guide)
@@ -101,6 +102,7 @@ every occurrence globally.
 | RPG Maker VX | ✅ | Shares the same adapter code as XP; verified against a real VX project (the open-source fan game ambratolm-games/flower-in-pain on GitHub), which surfaced and led to a fix for an object-reference bug in the Ruby Marshal writer library (see [Known Limitations](#known-limitations) below). |
 | WOLF RPG Editor (Wodita) | ✅ | Verified against WOLF RPG Editor's own official sample project (full coverage of Map/CommonEvent/Database files, including the LZ4 compression format used by default in the current editor version). WolfPro-encrypted and classic-XOR-encrypted projects are still not supported. |
 | RPG Maker 2000/2003 | ❌ | Completely different format, explicitly out of scope. |
+| Unity (IL2CPP / Mono) | 🧪 Experimental | A completely different mechanism — runtime mod-injection translation (deploys BepInEx + XUnity.AutoTranslator), no extract/inject step. See [🧩 Unity Game Support](#unity-support) below. |
 
 > **Dropped in a single-file exe with no loose project files?** Many RPG Maker MV/MZ games use
 > [Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html) to bundle the `www` resource
@@ -111,6 +113,47 @@ every occurrence globally.
 > while for large files), and the engine is automatically re-detected afterward — this works the
 > same regardless of whether the engine turns out to be MV/MZ or VX Ace/XP/VX/WOLF; the unpacking
 > step itself is engine-agnostic.
+
+---
+
+<a id="unity-support"></a>
+## 🧩 Unity Game Support
+
+**Experimental.** This is a completely different mechanism from the RPG Maker/WOLF RPG support
+above. Unity game text is mostly compiled into asset bundles or IL2CPP metadata, with no project
+files to read and write directly, so "extract → translate → inject" isn't possible here. Instead
+this uses the same runtime mod-injection approach the modding community relies on: dropping in a
+Unity game folder auto-detects Mono/IL2CPP and x86/x64, then deploys the matching
+[BepInEx](https://github.com/BepInEx/BepInEx) +
+[XUnity.AutoTranslator](https://github.com/bbepis/XUnity.AutoTranslator) build. While the game
+runs, it intercepts UI text in real time, forwards it to a local translation service built into
+this app, and replaces the displayed text in place — the game's own files are never modified, and
+clicking "Uninstall" at any time removes exactly what was deployed.
+
+The full pipeline has been verified against Unity's own official open-source
+[Chop Chop](https://github.com/UnityTechnologies/open-project-1) demo (a real IL2CPP game): deploy
+→ the game launches normally without crashing → XUnity correctly reads the pre-written
+translation-language config → uninstall restores the directory exactly.
+
+### How to use it
+
+1. Run `scripts/fetch_unity_mod_assets.py` once to prepare the mod assets (BepInEx/XUnity are
+   third-party binaries not distributed with this repo — this downloads them once)
+2. Drag in the Unity game folder (or its exe) → it's auto-detected as a Unity project and switches
+   to a dedicated deployment panel
+3. Click "Deploy Translation Mod" → launch the game yourself (via Steam or the exe directly).
+   **This app needs to stay running while you play** — the game requests translations from a
+   local port in real time; closing this app or redeploying means you'll need to restart the game
+   to connect to the new address
+4. Click "Uninstall" whenever you're done — the game itself is left untouched
+
+### Known limitations
+
+- The IL2CPP path depends on a [BepInEx 6 pre-release](https://github.com/BepInEx/BepInEx/releases)
+  (the stable v5 line has no IL2CPP support), so it's less mature than the Mono path.
+- Placeholder protection (TMP rich-text tags, `{0}` brace placeholders, `%d` format specifiers,
+  escaped newlines) is a generic first-pass safety net — game-specific markup outside these
+  patterns may occasionally slip through unprotected.
 
 ---
 
@@ -316,6 +359,18 @@ mainland China; this can be worked around with: `HTTPS_PROXY`/`HTTP_PROXY` (read
 httpx; no code changes needed if your system proxy is set), `LLAMA_CPP_RELEASE_BASE_URL` (swap in
 a self-hosted mirror/proxy prefix), `HF_ENDPOINT` (swap the HuggingFace domain, e.g.
 `https://hf-mirror.com`).
+
+#### Unity mod assets (BepInEx + XUnity.AutoTranslator)
+
+```bash
+.venv\Scripts\python scripts\fetch_unity_mod_assets.py
+```
+
+Downloads the four variants (Mono/IL2CPP × x86/x64) needed for
+[🧩 Unity Game Support](#unity-support) into `resources/unity_mod/`, for `scripts/build.py` to
+bundle into the packaged build. Third-party binaries, not committed to git; the Mono variants are
+a few MB each, the IL2CPP variants are 70MB+ each since they bundle a .NET runtime under
+`dotnet/`.
 
 </details>
 
