@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,11 @@ def test_deploy_writes_autotranslator_config_pointing_at_shim_port(tmp_path: Pat
     content = result.config_path.read_text(encoding="utf-8")
     assert "Endpoint=CustomTranslate" in content
     assert "http://127.0.0.1:54321/translate" in content
+    # [General] 段必须显式写目标/源语言——不写的话 XUnity 会用自己的默认值
+    # （Language=en, FromLanguage=ja）补齐，一个中文本地化工具的输出会变成
+    # 英文，不是留空就没事（真实复现过的问题，不是假设）。
+    assert "Language=zh-CN" in content
+    assert "FromLanguage=ja" in content
 
 
 def test_deploy_raises_for_variant_combo_outside_the_known_mapping(tmp_path: Path):
@@ -200,6 +207,25 @@ def test_remove_deletes_pure_additions_and_restores_backed_up_files(tmp_path: Pa
     assert not (game_dir / ".rpg_translator_unity" / "manifest.json").exists()
 
 
+def test_remove_cleans_up_nested_empty_dirs_outside_bepinex(tmp_path: Path):
+    """IL2CPP 变体在游戏根目录还铺了一整棵 dotnet/ 运行时目录（不在
+    BepInEx/ 下）；remove() 删完文件后不该只清理 BepInEx/ 一个固定目录名，
+    其它变体带来的空目录骨架也要清掉。"""
+    resources_root = tmp_path / "resources_root"
+    variant_dir = _make_variant_dir(resources_root, "mono_x64")
+    (variant_dir / "dotnet" / "runtime").mkdir(parents=True)
+    (variant_dir / "dotnet" / "runtime" / "coreclr.dll").write_bytes(b"fake-coreclr")
+    target = _make_target(tmp_path)
+    game_dir = target.exe_path.parent
+
+    deploy(target, shim_port=1, resources_root=resources_root)
+    assert (game_dir / "dotnet" / "runtime" / "coreclr.dll").is_file()
+
+    remove(game_dir)
+
+    assert not (game_dir / "dotnet").exists()
+
+
 def test_remove_without_prior_deploy_is_a_noop(tmp_path: Path):
     game_dir = tmp_path / "Game"
     game_dir.mkdir()
@@ -208,6 +234,69 @@ def test_remove_without_prior_deploy_is_a_noop(tmp_path: Path):
 
     assert result.removed == []
     assert result.restored == []
+
+
+def test_remove_recovers_from_mid_loop_failure_without_corrupting_already_restored_files(
+    tmp_path: Path, monkeypatch
+):
+    """remove() 中途失败（最现实的场景：用户没关游戏就点卸载，某个文件被游戏
+    进程锁住报 PermissionError）之后重新跑一遍，不该把已经在第一次调用里成功
+    还原的原始文件，误判成"备份没了、当纯新增文件"删掉。"""
+    resources_root = tmp_path / "resources_root"
+    _make_variant_dir(resources_root, "mono_x64")
+    target = _make_target(tmp_path)
+    game_dir = target.exe_path.parent
+    (game_dir / "winhttp.dll").write_bytes(b"original-winhttp")
+    (game_dir / "doorstop_config.ini").write_text("original-doorstop", encoding="utf-8")
+
+    deploy(target, shim_port=1, resources_root=resources_root)
+
+    import rpg_translator.unity.deploy as deploy_module
+
+    real_copy2 = shutil.copy2
+    call_count = {"n": 0}
+
+    def flaky_copy2(src, dst, *a, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise PermissionError("simulated: file locked by running game")
+        return real_copy2(src, dst, *a, **kw)
+
+    monkeypatch.setattr(deploy_module.shutil, "copy2", flaky_copy2)
+    with pytest.raises(PermissionError):
+        remove(game_dir)
+    monkeypatch.undo()  # 模拟"用户关掉游戏后重新点卸载"，这次不再故障注入
+
+    remove(game_dir)
+
+    assert (game_dir / "winhttp.dll").read_bytes() == b"original-winhttp"
+    assert (game_dir / "doorstop_config.ini").read_text(encoding="utf-8") == "original-doorstop"
+
+
+def test_remove_rejects_manifest_paths_that_escape_game_dir(tmp_path: Path):
+    """manifest.json 是 remove() 唯一的操作依据，而它就摆在游戏目录里——如果
+    游戏来源不可信（比如下载的游戏压缩包里预置了一份精心构造的
+    manifest.json），未经校验直接拼接会被 "../.." 带出 game_dir 之外，造成
+    任意文件删除。这里手动构造一份带越界路径的 manifest 模拟这个场景。"""
+    resources_root = tmp_path / "resources_root"
+    _make_variant_dir(resources_root, "mono_x64")
+    target = _make_target(tmp_path)
+    game_dir = target.exe_path.parent
+
+    deploy(target, shim_port=1, resources_root=resources_root)
+
+    outside_marker = tmp_path / "outside_marker.txt"
+    outside_marker.write_text("should not be touched", encoding="utf-8")
+    manifest_path = game_dir / ".rpg_translator_unity" / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"deployed_files": ["../outside_marker.txt", "winhttp.dll"]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = remove(game_dir)
+
+    assert outside_marker.read_text(encoding="utf-8") == "should not be touched"
+    assert "winhttp.dll" in result.removed
 
 
 def test_deploy_then_remove_round_trip_leaves_game_dir_as_before(tmp_path: Path):

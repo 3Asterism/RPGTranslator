@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 
 from rpg_translator.unity.detect import UnityTarget
+
+logger = logging.getLogger(__name__)
 
 _BACKUP_DIR_NAME = ".rpg_translator_backup"
 _STATE_DIR_NAME = ".rpg_translator_unity"
@@ -81,9 +84,20 @@ def _write_config(config_path: Path, shim_port: int) -> None:
     """BepInEx/config/AutoTranslatorConfig.ini 是社区广泛验证过的实际路径，
     但没有被 XUnity 第一方 README 逐字确认过——第一次真机部署要单独验证 XUnity
     启动时是读取这份已存在的 ini 还是会用默认值覆盖它（见设计文档"实测拉取后
-    确认的几个点"）。"""
+    确认的几个点"）。
+
+    [General] 段必须显式写 Language/FromLanguage——不写的话 XUnity 会用它自己
+    的默认值补齐（Language=en, FromLanguage=ja），亦即 shim 收到的请求会是
+    "把日文翻译成英文"，一个中文本地化工具的输出会是英文，不是留空就没事。
+    源语言先固定 ja（跟 translate_shim.py 在 XUnity 完全不传 from 参数时的兜底
+    默认值保持一致），英文源 Unity 游戏要翻译的话目前得手改这份 ini，第一版
+    暂不做语言选择 UI。"""
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
+        "[General]\n"
+        "Language=zh-CN\n"
+        "FromLanguage=ja\n"
+        "\n"
         "[Service]\n"
         "Endpoint=CustomTranslate\n"
         "\n"
@@ -174,6 +188,47 @@ def _cleanup_empty_dirs(path: Path) -> None:
         path.rmdir()
 
 
+def _cleanup_empty_dirs_upward(start: Path, stop_at: Path) -> None:
+    """从 start 逐级往上删空目录，直到 stop_at（不含）或遇到非空目录为止。用来
+    清掉 remove() 删完文件后留下的空目录骨架——不止 BepInEx/，IL2CPP 变体在
+    game_dir 根下还铺了一整棵 dotnet/ 运行时目录，硬编码清理单个固定目录名
+    覆盖不到。"""
+    stop_at = stop_at.resolve()
+    current = start.resolve()
+    while current != stop_at and current.is_relative_to(stop_at):
+        if not current.is_dir() or any(current.iterdir()):
+            return
+        current.rmdir()
+        current = current.parent
+
+
+def _is_safe_relative_path(rel: str, game_dir: Path) -> bool:
+    """manifest.json 里的相对路径在拼进 game_dir 之前必须校验：这份文件是
+    remove() 唯一的操作依据，而它就摆在游戏目录里——如果游戏来源不可信（比如
+    下载的游戏压缩包里预置了一份精心构造的 manifest.json），未经校验直接拼接
+    会被 "../../.." 或绝对路径带出 game_dir 之外，造成任意文件删除/覆写。"""
+    candidate = Path(rel)
+    if candidate.is_absolute():
+        return False
+    try:
+        resolved = (game_dir / candidate).resolve()
+        resolved.relative_to(game_dir)
+    except ValueError:
+        return False
+    return True
+
+
+def _rewrite_manifest(manifest_path: Path, remaining: list[str]) -> None:
+    """remove() 每处理完一条就重写一次 manifest，只保留还没处理的条目——这样
+    中途失败（最现实的场景：用户没关游戏就点卸载，winhttp.dll 被进程锁住报
+    PermissionError）重新跑一遍时，manifest 反映的是"真正还剩下什么没处理"，
+    不会把已经处理过的条目重新走一遍。"""
+    manifest_path.write_text(
+        json.dumps({"deployed_files": remaining}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def remove(game_dir: Path) -> RemoveResult:
     manifest_path = _manifest_path(game_dir)
     if not manifest_path.is_file():
@@ -181,26 +236,43 @@ def remove(game_dir: Path) -> RemoveResult:
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     backup_dir = _backup_dir(game_dir)
+    game_dir_resolved = game_dir.resolve()
 
     removed: list[str] = []
     restored: list[str] = []
-    for rel in manifest.get("deployed_files", []):
+    touched_parents: set[Path] = set()
+    remaining = list(manifest.get("deployed_files", []))
+
+    while remaining:
+        rel = remaining[0]
+        if not _is_safe_relative_path(rel, game_dir_resolved):
+            logger.warning("Unity mod manifest 里有非法路径，跳过：%r", rel)
+            remaining.pop(0)
+            _rewrite_manifest(manifest_path, remaining)
+            continue
+
         dest = game_dir / rel
         backup_src = backup_dir / rel
         if backup_src.is_file():
             dest.parent.mkdir(parents=True, exist_ok=True)
             _ensure_writable(dest)
             shutil.copy2(backup_src, dest)
-            _ensure_writable(backup_src)
-            backup_src.unlink()
             restored.append(rel)
+            # 不在这里删 backup_src——中途失败重跑时它还在，才能正确判断"这条
+            # 该走还原分支"，不会被误判成"备份没了，当纯新增文件删掉"（这条
+            # 恰恰是刚还原回去的游戏原始文件，见 I1 类问题的修复说明）。整个
+            # 循环全部处理完之后再一次性清掉整个 backup_dir。
         elif dest.is_file():
             _ensure_writable(dest)
             dest.unlink()
             removed.append(rel)
+        touched_parents.add(dest.parent)
+        remaining.pop(0)
+        _rewrite_manifest(manifest_path, remaining)
 
-    manifest_path.unlink()
-    _cleanup_empty_dirs(game_dir / "BepInEx")
-    _cleanup_empty_dirs(backup_dir)
+    manifest_path.unlink(missing_ok=True)
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    for parent in touched_parents:
+        _cleanup_empty_dirs_upward(parent, game_dir_resolved)
     _cleanup_empty_dirs(_state_dir(game_dir))
     return RemoveResult(removed=removed, restored=restored)
