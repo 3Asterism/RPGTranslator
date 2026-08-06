@@ -435,6 +435,75 @@ def test_export_translation_package_prompts_for_name_and_writes_file(
     assert (dest_dir / "我的游戏.rpgtrans.json").is_file()
 
 
+def test_reset_translations_button_clears_progress_after_confirmation(
+    qapp, tmp_path: Path, mz_project: Path, monkeypatch
+):
+    """「重新翻译」按钮：确认对话框点「是」之后，应该把已翻译内容清空打回 pending，
+    并尝试重新拉起翻译（这里没配置 API Key，走到 _on_start_clicked 的警告分支就
+    返回，不需要真的起线程/联网——测试关注的是重置这一步本身生效了）。"""
+    from rpg_translator.core.pipeline import run_extract
+    from rpg_translator.core.store import Store
+
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        units = store.list_units()
+        for unit in units:
+            store.update_translation(unit.id, f"[译]{unit.source_text}", status="translated")
+        store.set_memory("dummy-hash", "dummy-source", "dummy-译文")
+        store.commit()
+
+    window = MainWindow()
+    window._project_dir = mz_project
+    window._db_path = db_path
+    window._inject_button.setEnabled(True)
+
+    monkeypatch.setattr(
+        "rpg_translator.gui.main_window.QMessageBox.question",
+        lambda *a, **k: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr("rpg_translator.gui.main_window.QMessageBox.warning", lambda *a, **k: None)
+    monkeypatch.setattr("rpg_translator.gui.main_window.get_deepseek_api_key", lambda: None)
+
+    window._on_reset_translations_clicked()
+
+    assert window._inject_button.isEnabled() is False
+    with Store(db_path) as store:
+        for unit in store.list_units():
+            assert unit.status == "pending"
+            assert unit.translated_text is None
+        assert store.get_memory("dummy-hash") is None
+
+
+def test_reset_translations_button_asks_for_confirmation_and_aborts_on_no(
+    qapp, tmp_path: Path, mz_project: Path, monkeypatch
+):
+    """点「否」不该动数据库——确认对话框必须是真正的门槛，不是摆设。"""
+    from rpg_translator.core.pipeline import run_extract
+    from rpg_translator.core.store import Store
+
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        unit = store.list_units()[0]
+        store.update_translation(unit.id, "译文", status="translated")
+
+    window = MainWindow()
+    window._project_dir = mz_project
+    window._db_path = db_path
+
+    monkeypatch.setattr(
+        "rpg_translator.gui.main_window.QMessageBox.question",
+        lambda *a, **k: QMessageBox.StandardButton.No,
+    )
+
+    window._on_reset_translations_clicked()
+
+    with Store(db_path) as store:
+        translated = store.list_units(status="translated")
+        assert len(translated) == 1
+
+
 def test_export_mtool_json_button_writes_manual_trans_file(
     qapp, tmp_path: Path, mz_project: Path, monkeypatch
 ):

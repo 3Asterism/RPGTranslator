@@ -32,6 +32,7 @@ from rpg_translator.core.pipeline import (
     export_mtool_json,
     export_translation_package,
     has_language_variant,
+    reset_translations,
 )
 from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.gui.settings_dialog import (
@@ -409,10 +410,19 @@ class MainWindow(QMainWindow):
         self._retry_failed_button.setVisible(False)
         self._retry_failed_button.clicked.connect(self._on_retry_failed_clicked)
 
+        self._reset_translation_button = QPushButton("重新翻译")
+        self._reset_translation_button.setObjectName("secondaryButton")
+        self._reset_translation_button.setToolTip(
+            "上一版翻译质量不行？清空已翻译内容和缓存，整体重新翻译一遍"
+            "（不是续译——正常「开始翻译」默认只翻 pending 条目、命中缓存）。"
+        )
+        self._reset_translation_button.clicked.connect(self._on_reset_translations_clicked)
+
         start_row = QHBoxLayout()
         start_row.addWidget(self._start_button)
         start_row.addWidget(self._stop_button)
         start_row.addWidget(self._retry_failed_button)
+        start_row.addWidget(self._reset_translation_button)
         start_row.addStretch(1)
 
         self._progress_bar = QProgressBar()
@@ -956,6 +966,47 @@ class MainWindow(QMainWindow):
         提取（工程文本也没变）。"""
         self._log_message("重试失败项…")
         self._start_translate_worker()
+
+    def _on_reset_translations_clicked(self) -> None:
+        """整体推倒重来：正常「开始翻译」只翻 status="pending" 的条目、优先命中翻译
+        记忆缓存（见 core/pipeline.run_translate），是刻意设计的续译行为，但用户发现
+        上一版译文质量不行（比如中途换了模型/改了 prompt 设置）时，没有强制忽略
+        已有译文和缓存、重新过一遍模型的入口——这个按钮就是补这个口子。清空+重置是
+        纯本地 sqlite 操作（UPDATE + DELETE，没有逐行构造 TextUnit），几万行量级下
+        也是毫秒到百毫秒级，跟「导出翻译包」一样直接同步跑在这里，不用专门起线程。"""
+        if self._project_dir is None or self._db_path is None:
+            QMessageBox.warning(self, "还没有选择工程", "请先拖入工程并跑一遍翻译。")
+            return
+        if self._any_worker_running():
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还有任务在跑，会跟重置同时读写数据库，请等它跑完或点「停止」后再重置。",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "重新翻译",
+            "会清空当前工程已翻译的内容和翻译缓存，把这些条目重新打回待翻译状态，"
+            "然后重新调用模型整体翻译一遍。\n\n"
+            "只影响本地数据库，不会动游戏文件本身（除非你之后再点「注入到游戏」）；"
+            "但已经翻译好的内容会被清掉，需要重新消耗 API 调用/token。确定继续吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            count = reset_translations(self._db_path)
+        except Exception as e:
+            QMessageBox.critical(self, "重置失败", str(e))
+            return
+
+        self._log_message(f"已重置 {count} 条已翻译内容，重新开始翻译…")
+        self._inject_button.setEnabled(False)
+        self._retry_failed_button.setVisible(False)
+        self._on_start_clicked()
 
     def _ensure_worker_stopped(self, worker: QThread | None) -> bool:
         """在把 self._xxx_worker 指向一个新线程、丢掉旧引用之前，确保旧线程真的已经

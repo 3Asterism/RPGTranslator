@@ -335,6 +335,15 @@ def prune_stale_units(project_dir: Path, db_path: Path) -> int:
     return deleted
 
 
+def reset_translations(db_path: Path) -> int:
+    """把 db_path 对应工程里所有已翻译内容重置为待翻译状态，并清空翻译记忆缓存——
+    供 GUI「重新翻译」按钮用：正常流程默认续译（只翻 pending 条目，见 run_translate），
+    用户发现当前译文质量不行（比如中途换了模型/改了 prompt）想整体推倒重来时，没有
+    这个入口没法强制已经翻译过的内容重新过一遍模型。返回实际重置的条目数。"""
+    with Store(db_path) as store:
+        return store.reset_translations()
+
+
 def run_qa(db_path: Path, export_path: Path | None) -> list[ConflictRow]:
     with Store(db_path) as store:
         conflicts = find_context_conflicts(store)

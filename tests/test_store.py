@@ -186,3 +186,39 @@ def test_vacuum_does_not_raise_after_delete(tmp_path: Path):
         store.upsert_units([_make_unit("u1"), _make_unit("u2")])
         store.delete_missing({"u1"})
         store.vacuum()  # 只要不抛异常就算通过——VACUUM 本身没有可断言的返回值
+
+
+def test_reset_translations_reverts_translated_units_and_clears_memory(tmp_path: Path):
+    """「重新翻译」按钮的核心行为：已翻译内容打回 pending，且清空翻译记忆缓存——
+    不清缓存的话重置完立刻重新翻译会原样命中旧译文，等于白重置（见
+    translate/batch_translator.translate_units 的 cache_hits 分支）。"""
+    with Store(tmp_path / "units.db") as store:
+        store.upsert_units([_make_unit("u1"), _make_unit("u2", source_text="さようなら")])
+        store.update_translation("u1", "你好", status="translated")
+        store.update_translation("u2", "再见", status="translated")
+        store.set_memory(compute_source_hash("こんにちは"), "こんにちは", "你好")
+        store.commit()
+
+        reset_count = store.reset_translations()
+
+        assert reset_count == 2
+        assert store.get_unit("u1").status == "pending"
+        assert store.get_unit("u1").translated_text is None
+        assert store.get_unit("u2").status == "pending"
+        assert store.get_unit("u2").translated_text is None
+        assert store.get_memory(compute_source_hash("こんにちは")) is None
+
+
+def test_reset_translations_does_not_touch_reviewed_units(tmp_path: Path):
+    """status="reviewed"（人工确认过的翻译）不该被批量重置动到，即使数据模型支持
+    这个状态、目前 GUI 还没有暴露标记入口也一样——语义上"人工确认过"就该是终态。"""
+    with Store(tmp_path / "units.db") as store:
+        store.upsert_units([_make_unit("u1")])
+        store.update_translation("u1", "你好（已确认）", status="reviewed")
+
+        reset_count = store.reset_translations()
+
+        assert reset_count == 0
+        fetched = store.get_unit("u1")
+        assert fetched.status == "reviewed"
+        assert fetched.translated_text == "你好（已确认）"

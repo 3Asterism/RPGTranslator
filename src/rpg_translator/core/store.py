@@ -215,6 +215,27 @@ class Store:
         收缩文件体积，DELETE 之后文件本身不会变小，需要显式 VACUUM 才会真正瘦身。"""
         self._conn.execute("VACUUM")
 
+    def reset_translations(self) -> int:
+        """把所有 status="translated" 的行重置为 pending 并清空译文，同时清空
+        translation_memory 缓存表——供"用户发现上一版翻译质量不行（换了模型/改了
+        设置），想整体推倒重新翻译"这个场景用。只清状态、不清缓存的话，重置完立刻
+        重新翻译，去重分组会在 translate/batch_translator.translate_units 里原样
+        命中 translation_memory 缓存里那份旧译文，等于白重置；translation_memory
+        只存在于当前工程自己的 db 文件里（见 core/pipeline.db_path_for_project，
+        每个工程一份 db），清空它不会影响其它工程。status="reviewed"（人工确认过的
+        翻译，数据模型支持但目前 GUI 还没有暴露标记入口）不受影响。返回实际重置的
+        text_units 行数。"""
+        count = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM text_units WHERE status = 'translated'"
+        ).fetchone()["c"]
+        self._conn.execute(
+            "UPDATE text_units SET translated_text = NULL, status = 'pending' "
+            "WHERE status = 'translated'"
+        )
+        self._conn.execute("DELETE FROM translation_memory")
+        self._conn.commit()
+        return count
+
     def get_memory(self, source_hash: str) -> str | None:
         row = self._conn.execute(
             "SELECT translated_text FROM translation_memory WHERE source_hash = ?",

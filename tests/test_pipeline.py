@@ -13,6 +13,7 @@ from rpg_translator.core.pipeline import (
     has_language_variant,
     import_translation_package,
     prune_stale_units,
+    reset_translations,
     run_extract,
     run_inject,
     switch_language,
@@ -69,6 +70,30 @@ def test_prune_stale_units_removes_rows_missing_from_current_extraction(
         remaining_ids = {u.id for u in store.list_units()}
     assert remaining_ids == original_ids
     assert "stale-leftover-id" not in remaining_ids
+
+
+def test_reset_translations_clears_translated_content_for_retranslation(
+    mz_project: Path, tmp_path: Path
+):
+    """「重新翻译」按钮的入口函数：验证经过 run_extract 走真实工程流程后，已翻译
+    条目能被整体打回 pending，供用户在发现译文质量不行时重新过一遍模型。"""
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        units = store.list_units()
+        for unit in units:
+            store.update_translation(unit.id, f"[译]{unit.source_text}", status="translated")
+        store.set_memory("dummy-hash", "dummy-source", "dummy-译文")
+        store.commit()
+
+    reset_count = reset_translations(db_path)
+
+    assert reset_count == len(units)
+    with Store(db_path) as store:
+        for unit in store.list_units():
+            assert unit.status == "pending"
+            assert unit.translated_text is None
+        assert store.get_memory("dummy-hash") is None
 
 
 def test_export_and_import_translation_package_round_trip(tmp_path: Path, mz_project: Path):
