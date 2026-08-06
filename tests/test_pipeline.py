@@ -8,6 +8,7 @@ from rpg_translator.core.ir import TextUnit
 from rpg_translator.core.pipeline import (
     UnknownEngineError,
     detect_adapter,
+    export_mtool_json,
     export_translation_package,
     has_language_variant,
     import_translation_package,
@@ -125,6 +126,71 @@ def test_import_translation_package_skips_units_with_changed_source_text(
     imported, skipped = import_translation_package(other_db_path, package_path)
     assert imported == 0
     assert skipped == 1
+
+
+def test_export_mtool_json_writes_flat_source_to_translated_mapping(
+    tmp_path: Path, mz_project: Path
+):
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        units = store.list_units()
+        for unit in units:
+            store.update_translation(unit.id, f"[译]{unit.source_text}", status="translated")
+
+    dest_dir = tmp_path / "mtool_out"
+    mtool_path, conflicts = export_mtool_json(db_path, dest_dir)
+
+    assert mtool_path.is_file()
+    assert mtool_path.name == "ManualTransFile.json"
+    assert conflicts == 0
+
+    import json
+
+    mapping = json.loads(mtool_path.read_text(encoding="utf-8"))
+    distinct_sources = {u.source_text for u in units}
+    assert set(mapping.keys()) == distinct_sources
+    for source_text, translated_text in mapping.items():
+        assert translated_text == f"[译]{source_text}"
+
+
+def test_export_mtool_json_keeps_first_translation_on_duplicate_source_text(
+    tmp_path: Path, mz_project: Path
+):
+    """MTool 的 key 是原文本身，本项目按 locator 允许同一句原文在不同位置有不同
+    译文——导出成 MTool 格式时这类冲突没法保留，只能留一个，这里验证保留的是
+    第一次出现的译文，并且冲突数被如实报出来（不是静默丢数据）。"""
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        units = store.list_units()
+        assert len(units) >= 2, "fixture 至少要有两条文本才能模拟同原文不同译文"
+        first, second = units[0], units[1]
+
+        # 强制构造"同一原文、不同译文"的冲突场景：把第二个单元的 source_text 改成
+        # 和第一个一样，再各自给不同译文。
+        from rpg_translator.core.ir import TextUnit
+
+        forced_second = TextUnit(
+            id=second.id,
+            engine=second.engine,
+            file_path=second.file_path,
+            locator=second.locator,
+            context=second.context,
+            source_text=first.source_text,
+        )
+        store.upsert_units([forced_second])
+        store.update_translation(first.id, "译文A", status="translated")
+        store.update_translation(second.id, "译文B", status="translated")
+        store.commit()
+
+    mtool_path, conflicts = export_mtool_json(db_path, tmp_path / "mtool_out")
+
+    import json
+
+    mapping = json.loads(mtool_path.read_text(encoding="utf-8"))
+    assert conflicts == 1
+    assert mapping[first.source_text] == "译文A"
 
 
 def test_switch_language_toggles_output_dir_between_original_and_translated(

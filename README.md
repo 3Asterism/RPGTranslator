@@ -4,57 +4,84 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![GUI](https://img.shields.io/badge/GUI-PySide6-41CD52?logo=qt&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
+[![Release](https://img.shields.io/github/v/release/3Asterism/RPGTranslator?include_prereleases&label=release&color=success)](../../releases)
 
-**RPG Maker / WOLF RPG エディター 游戏文本提取 → DeepSeek 翻译 → 回填工具。**
-把游戏文件夹拖进窗口，一键提取文本、调用 DeepSeek API 翻译、回填出一份可直接运行的
-汉化版拷贝——**不改动原工程**，随时能切回原文对照。
+**RPG Maker / WOLF RPG エディター 游戏文本提取 → AI 翻译 → 回填工具。**
+把游戏文件夹拖进窗口，一键提取文本、调用 LLM 翻译、原地写回游戏工程本身——注入前
+自动备份原文版本，随时能用「切换为原文 / 切换为译文」中日对照，不用另外拷贝一份
+汉化目录。
 
 体验类似 MTool，但翻译记忆更细：相同原文默认复用同一个译名，QA 阶段会单独把"同一句话
 在不同语境下可能需要不同译法"的情况挑出来，而不是无脑全局替换。
 
----
+<p align="center">
+  <img src="docs/screenshots/main-window.png" alt="RPG Translator 主界面" width="640">
+</p>
 
-## 支持引擎
+<details>
+<summary><b>目录</b></summary>
+
+- [核心特性](#-核心特性)
+- [支持引擎](#-支持引擎)
+- [快速开始](#-快速开始)
+- [配置翻译引擎：在线 API / 本地模型](#️-配置翻译引擎在线-api--本地模型)
+- [开发者向：CLI / 测试 / 打包](#‍-开发者向cli--测试--打包)
+- [已知局限](#️-已知局限)
+- [技术栈](#-技术栈)
+- [License](#license)
+
+</details>
+
+## ✨ 核心特性
+
+**翻译质量与一致性**
+- **控制码保护**：`\C[n]` `\N[n]` `\V[n]` 等变量/颜色码翻译前转义成占位符，翻译后精确
+  还原并校验完整性；`\n<角色名>正文` 这种说话人标记写法（部分工程的约定）会把角色名
+  和正文拆开分别翻译再拼回去，模型全程看不到尖括号，从根上避免"该不该保留这段标记"
+  的判断失误
+- **翻译记忆去重**：相同原文只调用一次 API，兼顾效率和一致性
+- **QA 一致性扫描**：同一原文在不同语境下可能需要不同译法的情况，单独导出成待复核列表
+
+**稳定与效率**
+- **断点续传**：中途手动停止或进程被杀，重开软件继续跑，已翻译内容不会被打回重译
+- **翻译失败自动重试**：单条翻译失败不拖累整批，失败条目保留待译状态；一轮翻译跑完后
+  自动原地重试 2 轮（间隔 5 秒），仍失败的可以点「重试失败项」按钮直接重跑（不用重新
+  走一遍提取）
+- **多 provider 故障转移**：主 provider 连续报错（限流/5xx）自动切换备用 provider，
+  重试用指数退避
+- **限流自适应退避**：撞到 429 时同一 provider 上所有并发请求共享一个冷却窗口（优先读
+  `Retry-After`，否则按连续命中次数指数退避），避免各自独立重试反复冲撞同一个限流窗口
+- **并发限流 + 批量打包请求**：省时间也省 token（配合 DeepSeek 的 prompt caching），
+  批量大小可在设置面板调整
+
+**工作流**
+- **原文/译文一键切换**：翻译效果有问题时先切回原文核对，不用重新跑一遍注入
+- **翻译包分享**：导出成一份轻量 `.rpgtrans.json`，同一版本游戏的其他人可以直接导入
+  复用，不用重新花 API 额度；也支持导出 MTool 格式（`ManualTransFile.json`）
+- **单文件 exe 自动解包**：拖进来的游戏是 Enigma Virtual Box 打包的单文件 exe（找不到
+  散落的 `www/data`）时自动解包再识别，不用先手动找工具解包
+
+## 🎮 支持引擎
 
 | 引擎 | 状态 | 备注 |
 |---|---|---|
 | RPG Maker MV / MZ | ✅ 完整支持 | 明文 JSON，已用真实工程校准过事件指令编码表 |
-| RPG Maker VX Ace | ✅ 完整支持 | Ruby Marshal 二进制，含消息框运行时像素级动态换行补丁（spec 9.2.b，见下方"已知局限"）；数据库/事件文本抽取已用真实工程验证过 |
-| RPG Maker XP | ✅ 完整支持 | 已用真实 XP 工程（GitHub 上的 GPL-3.0 同人游戏 torresflo/Pokemon-Obsidian）验证并修复两个真机才暴露的 bug（见下方"已知局限"） |
-| RPG Maker VX | ✅ 完整支持 | 和 XP 共用一套适配器代码；已用真实 VX 工程（GitHub 上的开源同人游戏 ambratolm-games/flower-in-pain）验证并修复一个 Ruby Marshal 写入库的对象引用 bug（见下方"已知局限"） |
+| RPG Maker VX Ace | ✅ 完整支持 | Ruby Marshal 二进制，含消息框运行时像素级动态换行补丁（spec 9.2.b，见下方[已知局限](#️-已知局限)）；数据库/事件文本抽取已用真实工程验证过 |
+| RPG Maker XP | ✅ 完整支持 | 已用真实 XP 工程（GitHub 上的 GPL-3.0 同人游戏 torresflo/Pokemon-Obsidian）验证并修复两个真机才暴露的 bug（见下方[已知局限](#️-已知局限)） |
+| RPG Maker VX | ✅ 完整支持 | 和 XP 共用一套适配器代码；已用真实 VX 工程（GitHub 上的开源同人游戏 ambratolm-games/flower-in-pain）验证并修复一个 Ruby Marshal 写入库的对象引用 bug（见下方[已知局限](#️-已知局限)） |
 | WOLF RPG エディター（ウディタ） | ✅ 完整支持 | 已用 WOLF RPG Editor 官方自带示例工程验证过（Map/CommonEvent/Database 三种文件全覆盖，含当前编辑器版本默认的 LZ4 压缩格式）；仍不支持 WolfPro 加密保护和经典 XOR 加密的工程 |
 | RPG Maker 2000/2003 | ❌ 不支持 | 完全不同的格式，明确排除在范围外 |
 
-**拖进来的是单文件 exe、没有散落的工程文件？** 不少 RPG Maker MV/MZ 游戏用
-[Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html) 把 `www` 资源目录和
-nw.js 运行时整个打包进一个 exe 里分发（磁盘上找不到 `www/data`，只有孤零零一个几百 MB
-到几 GB 的 exe）。拖进这类文件夹时，如果正常识别失败、又在顶层找到一个这样打包的 exe，
-会自动解包到同级的 `<原目录名>_已解包` 目录（体积大的话要等一会），解包完自动重新识别
-引擎——不挑具体是 MV/MZ 还是 VX Ace/XP/VX/WOLF，解包这一步和引擎种类无关，识别哪种引擎
-交给解包完之后的正常识别流程。
+> **拖进来的是单文件 exe、没有散落的工程文件？** 不少 RPG Maker MV/MZ 游戏用
+> [Enigma Virtual Box](https://enigmaprotector.com/en/aboutvb.html) 把 `www` 资源目录和
+> nw.js 运行时整个打包进一个 exe 里分发（磁盘上找不到 `www/data`，只有孤零零一个几百 MB
+> 到几 GB 的 exe）。拖进这类文件夹时，如果正常识别失败、又在顶层找到一个这样打包的 exe，
+> 会自动解包到同级的 `<原目录名>_已解包` 目录（体积大的话要等一会），解包完自动重新识别
+> 引擎——不挑具体是 MV/MZ 还是 VX Ace/XP/VX/WOLF，解包这一步和引擎种类无关。
 
-## 功能
+## 🚀 快速开始
 
-- **控制码保护**：`\C[n]` `\N[n]` `\V[n]` 等变量/颜色码翻译前转义成占位符，翻译后精确还原并校验完整性；
-  `\n<角色名>正文` 这种说话人标记写法（部分工程的约定）会把角色名和正文拆开分别翻译再拼回去，模型全程
-  看不到尖括号，从根上避免"该不该保留这段标记"的判断失误
-- **翻译记忆去重**：相同原文只调用一次 API，兼顾效率和一致性
-- **断点续传**：中途手动停止或进程被杀，重开软件继续跑，已翻译内容不会被打回重译
-- **翻译失败自动重试**：单条翻译失败不拖累整批，失败条目保留待译状态；一轮翻译跑完后自动原地重试
-  2 轮（间隔 5 秒），仍失败的可以点「重试失败项」按钮直接重跑（不用重新走一遍提取）
-- **多 provider 故障转移**：主 provider 连续报错（限流/5xx）自动切换备用 provider，重试用指数退避
-- **QA 一致性扫描**：同一原文在不同语境下可能需要不同译法的情况，单独导出成待复核列表
-- **原文/译文一键切换**：翻译效果有问题时先切回原文核对，不用重新跑一遍注入
-- **翻译包分享**：导出成一份轻量 `.rpgtrans.json`，同一版本游戏的其他人可以直接导入复用，不用重新花 API 额度
-- **并发限流 + 批量打包请求**：省时间也省 token（配合 DeepSeek 的 prompt caching），批量大小可在设置面板调整
-- **限流自适应退避**：撞到 429 时同一 provider 上所有并发请求共享一个冷却窗口（优先读 `Retry-After`，
-  否则按连续命中次数指数退避），避免各自独立重试反复冲撞同一个限流窗口
-- **单文件 exe 自动解包**：拖进来的游戏是 Enigma Virtual Box 打包的单文件 exe（找不到散落的
-  `www/data`）时自动解包再识别，不用先手动找工具解包
-
-## 快速开始
-
-需要 Python 3.11+。
+已打包好的 Windows 版本直接看 [Releases](../../releases)，免装 Python。从源码跑：
 
 ```bash
 python -m venv .venv
@@ -76,15 +103,21 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 .venv\Scripts\rpg-translator-gui.exe
 ```
 
-**流程**：拖入游戏文件夹（或 `Game.exe`）→ 自动识别引擎 → 点「开始翻译」→ 翻译跑在后台，
-随时可以点「停止」；有条目翻译失败会自动重试几轮，还失败的可以点「重试失败项」再跑一次 →
-点「注入到游戏」写回一份新的汉化拷贝，原工程不受影响 → 用「切换为
-原文 / 切换为译文」中日对照，或者「导出翻译包」分享给同游戏的其他人。API Key 等设置在窗口
-右上角的「⚙ 设置」按钮里。
+### 使用流程
 
-已打包好的 Windows 版本见 [Releases](../../releases)。
+1. **拖入游戏文件夹**（或 `Game.exe`）→ 自动识别引擎
+2. 点「开始翻译」→ 翻译跑在后台，随时可以点「停止」；有条目翻译失败会自动重试几轮，
+   还失败的可以点「重试失败项」再跑一次
+3. 点「注入到游戏」→ 原地写回游戏工程（注入前自动备份原文版本）
+4. 用「切换为原文 / 切换为译文」中日对照，或者「导出翻译包」分享给同游戏的其他人
 
-## 配置翻译引擎：在线 API / 本地模型
+API Key、并发数、批量大小等设置在窗口右上角的「⚙ 设置」按钮里。
+
+## ⚙️ 配置翻译引擎：在线 API / 本地模型
+
+<p align="center">
+  <img src="docs/screenshots/settings-dialog.png" alt="设置面板" width="420">
+</p>
 
 设置面板（右上角「⚙ 设置」）里第一项「翻译引擎」可以在两者之间切换，选中哪个就用哪个，
 互不干扰、可以随时切回去，各自的配置分开存（在线走 `.env`/系统凭据管理器，本地模型同理）。
@@ -110,7 +143,8 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 「备用 Provider」（可选）：主 provider 连续报错（限流/5xx）时自动切过去，三个字段都留空
 就是不启用，行为和以前一样。
 
-### 本地模型（比如 Ollama 部署的 Sakura）
+<details>
+<summary><b>本地模型（比如 Ollama 部署的 Sakura）——点击展开部署步骤</b></summary>
 
 适合有独立显卡（实测 12GB 显存能跑得动 7B 量化模型）、想完全离线翻译、或者不想为翻译付
 API 费用的场景。走的是专门适配过 [SakuraLLM/GalTransl](https://github.com/SakuraLLM/SakuraLLM)
@@ -142,7 +176,30 @@ API 费用的场景。走的是专门适配过 [SakuraLLM/GalTransl](https://git
 已知局限：本地小模型批量打包翻译时偶尔会输出行数对不上（自动退化成逐条重试，不会丢译文，
 只是变慢）；人名等专有名词的音译一致性不如在线大模型稳定（没有项目级术语表约束）。
 
-## CLI（开发调试用，不是给最终用户的主入口）
+</details>
+
+<details>
+<summary><b>完全版：内置本地模型，免部署——点击展开</b></summary>
+
+不想自己装 Ollama、下模型的话，[Releases](../../releases) 里的"完全版"（`RPGTranslator-full-*`，
+分卷压缩包，需要 NVIDIA 显卡）已经内置了 CUDA 版 llama.cpp 引擎和
+[SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF](https://huggingface.co/SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF)
+（q6k 量化）模型文件。设置面板切到「本地模型」、Base URL/模型名留空，点「开始翻译」会自动
+拉起内置引擎（首次加载模型进显存要等几十秒），不用手动配置。仍然可以手填 Base URL 指向别处
+部署的服务，填了就优先用手填的地址，不会被内置引擎抢占。
+
+内置的模型文件遵循 [CC-BY-NC-SA-4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 协议
+（署名-非商业性使用-相同方式共享），由 [SakuraLLM](https://github.com/SakuraLLM) 训练发布，
+本项目本身免费非商用分发。
+
+</details>
+
+## 🧑‍💻 开发者向：CLI / 测试 / 打包
+
+<details>
+<summary>点击展开（面向贡献者，普通用户直接用 GUI 即可）</summary>
+
+### CLI（开发调试用，不是给最终用户的主入口）
 
 ```bash
 rpg-translator extract   <项目目录> --out units.db
@@ -152,7 +209,7 @@ rpg-translator inject    --db units.db --project <项目目录> --out <输出目
 rpg-translator run       <项目目录> --out <输出目录>
 ```
 
-## 测试
+### 测试
 
 ```bash
 .venv\Scripts\pytest
@@ -160,7 +217,7 @@ rpg-translator run       <项目目录> --out <输出目录>
 
 部分测试会真实调用配置好的 LLM API，本地没配 `DEEPSEEK_API_KEY` 时自动跳过，不会失败。
 
-## 打包
+### 打包
 
 ```bash
 .venv\Scripts\python scripts\build.py
@@ -169,7 +226,31 @@ rpg-translator run       <项目目录> --out <输出目录>
 产出 `dist/RPGTranslator/`（PyInstaller `--onedir` 模式）。目前只在开发机上验证过启动，
 还没在没装 Python 的干净 Windows 环境里实测过，分发前建议自行确认一遍。
 
-## 已知局限
+#### 完全版（内置 CUDA 引擎 + 模型）
+
+```bash
+.venv\Scripts\python scripts\build_full.py
+```
+
+在上面精简版的基础上，额外下载 llama.cpp 官方预编译 CUDA 二进制和 Sakura GGUF 模型文件
+（合计 10GB+，第一次跑视网络情况要一段时间），组装进 `dist/RPGTranslator/resources/local_engine/`，
+再 7z 分卷打包成 `dist/RPGTranslator-full-v<version>.7z.001`、`.002`……（单卷不超过 1900MB，
+过 GitHub Release 单文件 2GB 的上限）。不在 CI/自动化测试里跑，是发布前手动跑一次的操作；
+`scripts/build_full.py` 顶部的版本号/校验值常量需要人工确认过新 build 能正常跑起来才能更新。
+
+下载支持断点续传 + 失败重试 + 本地缓存命中跳过，`--work-dir`（默认
+`dist/_build_full_cache`）下已经下过的文件重跑脚本不会重新拉一遍，除非加
+`--force-redownload`。大陆网络访问 GitHub Release/HuggingFace 经常不稳，可以配合：
+`HTTPS_PROXY`/`HTTP_PROXY`（httpx 默认读，配了系统代理不用改代码）、
+`LLAMA_CPP_RELEASE_BASE_URL`（替换成自建反代/镜像前缀）、
+`HF_ENDPOINT`（替换 HuggingFace 域名，比如 `https://hf-mirror.com`）。
+
+</details>
+
+## ⚠️ 已知局限
+
+<details>
+<summary>点击展开（引擎实现细节，普通用户可以跳过）</summary>
 
 - **RGSS 引擎（VX Ace/XP/VX）共用的 Ruby Marshal 写入库有一个真机才暴露的对象引用 bug，已
   修复**：真实 XP/VX 工程（分别是 GitHub 上的 torresflo/Pokemon-Obsidian、
@@ -196,18 +277,20 @@ rpg-translator run       <项目目录> --out <输出目录>
   Map/CommonEvent/Database 三种文件（含当前编辑器版本默认的 LZ4 压缩格式、v3.5 版本的
   Page/Command 结构变化），仍明确不支持 WolfPro 加密保护和经典 XOR 加密的工程，遇到会直接
   报错而不是猜测/静默产出乱码
-- PyInstaller 打包出的 exe 可能被杀毒软件误报，是已知的普遍现象
+- PyInstaller 打包出的 exe 可能被杀毒软件误报，是已知的普遍现象；`scripts/build.py` 已加
+  `--noupx`（UPX 压缩壳是常见诱因之一）降低概率，但没有代码签名证书，不可能彻底消除
 - 单文件 exe 自动解包目前只认 Enigma Virtual Box 这一种打包方式（`evbunpack`），像
   VMProtect/Themida 这类加壳保护、或者把资源塞进 NSIS 安装包里的分发方式不在覆盖范围内，
   遇到这些会照常回退到"未识别到支持的引擎"
 
-完整技术规格、每个里程碑的验收标准、逆向工程来源（WOLF 部分参考了
-[wolftrans](https://github.com/elizagamedev/wolftrans)、
+WOLF 格式的逆向工程来源：[wolftrans](https://github.com/elizagamedev/wolftrans)、
 [WolfTL](https://github.com/Sinflower/WolfTL)、
-[rewolf-trans](https://github.com/KCFindstr/rewolf-trans) 三个社区项目的格式研究成果）都记录在
-[`galgame_rpgmaker_translator_spec (1).md`](<galgame_rpgmaker_translator_spec (1).md>)。
+[rewolf-trans](https://github.com/KCFindstr/rewolf-trans) 三个社区项目的格式研究成果，
+交叉验证后移植（详见 `engines/wolf_binary.py` 顶部注释）。
 
-## 技术栈
+</details>
+
+## 🛠 技术栈
 
 Python 3.11+ · PySide6（GUI） · pydantic v2 · SQLite · httpx（异步） · rubymarshal ·
 typer（CLI） · PyInstaller

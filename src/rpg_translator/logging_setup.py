@@ -64,10 +64,12 @@ def setup_logging() -> Path:
     handler.setFormatter(logging.Formatter(_LOG_FORMAT))
     root.addHandler(handler)
 
-    if sys.stdout is None:
-        sys.stdout = open(log_dir / "console.log", "a", encoding="utf-8")
-    if sys.stderr is None:
-        sys.stderr = open(log_dir / "console.log", "a", encoding="utf-8")
+    if sys.stdout is None or sys.stderr is None:
+        console_log = open(log_dir / "console.log", "a", encoding="utf-8")
+        if sys.stdout is None:
+            sys.stdout = console_log
+        if sys.stderr is None:
+            sys.stderr = console_log
 
     sys.excepthook = _make_excepthook(log_file)
     threading.excepthook = _log_thread_exception

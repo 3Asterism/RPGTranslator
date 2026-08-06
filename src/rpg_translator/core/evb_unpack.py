@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 from pathlib import Path
 
 from evbunpack.const import EVB_MAGIC
@@ -11,6 +12,16 @@ from evbunpack.__main__ import main as _evbunpack_main, search_for_magic
 # （原始 PE 本体 + 两个 .enigma 节），拖进来的可能是几个 GB 的游戏本体，没必要为了
 # 找一个 magic 扫完整个文件；这个窗口对目前见过的 RPG Maker MV/MZ 单文件游戏够用。
 _MAGIC_SEARCH_WINDOW = 256 * 1024 * 1024
+
+# contextlib.redirect_stdout/redirect_stderr 改的是进程全局的 sys.stdout/sys.stderr，
+# Python 官方文档明确标注这两个上下文管理器不是线程安全的——unpack_evb() 在
+# gui/workers.py 的 UnpackWorker 这个独立 QThread 里跑，这把锁至少保证这个项目自己
+# 不会同时跑两个 unpack_evb()（互相用同一份全局 stdout/stderr 抢着换入换出）；管不住
+# 的是解包期间恰好有别的线程直接往 sys.stdout/sys.stderr 写字符（比如某个三方依赖
+# 库自己 print/warnings.warn），那部分输出理论上仍可能被这段重定向影响到——目前代码
+# 路径下没有别的线程会在这个窗口内这么做，这把锁主要是防住"以后允许并发解包"这种
+# 改动引入的自我竞争。
+_unpack_lock = threading.Lock()
 
 
 def is_evb_packed(exe_path: Path) -> bool:
@@ -56,6 +67,7 @@ def unpack_evb(exe_path: Path, out_dir: Path) -> None:
     有用——调用方应该在这个函数返回后，用现有的 detect_adapter() 重新探测 out_dir，
     探测成功才算数。"""
     out_dir.mkdir(parents=True, exist_ok=True)
-    with open(os.devnull, "w", encoding="utf-8") as devnull:
-        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-            _evbunpack_main(str(exe_path), str(out_dir))
+    with _unpack_lock:
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                _evbunpack_main(str(exe_path), str(out_dir))

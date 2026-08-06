@@ -9,10 +9,141 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from rpg_translator.core.evb_unpack import unpack_evb
-from rpg_translator.core.pipeline import run_extract, run_inject, run_translate
+from rpg_translator.core.pipeline import (
+    LanguageVariant,
+    db_path_for_project,
+    import_translation_package,
+    prune_stale_units,
+    run_extract,
+    run_inject,
+    run_translate,
+    switch_language,
+)
+from rpg_translator.core.store import Store
+from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY, PromptStrategy
+from rpg_translator.translate.local_engine import LocalEngineProcess
 
 logger = logging.getLogger(__name__)
+
+
+class ExtractPreviewWorker(QThread):
+    """拖入工程时的预览扫描：只是为了在 UI 上显示"识别到文本约 N 条"和续译进度提示，
+    不落库（真正落库是用户点「开始翻译」时的 ExtractWorker）。之前这一步直接同步跑在
+    _on_path_dropped 里，大工程下 adapter.extract() 本身耗时明显，会让刚拖进来的
+    窗口卡住到看起来像没反应，跟这个项目其它地方"耗时操作不占 GUI 线程"的做法不
+    一致。
+
+    续译进度提示（"已翻译 X/Y"）需要读一遍已有的 units.db——这一步原来是在
+    _on_preview_extract_done 里、扫描线程跑完之后，同步跑在 GUI 线程上的：老工程
+    的 db 可能有几万行，即使只是为了数个数也要挨个构造 TextUnit（含两次 json.loads），
+    真机上这一下能让刚扫完的窗口又卡一截。这里顺路在同一个后台线程里把这一步也做掉，
+    GUI 线程拿到结果时只剩下摆按钮/改文字这类几乎零耗时的操作。"""
+
+    finished_ok = Signal(list, str)  # (list[TextUnit], resume_note)
+    failed = Signal(str)
+
+    def __init__(self, adapter: EngineAdapter, project_dir: Path, db_path: Path, parent=None):
+        super().__init__(parent)
+        self._adapter = adapter
+        self._project_dir = project_dir
+        self._db_path = db_path
+
+    def run(self) -> None:
+        try:
+            units = self._adapter.extract(self._project_dir)
+        except Exception as e:
+            logger.exception("拖入预览扫描失败")
+            self.failed.emit(str(e))
+            return
+        resume_note = self._resume_progress_note(units)
+        self.finished_ok.emit(units, resume_note)
+
+    def _resume_progress_note(self, units: list) -> str:
+        """如果这个工程之前已经翻译过一部分（db 文件存在），返回一句续译进度提示；
+        读取失败（比如上次的 db 文件损坏/被占用）只是锦上添花的提示丢了，不该拦住
+        整个拖拽识别流程，记下日志、退化成空字符串。"""
+        if not self._db_path.is_file():
+            return ""
+        try:
+            with Store(self._db_path) as store:
+                done_ids = store.list_unit_ids(exclude_status="pending")
+        except Exception:
+            logger.exception("读取续译进度失败：%s", self._project_dir)
+            return ""
+        done = sum(1 for u in units if u.id in done_ids)
+        if done == 0:
+            return ""
+        return f"，已翻译 {done}/{len(units)}（点击「开始翻译」续译剩余部分）"
+
+
+class SwitchLanguageWorker(QThread):
+    """在原文/译文两份备份之间切换游戏工程当前生效的文件——涉及按文件挨个 copy2，
+    工程文件多时不是瞬时操作，同样不能占 GUI 线程。"""
+
+    finished_ok = Signal(int)  # 切换的文件数
+    failed = Signal(str)
+
+    def __init__(self, output_dir: Path, variant: LanguageVariant, parent=None):
+        super().__init__(parent)
+        self._output_dir = output_dir
+        self._variant = variant
+
+    def run(self) -> None:
+        try:
+            count = switch_language(self._output_dir, self._variant)
+        except Exception as e:
+            logger.exception("切换语言版本失败")
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(count)
+
+
+class ImportPackageWorker(QThread):
+    """导入翻译包：先在本地重新跑一遍 extract（保证两边算出来的 TextUnit id 对得
+    上），再导入包里的译文——重新 extract 这一步就是 ExtractWorker 单独跑时同样的
+    耗时操作，不能同步跑在 GUI 线程。"""
+
+    finished_ok = Signal(int, int)  # (成功导入, 版本不匹配跳过)
+    failed = Signal(str)
+
+    def __init__(self, project_dir: Path, db_path: Path, package_path: Path, parent=None):
+        super().__init__(parent)
+        self._project_dir = project_dir
+        self._db_path = db_path
+        self._package_path = package_path
+
+    def run(self) -> None:
+        try:
+            run_extract(self._project_dir, self._db_path)
+            imported, skipped = import_translation_package(self._db_path, self._package_path)
+        except Exception as e:
+            logger.exception("导入翻译包失败")
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(imported, skipped)
+
+
+class CleanupDbWorker(QThread):
+    """按当前工程重新扫描一遍文本，删掉数据库里不再对应任何现存文本的历史记录并
+    VACUUM 回收磁盘空间——重新扫描 + VACUUM（整份 db 文件重写）都不是瞬时操作。"""
+
+    finished_ok = Signal(int)  # 删除的历史记录条数
+    failed = Signal(str)
+
+    def __init__(self, project_dir: Path, db_path: Path, parent=None):
+        super().__init__(parent)
+        self._project_dir = project_dir
+        self._db_path = db_path
+
+    def run(self) -> None:
+        try:
+            deleted = prune_stale_units(self._project_dir, self._db_path)
+        except Exception as e:
+            logger.exception("清理数据库失败")
+            self.failed.emit(str(e))
+            return
+        self.finished_ok.emit(deleted)
 
 
 class UnpackWorker(QThread):
@@ -176,6 +307,38 @@ class TranslateWorker(QThread):
             return
         self._flush_log_buffer()
         self.finished_ok.emit(len(translated), failures)
+
+
+class LocalEngineStartWorker(QThread):
+    """拉起内置 llama-server.exe 子进程并等它就绪。模型加载进显存有实打实的
+    耗时（6.25GB 的 q6k 量化，实测几秒到几十秒不等，取决于显卡/磁盘速度），
+    跟其它 Worker 一样不能占 GUI 线程。"""
+
+    finished_ok = Signal(str)  # base_url
+    failed = Signal(str)
+
+    _READY_TIMEOUT_SECONDS = 90.0
+
+    def __init__(self, engine_process: LocalEngineProcess, parent=None):
+        super().__init__(parent)
+        self._engine_process = engine_process
+
+    def run(self) -> None:
+        try:
+            base_url = self._engine_process.start()
+        except Exception as e:
+            logger.exception("内置本地模型子进程启动失败")
+            self.failed.emit(str(e))
+            return
+
+        if not self._engine_process.wait_until_ready(self._READY_TIMEOUT_SECONDS):
+            log_path = self._engine_process.log_path
+            self._engine_process.stop()
+            detail = f"，日志见 {log_path}" if log_path is not None else ""
+            self.failed.emit(f"内置本地模型没能在 {self._READY_TIMEOUT_SECONDS:.0f} 秒内就绪{detail}")
+            return
+
+        self.finished_ok.emit(base_url)
 
 
 class InjectWorker(QThread):

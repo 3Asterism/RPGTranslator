@@ -32,6 +32,10 @@ REGISTERED_ADAPTERS: list[type[EngineAdapter]] = [
 ]
 
 
+def db_path_for_project(project_dir: Path) -> Path:
+    return project_dir / ".rpg_translator" / "units.db"
+
+
 class UnknownEngineError(Exception):
     pass
 
@@ -370,6 +374,33 @@ def export_translation_package(db_path: Path, game_name: str, dest_dir: Path) ->
     package_path = dest_dir / f"{game_name}.rpgtrans.json"
     package_path.write_text(json.dumps(package, ensure_ascii=False, indent=2), encoding="utf-8")
     return package_path
+
+
+def export_mtool_json(
+    db_path: Path, dest_dir: Path, filename: str = "ManualTransFile.json"
+) -> tuple[Path, int]:
+    """导出成 MTool 生态认的扁平 {原文: 译文} 格式，给只想用 MTool 客户端运行时
+    注入（不走本项目 inject 原地写回）的用户多一条路。MTool 的 key 就是原文本身，
+    不带 locator，没法像本项目那样区分"同一句原文在不同位置对应不同译文"——遇到
+    冲突保留第一次出现的译文，返回冲突条数让调用方决定要不要提示用户。"""
+    with Store(db_path) as store:
+        units = store.list_units()
+
+    translated = [u for u in units if u.translated_text is not None]
+
+    mapping: dict[str, str] = {}
+    conflicts = 0
+    for u in translated:
+        if u.source_text in mapping:
+            if mapping[u.source_text] != u.translated_text:
+                conflicts += 1
+            continue
+        mapping[u.source_text] = u.translated_text
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out_path = dest_dir / filename
+    out_path.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path, conflicts
 
 
 def import_translation_package(db_path: Path, package_path: Path) -> tuple[int, int]:

@@ -27,13 +27,11 @@ from rpg_translator.config import get_deepseek_api_key
 from rpg_translator.core.evb_unpack import find_evb_candidate
 from rpg_translator.core.pipeline import (
     UnknownEngineError,
+    db_path_for_project,
     detect_adapter,
+    export_mtool_json,
     export_translation_package,
     has_language_variant,
-    import_translation_package,
-    prune_stale_units,
-    run_extract,
-    switch_language,
 )
 from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.gui.settings_dialog import (
@@ -45,8 +43,24 @@ from rpg_translator.gui.settings_dialog import (
     resolve_fallback_config,
     resolve_local_config,
 )
-from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker, UnpackWorker
+from rpg_translator.gui.workers import (
+    CleanupDbWorker,
+    ExtractPreviewWorker,
+    ExtractWorker,
+    ImportPackageWorker,
+    InjectWorker,
+    LocalEngineStartWorker,
+    SwitchLanguageWorker,
+    TranslateWorker,
+    UnpackWorker,
+)
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY
+from rpg_translator.translate.local_engine import (
+    LOCAL_ENGINE_MODEL_ALIAS,
+    BundledEngine,
+    LocalEngineProcess,
+    find_bundled_engine,
+)
 from rpg_translator.translate.pricing import estimate_cost_cny
 from rpg_translator.translate.sakura_prompt import SAKURA_PROMPT_STRATEGY
 
@@ -229,10 +243,6 @@ def resolve_dropped_path(path: Path) -> Path:
     return path.parent if path.is_file() else path
 
 
-def db_path_for_project(project_dir: Path) -> Path:
-    return project_dir / ".rpg_translator" / "units.db"
-
-
 def _format_duration(seconds: float) -> str:
     seconds = max(0.0, seconds)
     if seconds < 60:
@@ -300,6 +310,19 @@ class MainWindow(QMainWindow):
         self._translate_worker: TranslateWorker | None = None
         self._inject_worker: InjectWorker | None = None
         self._unpack_worker: UnpackWorker | None = None
+        self._preview_worker: ExtractPreviewWorker | None = None
+        self._switch_language_worker: SwitchLanguageWorker | None = None
+        self._import_package_worker: ImportPackageWorker | None = None
+        self._cleanup_db_worker: CleanupDbWorker | None = None
+        self._local_engine_start_worker: LocalEngineStartWorker | None = None
+        # 完全版内置引擎的子进程句柄（精简版下永远是 None）；点「开始翻译」时
+        # 按需创建，一旦起来了后续「重试失败项」复用，不重复加载模型。
+        self._local_engine_process: LocalEngineProcess | None = None
+        # 本次启动内置引擎实际拿到的 base_url（每次启动端口都不同，不写进
+        # QSettings，只在这次运行的进程内存里存着）。
+        self._bundled_local_base_url: str | None = None
+        self._pending_adapter: EngineAdapter | None = None
+        self._pending_switch_variant: str | None = None
         self._WORKER_STOP_TIMEOUT_MS = 5000
 
         # log_message/stage_changed 信号来自后台线程，两个 provider 都报错时高并发
@@ -319,7 +342,14 @@ class MainWindow(QMainWindow):
         self._session_prompt_tokens = 0
         self._session_completion_tokens = 0
         self._session_cost_cny = 0.0
-        self._session_has_unpriced_model = False
+        self._session_has_approx_priced_model = False
+        # 本次会话有没有跑过本地引擎——本地模型跑在用户自己显卡上，没有 API 调用
+        # 费用，这部分 token 不该被计进"预估花费"，也不该被当成"型号未收录定价"
+        # 提示用户去查价目表（那张表本来就不管本地模型）。每次起 TranslateWorker
+        # 时按当前选的引擎刷新（见 _start_translate_worker），反映的是"最近一次
+        # 翻译跑的是哪个引擎"，不是"本次会话曾经用过哪个引擎"的历史并集。
+        self._current_engine_is_local = False
+        self._session_has_local_usage = False
 
         # 翻译速度/剩余时间预估：只在当前这一次 TranslateWorker 运行期间有意义，每次
         # 重新起 worker（首次翻译、重试失败项）都要清空，不能带着上一轮的速度残留。
@@ -452,6 +482,10 @@ class MainWindow(QMainWindow):
         self._import_package_button.setObjectName("secondaryButton")
         self._import_package_button.clicked.connect(self._on_import_package_clicked)
 
+        self._export_mtool_button = QPushButton("导出 MTool 格式…")
+        self._export_mtool_button.setObjectName("secondaryButton")
+        self._export_mtool_button.clicked.connect(self._on_export_mtool_clicked)
+
         self._cleanup_db_button = QPushButton("清理数据库…")
         self._cleanup_db_button.setObjectName("secondaryButton")
         self._cleanup_db_button.clicked.connect(self._on_cleanup_db_clicked)
@@ -461,6 +495,7 @@ class MainWindow(QMainWindow):
         share_row.addWidget(self._switch_translated_button)
         share_row.addWidget(self._export_package_button)
         share_row.addWidget(self._import_package_button)
+        share_row.addWidget(self._export_mtool_button)
         share_row.addWidget(self._cleanup_db_button)
         share_row.addStretch(1)
 
@@ -502,11 +537,14 @@ class MainWindow(QMainWindow):
     def _on_usage_changed(self, model: str, prompt_tokens: int, completion_tokens: int) -> None:
         self._session_prompt_tokens += prompt_tokens
         self._session_completion_tokens += completion_tokens
-        cost = estimate_cost_cny(model, prompt_tokens, completion_tokens)
-        if cost is None:
-            self._session_has_unpriced_model = True
+        if self._current_engine_is_local:
+            # 本地引擎没有 API 调用费用——token 数照记，但不查价目表、不计入花费。
+            self._session_has_local_usage = True
         else:
+            cost, exact = estimate_cost_cny(model, prompt_tokens, completion_tokens)
             self._session_cost_cny += cost
+            if not exact:
+                self._session_has_approx_priced_model = True
         self._refresh_usage_label()
 
     def _refresh_usage_label(self) -> None:
@@ -516,11 +554,51 @@ class MainWindow(QMainWindow):
             f"输出 {self._session_completion_tokens:,}（共 {total:,}） · "
             f"预估花费 ¥{self._session_cost_cny:.2f}"
         )
-        if self._session_has_unpriced_model:
-            text += "（含未知计价模型，费用为部分预估，仅供参考）"
+        notes = []
+        if self._session_has_approx_priced_model:
+            notes.append("部分型号未收录官方定价，按同类模型均价粗略估算")
+        if self._session_has_local_usage:
+            notes.append("含本地模型用量，本地部分不计入费用")
+        if notes:
+            text += f"（{'；'.join(notes)}，仅供参考）"
         self._usage_label.setText(text)
 
-    def _on_path_dropped(self, path: Path) -> None:
+    def _all_workers(self) -> tuple[QThread | None, ...]:
+        return (
+            self._extract_worker,
+            self._translate_worker,
+            self._inject_worker,
+            self._unpack_worker,
+            self._preview_worker,
+            self._switch_language_worker,
+            self._import_package_worker,
+            self._cleanup_db_worker,
+            self._local_engine_start_worker,
+        )
+
+    def _any_worker_running(self) -> bool:
+        return any(worker is not None and worker.isRunning() for worker in self._all_workers())
+
+    def _on_path_dropped(self, path: Path) -> bool:
+        """返回值只表示"这次拖拽有没有识别出受支持的引擎"（同步可知的部分），不
+        代表预览扫描（见 ExtractPreviewWorker）已经跑完——扫描本身是异步的，调用方
+        不该指望这个函数返回时 self._adapter 已经被设置好（见 _on_evb_unpack_done
+        为什么要用这个返回值而不是事后检查 self._adapter）。"""
+        # 翻译/注入/提取/解包 worker 跑在后台线程时，self._project_dir/self._db_path
+        # 会被这些 worker 完成时的回调（_on_translate_done/_on_inject_done 等）用来
+        # 更新按钮状态/提示信息——如果这时候允许拖入新项目覆盖这两个字段，旧 worker
+        # 完成时会误把"新项目还没翻译/注入"的按钮状态改成"可以操作"（比如无条件
+        # setEnabled(True) 的 Inject 按钮），点下去实际操作的是新项目而不是提示里
+        # 说的那个项目，是静默的误操作，不是单纯的提示文字不准。真正在跑的任务只有
+        # 跑完/取消后才会清空这些字段（各 worker 自己的完成/失败回调没有清空引用，
+        # isRunning() 已经能区分"跑完"和"还在跑"，不需要额外状态位）——拒绝这次拖拽
+        # 比默默覆盖更安全，用户等旧任务跑完/停止后重新拖一遍即可。
+        if self._any_worker_running():
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还有任务在跑（提取/翻译/写回/解包），请等它跑完或点「停止」后再拖入新项目。",
+            )
+            return False
         self._project_dir = path
         try:
             adapter = detect_adapter(path)
@@ -528,35 +606,37 @@ class MainWindow(QMainWindow):
             evb_candidate = find_evb_candidate(path)
             if evb_candidate is not None:
                 self._start_evb_unpack(evb_candidate)
-                return
+                return False
             self._info_label.setText("未识别到支持的 RPG Maker 引擎")
             self._adapter = None
             self._start_button.setEnabled(False)
             self._switch_original_button.setEnabled(False)
             self._switch_translated_button.setEnabled(False)
             self._open_output_button.setVisible(False)
-            return
+            return False
 
-        try:
-            units = adapter.extract(path)
-        except Exception as e:
-            self._info_label.setText(f"扫描失败：{e}")
-            self._adapter = None
-            self._start_button.setEnabled(False)
-            self._switch_original_button.setEnabled(False)
-            self._switch_translated_button.setEnabled(False)
-            self._open_output_button.setVisible(False)
-            return
+        # adapter.extract() 大工程下耗时明显（要解析全部 Map*.json/数据库文件），
+        # 之前直接同步跑在这里，会让刚拖进来的窗口卡住到看起来像没反应——放到
+        # ExtractPreviewWorker 后台跑，结果回来之前只是 self._adapter 还是 None、
+        # 相关按钮保持禁用，不是卡死。
+        self._adapter = None
+        self._pending_adapter = adapter
+        self._info_label.setText("正在扫描工程文本…")
+        self._start_button.setEnabled(False)
+        self._switch_original_button.setEnabled(False)
+        self._switch_translated_button.setEnabled(False)
+        self._open_output_button.setVisible(False)
+        self._preview_worker = ExtractPreviewWorker(adapter, path, db_path_for_project(path))
+        self._preview_worker.finished_ok.connect(self._on_preview_extract_done)
+        self._preview_worker.failed.connect(self._on_preview_extract_failed)
+        self._preview_worker.start()
+        return True
 
+    def _on_preview_extract_done(self, units: list, resume_note: str) -> None:
+        path = self._project_dir
+        adapter = self._pending_adapter
         self._adapter = adapter
         engine_label = _ENGINE_LABELS.get(adapter.engine_name, adapter.engine_name)
-        try:
-            resume_note = self._resume_progress_note(path, units)
-        except Exception:
-            # 断点续传进度只是锦上添花的提示，读取失败（比如上次的 db 文件损坏/被占用）
-            # 不该拦住整个拖拽识别流程——记下日志，提示照常显示，只是不带续译进度。
-            logger.exception("读取续译进度失败：%s", path)
-            resume_note = ""
         self._info_label.setText(
             f"识别到引擎：{engine_label}，扫描到文本约 {len(units)} 条{resume_note}"
         )
@@ -569,6 +649,14 @@ class MainWindow(QMainWindow):
         self._open_output_button.setVisible(has_language_variant(path, "translated"))
         self._switch_original_button.setEnabled(has_language_variant(path, "original"))
         self._switch_translated_button.setEnabled(has_language_variant(path, "translated"))
+
+    def _on_preview_extract_failed(self, message: str) -> None:
+        self._info_label.setText(f"扫描失败：{message}")
+        self._adapter = None
+        self._start_button.setEnabled(False)
+        self._switch_original_button.setEnabled(False)
+        self._switch_translated_button.setEnabled(False)
+        self._open_output_button.setVisible(False)
 
     def _start_evb_unpack(self, exe_path: Path) -> None:
         """拖进来的目录没找到能直接识别的工程文件，但顶层有个 Enigma Virtual Box
@@ -601,8 +689,12 @@ class MainWindow(QMainWindow):
         # 正常识别流程，识别成功才算数，失败就老实告诉用户，而不是假装解包顺利。
         out_path = Path(out_dir)
         self._log_message(f"解包完成：{out_path}，正在重新识别引擎…")
-        self._on_path_dropped(out_path)
-        if self._adapter is None:
+        # _on_path_dropped 现在的返回值只表示"识别到了受支持的引擎"这个同步结果，
+        # 真正的预览扫描是异步的（见 ExtractPreviewWorker）——这里不能沿用旧代码
+        # 靠"调用后立刻检查 self._adapter 是否为 None"来判断识别成不成功，扫描还
+        # 没跑完时 self._adapter 必然还是 None，会被误判成"未识别到引擎"。
+        recognized = self._on_path_dropped(out_path)
+        if not recognized:
             self._info_label.setText(
                 f"已解包到 {out_path}，但仍未识别到支持的 RPG Maker 引擎——"
                 "可能是这个游戏用的不是 RPG Maker MV/MZ 引擎，或者解包结果不完整。"
@@ -616,23 +708,6 @@ class MainWindow(QMainWindow):
         self._start_button.setEnabled(False)
         self._progress_bar.setRange(0, 100)
         self._progress_bar.setValue(0)
-
-    @staticmethod
-    def _resume_progress_note(project_dir: Path, units: list) -> str:
-        """如果这个工程之前已经翻译过一部分（db 文件存在），提示已完成的进度——
-        断点续传对用户可见，不用重新点了"开始翻译"才发现原来接着上次的进度在跑。"""
-        db_path = db_path_for_project(project_dir)
-        if not db_path.is_file():
-            return ""
-
-        from rpg_translator.core.store import Store
-
-        with Store(db_path) as store:
-            done_ids = {u.id for u in store.list_units() if u.status != "pending"}
-        done = sum(1 for u in units if u.id in done_ids)
-        if done == 0:
-            return ""
-        return f"，已翻译 {done}/{len(units)}（点击「开始翻译」续译剩余部分）"
 
     def _open_settings(self) -> None:
         # 原来 SettingsDialog(self).exec() 没接住返回的对象——exec() 一返回这行
@@ -654,10 +729,17 @@ class MainWindow(QMainWindow):
         if qsettings.value("engine", "online") == ENGINE_LOCAL:
             _, local_base_url, local_model = resolve_local_config(qsettings)
             if not local_base_url or not local_model:
-                QMessageBox.warning(
-                    self, "未配置本地模型",
-                    "请先在设置里配置本地模型的 Base URL 和模型名。",
-                )
+                # 用户没手填本地服务地址——完全版内置了引擎+模型文件的话，不用
+                # 报错拦住，点开始翻译这一刻才真正拉起子进程（见
+                # docs/superpowers/specs/2026-07-23-bundled-local-model-design.md）。
+                bundled = find_bundled_engine()
+                if bundled is None:
+                    QMessageBox.warning(
+                        self, "未配置本地模型",
+                        "请先在设置里配置本地模型的 Base URL 和模型名。",
+                    )
+                    return
+                self._start_bundled_local_engine(bundled)
                 return
         else:
             api_key = get_deepseek_api_key()
@@ -665,6 +747,37 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "未配置 API Key", "请先在设置里配置 DeepSeek API Key。")
                 return
 
+        self._begin_extract_and_translate()
+
+    def _start_bundled_local_engine(self, bundled: BundledEngine) -> None:
+        """已经起过、还活着就直接复用（模型加载进显存有实打实的耗时，没必要
+        每次点开始翻译都重来）；没起过或者上次的子进程已经退出，起一个新的。"""
+        if self._local_engine_process is not None and self._local_engine_process.is_running():
+            self._bundled_local_base_url = self._local_engine_process.base_url
+            self._begin_extract_and_translate()
+            return
+
+        if self._local_engine_start_worker is not None and self._local_engine_start_worker.isRunning():
+            return  # 已经在起了，重复点击不重复触发
+
+        self._local_engine_process = LocalEngineProcess(bundled)
+        self._start_button.setEnabled(False)
+        self._log_message("正在启动内置本地模型（首次加载模型进显存可能要几十秒）…")
+        self._local_engine_start_worker = LocalEngineStartWorker(self._local_engine_process)
+        self._local_engine_start_worker.finished_ok.connect(self._on_local_engine_started)
+        self._local_engine_start_worker.failed.connect(self._on_local_engine_start_failed)
+        self._local_engine_start_worker.start()
+
+    def _on_local_engine_started(self, base_url: str) -> None:
+        self._bundled_local_base_url = base_url
+        self._log_message("内置本地模型已就绪。")
+        self._begin_extract_and_translate()
+
+    def _on_local_engine_start_failed(self, error: str) -> None:
+        self._start_button.setEnabled(True)
+        QMessageBox.warning(self, "内置本地模型启动失败", error)
+
+    def _begin_extract_and_translate(self) -> None:
         if not self._ensure_worker_stopped(self._extract_worker) or not self._ensure_worker_stopped(
             self._translate_worker
         ):
@@ -711,11 +824,15 @@ class MainWindow(QMainWindow):
         concurrency = int(qsettings.value("concurrency", 4))
         batch_size = int(qsettings.value("batch_size", DEFAULT_BATCH_SIZE))
 
-        if qsettings.value("engine", "online") == ENGINE_LOCAL:
+        self._current_engine_is_local = qsettings.value("engine", "online") == ENGINE_LOCAL
+        if self._current_engine_is_local:
             # 本地模型走专门适配过的 prompt 模板（见 sakura_prompt.py），不走 DeepSeek
             # 那套自由格式；也不启用备用 provider——故障转移是为云端服务瞬时报错设计
             # 的，本地服务连不上通常是配置错了，切去 DeepSeek 反而会误导排查方向。
             api_key, base_url, model = resolve_local_config(qsettings)
+            if (not base_url or not model) and self._bundled_local_base_url:
+                base_url = self._bundled_local_base_url
+                model = LOCAL_ENGINE_MODEL_ALIAS
             fallback_api_key = fallback_base_url = fallback_model = None
             prompt_strategy = SAKURA_PROMPT_STRATEGY
             # 本地量化小模型处理一批几十条的请求天然比云端 API 慢（实测局域网测试机
@@ -871,17 +988,9 @@ class MainWindow(QMainWindow):
         关闭之前，把还在跑的 worker 找出来，能取消的先请求取消（目前只有
         TranslateWorker 有 stop()），限时等它们跑完；等不到就不放行，留给用户
         「再等等」的机会，而不是硬关闭把还活着的线程带走。"""
-        running = [
-            worker
-            for worker in (
-                self._extract_worker,
-                self._translate_worker,
-                self._inject_worker,
-                self._unpack_worker,
-            )
-            if worker is not None and worker.isRunning()
-        ]
+        running = [worker for worker in self._all_workers() if worker is not None and worker.isRunning()]
         if not running:
+            self._stop_local_engine()
             event.accept()
             return
 
@@ -900,7 +1009,14 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
+        self._stop_local_engine()
         event.accept()
+
+    def _stop_local_engine(self) -> None:
+        """完全版内置引擎的子进程不是 QThread，不受上面那套 worker 收尾逻辑
+        管——关窗口前顺手杀掉，避免 llama-server.exe 变成孤儿进程占着显存。"""
+        if self._local_engine_process is not None:
+            self._local_engine_process.stop()
 
     def _on_stop_clicked(self) -> None:
         if self._translate_worker is None:
@@ -919,6 +1035,12 @@ class MainWindow(QMainWindow):
         self._load_translated_project(Path(directory))
 
     def _load_translated_project(self, project_dir: Path) -> None:
+        if self._any_worker_running():
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还有任务在跑（提取/翻译/写回/解包），请等它跑完或点「停止」后再加载新工程。",
+            )
+            return
         db_path = db_path_for_project(project_dir)
         if not db_path.is_file():
             QMessageBox.warning(
@@ -981,13 +1103,36 @@ class MainWindow(QMainWindow):
     def _on_switch_language(self, variant: str) -> None:
         if self._project_dir is None:
             return
-        try:
-            count = switch_language(self._project_dir, variant)
-        except FileNotFoundError as e:
-            QMessageBox.warning(self, "切换失败", str(e))
+        if not self._ensure_worker_stopped(self._switch_language_worker):
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还在收尾上一次切换，请稍等几秒再试。",
+            )
             return
+        # 按文件挨个 copy2，工程文件多时不是瞬时操作（同步跑会冻住整个窗口），放到
+        # SwitchLanguageWorker 后台跑；两个按钮先禁用，避免跑的时候再点一次两个
+        # worker 互相打架。
+        self._switch_original_button.setEnabled(False)
+        self._switch_translated_button.setEnabled(False)
+        self._pending_switch_variant = variant
+        self._switch_language_worker = SwitchLanguageWorker(self._project_dir, variant)
+        self._switch_language_worker.finished_ok.connect(self._on_switch_language_done)
+        self._switch_language_worker.failed.connect(self._on_switch_language_failed)
+        self._switch_language_worker.start()
+
+    def _on_switch_language_done(self, count: int) -> None:
+        variant = self._pending_switch_variant
         label = "原文" if variant == "original" else "译文"
         self._log_message(f"已切换为{label}：{count} 个文件。")
+        project_dir = self._project_dir
+        self._switch_original_button.setEnabled(has_language_variant(project_dir, "original"))
+        self._switch_translated_button.setEnabled(has_language_variant(project_dir, "translated"))
+
+    def _on_switch_language_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "切换失败", message)
+        project_dir = self._project_dir
+        self._switch_original_button.setEnabled(has_language_variant(project_dir, "original"))
+        self._switch_translated_button.setEnabled(has_language_variant(project_dir, "translated"))
 
     def _on_export_package_clicked(self) -> None:
         if self._db_path is None or self._project_dir is None:
@@ -1015,9 +1160,45 @@ class MainWindow(QMainWindow):
         self._log_message(f"翻译包已导出：{package_path}")
         QMessageBox.information(self, "导出完成", f"已生成：{package_path}\n\n可以直接分享给拿到同一个游戏的人。")
 
+    def _on_export_mtool_clicked(self) -> None:
+        if self._db_path is None or self._project_dir is None:
+            QMessageBox.warning(self, "还没有翻译内容", "请先拖入工程并跑一遍翻译。")
+            return
+
+        dest_dir = QFileDialog.getExistingDirectory(
+            self, "选择 ManualTransFile.json 保存位置", str(self._project_dir.parent)
+        )
+        if not dest_dir:
+            return
+
+        try:
+            mtool_path, conflicts = export_mtool_json(self._db_path, Path(dest_dir))
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", str(e))
+            return
+
+        self._log_message(f"MTool 格式已导出：{mtool_path}")
+        message = (
+            f"已生成：{mtool_path}\n\n"
+            "把这个文件放到游戏根目录，配合 MTool 客户端使用（运行时替换文本，"
+            "不经过本工具的注入流程，不会改动游戏原文件）。"
+        )
+        if conflicts:
+            message += (
+                f"\n\n注意：有 {conflicts} 处同一原文在本工具里对应了不同译文，"
+                "MTool 格式只能按原文本身做 key，已保留每处的首次出现译文。"
+            )
+        QMessageBox.information(self, "导出完成", message)
+
     def _on_import_package_clicked(self) -> None:
         if self._project_dir is None:
             QMessageBox.warning(self, "还没有选择工程", "请先把游戏文件夹拖进来，再导入翻译包。")
+            return
+        if self._any_worker_running():
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还有任务在跑，会跟导入同时读写数据库，请等它跑完或点「停止」后再导入。",
+            )
             return
 
         package_file, _ = QFileDialog.getOpenFileName(
@@ -1030,19 +1211,35 @@ class MainWindow(QMainWindow):
             self._db_path = db_path_for_project(self._project_dir)
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            # 先确保本地也跑过一遍 extract——同一版本游戏两边算出来的 TextUnit id 才对得上，
-            # 已经翻译过的条目不受影响（upsert_units 原文没变就不覆盖翻译进度）。
-            run_extract(self._project_dir, self._db_path)
-            imported, skipped = import_translation_package(self._db_path, Path(package_file))
-        except Exception as e:
-            QMessageBox.critical(self, "导入失败", str(e))
+        if not self._ensure_worker_stopped(self._import_package_worker):
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还在收尾上一次导入，请稍等几秒再试。",
+            )
             return
 
+        # 重新 extract 这一步和 ExtractWorker 单独跑时一样耗时，同步跑会冻住窗口，
+        # 放到 ImportPackageWorker 后台跑（内部先 run_extract 保证两边 TextUnit id
+        # 对得上，再导入包里的译文，见 workers.py 的说明）。
+        self._import_package_button.setEnabled(False)
+        self._log_message("正在导入翻译包…")
+        self._import_package_worker = ImportPackageWorker(
+            self._project_dir, self._db_path, Path(package_file)
+        )
+        self._import_package_worker.finished_ok.connect(self._on_import_package_done)
+        self._import_package_worker.failed.connect(self._on_import_package_failed)
+        self._import_package_worker.start()
+
+    def _on_import_package_done(self, imported: int, skipped: int) -> None:
+        self._import_package_button.setEnabled(True)
         self._log_message(f"翻译包导入完成：成功 {imported} 条，跳过（版本不匹配）{skipped} 条。")
         if imported > 0:
             self._inject_button.setEnabled(True)
         QMessageBox.information(self, "导入完成", f"成功导入 {imported} 条，跳过 {skipped} 条。")
+
+    def _on_import_package_failed(self, message: str) -> None:
+        self._import_package_button.setEnabled(True)
+        QMessageBox.critical(self, "导入失败", message)
 
     def _on_cleanup_db_clicked(self) -> None:
         """按当前游戏工程重新扫描一遍文本，删掉数据库里不再对应任何现存文本的历史
@@ -1051,6 +1248,12 @@ class MainWindow(QMainWindow):
         这是手动触发的瘦身入口，不会自动执行，避免误删还有用的翻译记录。"""
         if self._project_dir is None or self._db_path is None:
             QMessageBox.warning(self, "还没有选择工程", "请先拖入工程并跑一遍翻译。")
+            return
+        if self._any_worker_running():
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还有任务在跑，会跟清理同时读写数据库，请等它跑完或点「停止」后再清理。",
+            )
             return
 
         reply = QMessageBox.question(
@@ -1065,14 +1268,30 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        try:
-            deleted = prune_stale_units(self._project_dir, self._db_path)
-        except Exception as e:
-            QMessageBox.critical(self, "清理失败", str(e))
+        if not self._ensure_worker_stopped(self._cleanup_db_worker):
+            QMessageBox.warning(
+                self, "上一次任务还没停干净",
+                "后台还在收尾上一次清理，请稍等几秒再试。",
+            )
             return
 
+        # 重新扫描一遍工程 + VACUUM（整份 db 文件重写）都不是瞬时操作，放到
+        # CleanupDbWorker 后台跑，避免同步跑冻住窗口。
+        self._cleanup_db_button.setEnabled(False)
+        self._log_message("正在清理数据库…")
+        self._cleanup_db_worker = CleanupDbWorker(self._project_dir, self._db_path)
+        self._cleanup_db_worker.finished_ok.connect(self._on_cleanup_db_done)
+        self._cleanup_db_worker.failed.connect(self._on_cleanup_db_failed)
+        self._cleanup_db_worker.start()
+
+    def _on_cleanup_db_done(self, deleted: int) -> None:
+        self._cleanup_db_button.setEnabled(True)
         self._log_message(f"数据库清理完成：删除了 {deleted} 条不再对应当前文本的历史记录。")
         QMessageBox.information(self, "清理完成", f"已删除 {deleted} 条历史记录并回收磁盘空间。")
+
+    def _on_cleanup_db_failed(self, message: str) -> None:
+        self._cleanup_db_button.setEnabled(True)
+        QMessageBox.critical(self, "清理失败", message)
 
     def _on_failed(self, message: str) -> None:
         self._log_message(f"出错：{message}")

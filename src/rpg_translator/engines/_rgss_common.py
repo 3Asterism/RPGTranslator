@@ -109,9 +109,23 @@ def _encode_like(original: Any, text: str) -> Any:
         return text
     try:
         original.decode("utf-8")
-        return text.encode("utf-8")
+        encoding = "utf-8"
     except UnicodeDecodeError:
-        return text.encode("cp932")
+        encoding = "cp932"
+    try:
+        return text.encode(encoding)
+    except UnicodeEncodeError as e:
+        # cp932（Shift-JIS）这个经典编码本身就编不出绝大多数简体中文字——原始字段
+        # 是老版本 Ruby（1.8，字符串没有编码感知）的 Shift-JIS 字节，这个工程的
+        # 运行时本身就没有"每个字符串自带编码标记"的概念，不是随便换个 Python
+        # 编码函数就能绕过的问题。不能吞掉这个错误再随便编一个降级结果糊弄过去，
+        # 那样写出来的 .rvdata2 会带着截断/替换字符的损坏文本，用户很可能要到
+        # 游戏里显示乱码才会发现；直接报错让用户知道这条译文回填不了。
+        raise ValueError(
+            f"译文包含 {encoding} 无法表示的字符，写不回这个经典 XP/VX 工程"
+            f"（老版本 Ruby 字符串固定用 {encoding} 编码，没有 per-string 编码"
+            f"标记可以切换）：{e}\n译文：{text!r}"
+        ) from e
 
 
 def parse_locator(locator: str) -> list[Any]:

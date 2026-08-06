@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QDialog, QMessageBox
 
 from rpg_translator.config import Settings, get_deepseek_api_key
@@ -15,8 +16,16 @@ from rpg_translator.gui.main_window import (
     db_path_for_project,
     resolve_dropped_path,
 )
-from rpg_translator.gui.settings_dialog import ENGINE_LOCAL, ENGINE_ONLINE, SettingsDialog
-from rpg_translator.gui.workers import ExtractWorker, InjectWorker, TranslateWorker
+from rpg_translator.gui.settings_dialog import (
+    APP_NAME,
+    ENGINE_LOCAL,
+    ENGINE_ONLINE,
+    ORG_NAME,
+    SettingsDialog,
+    _ConnectivityCheckWorker,
+)
+from rpg_translator.gui.workers import ExtractWorker, InjectWorker, LocalEngineStartWorker, TranslateWorker
+from rpg_translator.translate.local_engine import BundledEngine, LocalEngineProcess
 
 
 def _mock_transport(status_code: int = 200) -> httpx.MockTransport:
@@ -36,6 +45,21 @@ def _unreachable_transport() -> httpx.MockTransport:
         raise httpx.ConnectError("connection refused", request=request)
 
     return httpx.MockTransport(handler)
+
+
+def _drop_and_wait(window: MainWindow, path: Path, qapp, timeout: int = 10_000) -> None:
+    """_on_path_dropped 识别到引擎后，预览扫描（adapter.extract()）跑在后台
+    ExtractPreviewWorker 里就立刻返回（见 main_window.py 的说明），测试要显式等
+    这个线程跑完、再把 Qt 事件队列里排队的跨线程信号处理掉，才能看到
+    _on_preview_extract_done 真正执行完之后的按钮状态/提示文字。没识别到引擎的
+    路径（UnknownEngineError）不会起 worker，_preview_worker 保持上一次的值或
+    None，调用方不需要也不应该在那种场景下调用这个 helper。"""
+    window._on_path_dropped(path)
+    worker = window._preview_worker
+    assert worker is not None, "预览扫描线程没有被创建（识别引擎失败了？）"
+    finished_in_time = worker.wait(timeout)
+    qapp.processEvents()
+    assert finished_in_time, "预览扫描线程没在超时内跑完"
 
 
 def test_main_window_constructs_with_start_disabled(qapp):
@@ -85,6 +109,39 @@ def test_main_window_compute_eta_text_all_done_has_no_remaining_text(qapp):
     assert "还剩" not in text
 
 
+def test_main_window_on_usage_changed_accumulates_cost_for_known_model(qapp):
+    window = MainWindow()
+    window._on_usage_changed("deepseek-v4-flash", 1_000_000, 500_000)
+
+    assert "预估花费 ¥2.00" in window._usage_label.text()
+    assert "仅供参考" not in window._usage_label.text()
+
+
+def test_main_window_on_usage_changed_notes_approx_price_for_unknown_model(qapp):
+    """价目表里没有的型号现在会用粗略均价给一个费用数量级参考（见
+    translate/pricing.py），但不能让用户误以为这是精确账单——状态栏要明确标注
+    这是估算。"""
+    window = MainWindow()
+    window._on_usage_changed("some-unlisted-model", 1_000_000, 1_000_000)
+
+    text = window._usage_label.text()
+    assert "预估花费 ¥" in text
+    assert "按同类模型均价粗略估算" in text
+
+
+def test_main_window_on_usage_changed_skips_cost_for_local_engine(qapp):
+    """本地引擎没有 API 调用费用——切到本地引擎之后的用量不该计进预估花费，
+    也不该被当成"型号未收录定价"提示用户去查价目表。"""
+    window = MainWindow()
+    window._current_engine_is_local = True
+    window._on_usage_changed("sakura-7b-qwen2.5-v1.0-q6k", 1_000_000, 1_000_000)
+
+    text = window._usage_label.text()
+    assert "预估花费 ¥0.00" in text
+    assert "本地模型用量" in text
+    assert "按同类模型均价粗略估算" not in text
+
+
 def test_main_window_on_progress_changed_updates_eta_label(qapp):
     window = MainWindow()
     window._on_progress_changed(0, 10)
@@ -108,7 +165,7 @@ def test_main_window_on_progress_changed_bursts_do_not_inflate_sample_count(qapp
 
 def test_drop_recognized_mz_project_enables_start_and_shows_engine(qapp, mz_project: Path):
     window = MainWindow()
-    window._on_path_dropped(mz_project)
+    _drop_and_wait(window, mz_project, qapp)
 
     assert window._start_button.isEnabled() is True
     assert window._adapter is not None
@@ -123,7 +180,7 @@ def test_db_path_for_project_points_at_rpg_translator_units_db(tmp_path: Path):
 
 def test_drop_recognized_vxace_project_enables_start_and_shows_engine(qapp, vxace_project: Path):
     window = MainWindow()
-    window._on_path_dropped(vxace_project)
+    _drop_and_wait(window, vxace_project, qapp)
 
     assert window._start_button.isEnabled() is True
     assert window._adapter is not None
@@ -208,14 +265,14 @@ def test_drop_project_with_existing_progress_shows_resume_note(qapp, mz_project:
         store.update_translation(first_unit.id, "已翻译的内容", status="translated")
 
     window = MainWindow()
-    window._on_path_dropped(mz_project)
+    _drop_and_wait(window, mz_project, qapp)
 
     assert "已翻译 1/14" in window._info_label.text()
 
 
 def test_drop_project_without_prior_progress_shows_no_resume_note(qapp, mz_project: Path):
     window = MainWindow()
-    window._on_path_dropped(mz_project)
+    _drop_and_wait(window, mz_project, qapp)
 
     assert "已翻译" not in window._info_label.text()
 
@@ -233,6 +290,116 @@ def test_stop_button_hidden_until_translation_starts_and_calls_worker_stop(qapp)
 
     assert stopped == [True]
     assert window._stop_button.isEnabled() is False
+
+
+def _set_local_engine_with_empty_config() -> None:
+    """走 QSettings 直接写——SettingsDialog 的保存路径会拒绝空 Base URL（见
+    _resolve_check_target），没法通过 UI 存出"engine=local 但字段全空"这个状态，
+    只能直接写 QSettings 模拟"用户选了本地模型但还没配置"这个真实会出现的组合。"""
+    qsettings = QSettings(ORG_NAME, APP_NAME)
+    qsettings.setValue("engine", ENGINE_LOCAL)
+    qsettings.setValue("local_base_url", "")
+    qsettings.setValue("local_model", "")
+
+
+def _reset_engine_to_online() -> None:
+    QSettings(ORG_NAME, APP_NAME).setValue("engine", ENGINE_ONLINE)
+
+
+def _track_warnings(monkeypatch) -> list[str]:
+    """记录 QMessageBox.warning 弹出的正文，不真的弹窗阻塞测试。"""
+    messages: list[str] = []
+
+    def fake_warning(parent, title, text, *args, **kwargs):
+        messages.append(text)
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "warning", fake_warning)
+    return messages
+
+
+def test_on_start_clicked_local_engine_without_config_and_no_bundle_warns(
+    qapp, mz_project: Path, monkeypatch
+):
+    """精简版（没有内置引擎文件）下，本地引擎没配置就点开始翻译，行为跟改动前
+    一样——弹出提示，不往下走。"""
+    _set_local_engine_with_empty_config()
+    monkeypatch.setattr("rpg_translator.gui.main_window.find_bundled_engine", lambda: None)
+    _track_warnings(monkeypatch)
+
+    window = MainWindow()
+    _drop_and_wait(window, mz_project, qapp)
+
+    window._on_start_clicked()
+
+    assert window._extract_worker is None
+    assert window._local_engine_start_worker is None
+    _reset_engine_to_online()
+
+
+def test_on_start_clicked_starts_bundled_engine_then_begins_extraction(
+    qapp, tmp_path: Path, mz_project: Path, monkeypatch
+):
+    """完全版（有内置引擎文件）下，本地引擎没手填配置不该再弹错——点开始翻译
+    应该先拉起内置子进程，就绪后自动继续走提取流程。"""
+    _set_local_engine_with_empty_config()
+    bundled = BundledEngine(exe_path=tmp_path / "llama-server.exe", model_path=tmp_path / "model.gguf")
+    monkeypatch.setattr("rpg_translator.gui.main_window.find_bundled_engine", lambda: bundled)
+    monkeypatch.setattr(LocalEngineProcess, "start", lambda self: "http://127.0.0.1:9999/v1")
+    monkeypatch.setattr(LocalEngineProcess, "wait_until_ready", lambda self, timeout: True)
+
+    window = MainWindow()
+    _drop_and_wait(window, mz_project, qapp)
+
+    window._on_start_clicked()
+
+    worker = window._local_engine_start_worker
+    assert worker is not None, "没有起 LocalEngineStartWorker"
+    assert worker.wait(5_000), "LocalEngineStartWorker 没在超时内跑完"
+    qapp.processEvents()
+
+    assert window._bundled_local_base_url == "http://127.0.0.1:9999/v1"
+    assert window._extract_worker is not None, "内置引擎就绪后应该自动继续走提取流程"
+    _reset_engine_to_online()
+
+
+def test_on_start_clicked_bundled_engine_start_failure_warns_and_reenables_button(
+    qapp, tmp_path: Path, mz_project: Path, monkeypatch
+):
+    _set_local_engine_with_empty_config()
+    bundled = BundledEngine(exe_path=tmp_path / "llama-server.exe", model_path=tmp_path / "model.gguf")
+    monkeypatch.setattr("rpg_translator.gui.main_window.find_bundled_engine", lambda: bundled)
+    monkeypatch.setattr(LocalEngineProcess, "start", lambda self: "http://127.0.0.1:9999/v1")
+    monkeypatch.setattr(LocalEngineProcess, "wait_until_ready", lambda self, timeout: False)
+    monkeypatch.setattr(LocalEngineProcess, "stop", lambda self: None)
+    warnings = _track_warnings(monkeypatch)
+
+    window = MainWindow()
+    _drop_and_wait(window, mz_project, qapp)
+
+    window._on_start_clicked()
+
+    worker = window._local_engine_start_worker
+    assert worker is not None
+    assert worker.wait(5_000)
+    qapp.processEvents()
+
+    assert window._extract_worker is None, "启动失败不该继续走提取流程"
+    assert window._start_button.isEnabled() is True
+    assert warnings, "启动失败应该弹出提示"
+    _reset_engine_to_online()
+
+
+def test_close_event_stops_bundled_local_engine_process(qapp, mz_project: Path):
+    window = MainWindow()
+    _drop_and_wait(window, mz_project, qapp)
+
+    stopped = []
+    window._local_engine_process = type("_FakeProc", (), {"stop": lambda self: stopped.append(True)})()
+
+    window.close()
+
+    assert stopped == [True]
 
 
 def test_export_translation_package_prompts_for_name_and_writes_file(
@@ -268,6 +435,35 @@ def test_export_translation_package_prompts_for_name_and_writes_file(
     assert (dest_dir / "我的游戏.rpgtrans.json").is_file()
 
 
+def test_export_mtool_json_button_writes_manual_trans_file(
+    qapp, tmp_path: Path, mz_project: Path, monkeypatch
+):
+    from rpg_translator.core.pipeline import run_extract
+    from rpg_translator.core.store import Store
+
+    db_path = tmp_path / "units.db"
+    run_extract(mz_project, db_path)
+    with Store(db_path) as store:
+        unit = store.list_units()[0]
+        store.update_translation(unit.id, "译文", status="translated")
+
+    window = MainWindow()
+    window._project_dir = mz_project
+    window._db_path = db_path
+
+    dest_dir = tmp_path / "mtool_dest"
+    dest_dir.mkdir()
+    monkeypatch.setattr(
+        "rpg_translator.gui.main_window.QFileDialog.getExistingDirectory",
+        lambda *a, **k: str(dest_dir),
+    )
+    monkeypatch.setattr("rpg_translator.gui.main_window.QMessageBox.information", lambda *a, **k: None)
+
+    window._on_export_mtool_clicked()
+
+    assert (dest_dir / "ManualTransFile.json").is_file()
+
+
 def test_import_translation_package_button_imports_and_enables_inject(
     qapp, tmp_path: Path, mz_project: Path, monkeypatch
 ):
@@ -292,6 +488,10 @@ def test_import_translation_package_button_imports_and_enables_inject(
     monkeypatch.setattr("rpg_translator.gui.main_window.QMessageBox.information", lambda *a, **k: None)
 
     window._on_import_package_clicked()
+    worker = window._import_package_worker
+    assert worker is not None, "导入线程没有被创建"
+    assert worker.wait(10_000), "导入线程没在超时内跑完"
+    qapp.processEvents()
 
     assert window._inject_button.isEnabled() is True
     with Store(window._db_path) as store:
@@ -311,6 +511,18 @@ def test_resolve_dropped_path_returns_folder_unchanged(tmp_path: Path):
     assert resolve_dropped_path(project_dir) == project_dir
 
 
+def _accept_and_wait(dialog: SettingsDialog, qapp, timeout: int = 10_000) -> None:
+    """_on_accept 现在起一个后台 QThread 做连接测试就立刻返回（见 settings_dialog.py
+    _ConnectivityCheckWorker 的说明），测试要显式等这个线程跑完、再把 Qt 事件队列
+    里排队的跨线程信号处理掉，才能看到 _save_settings/accept() 真正执行完的效果。"""
+    dialog._on_accept()
+    worker = dialog._check_worker
+    assert worker is not None, "连接测试线程没有被创建（校验阶段被提前拒绝了？）"
+    finished_in_time = worker.wait(timeout)
+    qapp.processEvents()
+    assert finished_in_time, "连接测试线程没在超时内跑完"
+
+
 def test_settings_dialog_persists_model_concurrency(qapp):
     dialog = SettingsDialog()
     dialog._model_combo.setCurrentText("deepseek-v4-pro")
@@ -318,7 +530,7 @@ def test_settings_dialog_persists_model_concurrency(qapp):
     dialog._api_key_edit.setText("test-key-not-real")
     dialog._connectivity_transport = _mock_transport()
 
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
 
     reloaded = SettingsDialog()
     assert reloaded.model == "deepseek-v4-pro"
@@ -338,7 +550,7 @@ def test_settings_dialog_persists_base_url_and_fallback_provider(qapp):
     dialog._api_key_edit.setText("test-key-not-real")
     dialog._connectivity_transport = _mock_transport()
 
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
 
     reloaded = SettingsDialog()
     assert reloaded.base_url == "https://api.siliconflow.cn/v1"
@@ -370,7 +582,7 @@ def test_settings_dialog_selecting_online_engine_shows_online_box(qapp):
 
     dialog._api_key_edit.setText("test-key-not-real")
     dialog._connectivity_transport = _mock_transport()
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
     assert SettingsDialog().engine == ENGINE_ONLINE
 
 
@@ -387,7 +599,7 @@ def test_settings_dialog_persists_local_engine_config(qapp):
     dialog._local_model_edit.setText("sakura-galtransl")
     dialog._connectivity_transport = _mock_transport()
 
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
 
     reloaded = SettingsDialog()
     assert reloaded.engine == ENGINE_LOCAL
@@ -403,15 +615,31 @@ def _select_online_engine(dialog: SettingsDialog) -> None:
     dialog._engine_combo.setCurrentIndex(dialog._engine_combo.findData(ENGINE_ONLINE))
 
 
+def _run_connectivity_check(
+    qapp,
+    url: str = "https://example.invalid/v1/models",
+    base_url: str = "https://example.invalid/v1",
+    api_key: str = "test-key",
+    transport: httpx.BaseTransport | None = None,
+    timeout: int = 10_000,
+) -> tuple[bool, str]:
+    """直接跑 _ConnectivityCheckWorker（真正做网络请求判断的地方，见 settings_dialog.py），
+    不经过整个对话框的 accept 流程——纯粹验证"连通性判断本身"这一小块逻辑。"""
+    results: list[tuple[bool, str]] = []
+    worker = _ConnectivityCheckWorker(url, base_url, api_key, 8.0, transport)
+    worker.finished_check.connect(lambda ok, error: results.append((ok, error)))
+    worker.start()
+    finished_in_time = worker.wait(timeout)
+    qapp.processEvents()
+    assert finished_in_time, "连接测试线程没在超时内跑完"
+    assert len(results) == 1
+    return results[0]
+
+
 def test_settings_dialog_check_connectivity_succeeds_when_server_responds(qapp):
     """只要服务端有响应就算"连得上"，哪怕是 401（key 错）也不算连通性失败——
     key/模型名对不对是另一回事，留给真正翻译时的报错反馈。"""
-    dialog = SettingsDialog()
-    _select_online_engine(dialog)
-    dialog._api_key_edit.setText("wrong-key")
-    dialog._connectivity_transport = _mock_transport(status_code=401)
-
-    ok, error = dialog._check_connectivity()
+    ok, error = _run_connectivity_check(qapp, transport=_mock_transport(status_code=401))
 
     assert ok is True
     assert error == ""
@@ -420,52 +648,54 @@ def test_settings_dialog_check_connectivity_succeeds_when_server_responds(qapp):
 def test_settings_dialog_check_connectivity_fails_on_5xx_response(qapp):
     """502/504 这类网关错误不算"连通"——本机走系统代理时，代理能正常应答但连不上
     局域网里真正的目标地址会回这个，客户端确实收到了响应，但要连的地址其实没通。"""
-    dialog = SettingsDialog()
-    _select_online_engine(dialog)
-    dialog._api_key_edit.setText("test-key")
-    dialog._connectivity_transport = _mock_transport(status_code=502)
-
-    ok, error = dialog._check_connectivity()
+    ok, error = _run_connectivity_check(qapp, transport=_mock_transport(status_code=502))
 
     assert ok is False
     assert "502" in error
 
 
 def test_settings_dialog_check_connectivity_fails_on_transport_error(qapp):
-    dialog = SettingsDialog()
-    _select_online_engine(dialog)
-    dialog._api_key_edit.setText("test-key")
-    dialog._connectivity_transport = _unreachable_transport()
-
-    ok, error = dialog._check_connectivity()
+    ok, error = _run_connectivity_check(qapp, transport=_unreachable_transport())
 
     assert ok is False
     assert error  # 带上了具体的错误信息，不是空字符串
 
 
-def test_settings_dialog_check_connectivity_fails_when_online_api_key_empty(qapp):
+def test_settings_dialog_check_connectivity_fails_when_online_api_key_empty(qapp, monkeypatch):
+    """API Key/Base URL 是否为空这类轻量校验不需要起后台线程，直接同步拒绝——
+    见 settings_dialog.py 的 _resolve_check_target。"""
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", lambda parent, title, text, *a, **k: warnings.append(text)
+    )
     dialog = SettingsDialog()
     _select_online_engine(dialog)
     dialog._api_key_edit.setText("")
     dialog._connectivity_transport = _mock_transport()
 
-    ok, error = dialog._check_connectivity()
+    target = dialog._resolve_check_target()
 
-    assert ok is False
-    assert "API Key" in error
+    assert target is None
+    assert dialog._check_worker is None  # 校验没过，压根不该起后台线程
+    assert warnings and "API Key" in warnings[0]
 
 
-def test_settings_dialog_check_connectivity_fails_when_local_base_url_empty(qapp):
+def test_settings_dialog_check_connectivity_fails_when_local_base_url_empty(qapp, monkeypatch):
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", lambda parent, title, text, *a, **k: warnings.append(text)
+    )
     dialog = SettingsDialog()
     index = dialog._engine_combo.findData(ENGINE_LOCAL)
     dialog._engine_combo.setCurrentIndex(index)
     dialog._local_base_url_edit.setText("")
     dialog._connectivity_transport = _mock_transport()
 
-    ok, error = dialog._check_connectivity()
+    target = dialog._resolve_check_target()
 
-    assert ok is False
-    assert "Base URL" in error
+    assert target is None
+    assert dialog._check_worker is None
+    assert warnings and "Base URL" in warnings[0]
 
 
 def test_settings_dialog_on_accept_does_not_save_when_connectivity_check_fails(
@@ -480,10 +710,39 @@ def test_settings_dialog_on_accept_does_not_save_when_connectivity_check_fails(
     dialog._concurrency_spin.setValue(baseline + 1)
     dialog._connectivity_transport = _unreachable_transport()
 
-    dialog._on_accept()
+    _accept_and_wait(dialog, qapp)
 
     assert dialog.result() != int(QDialog.DialogCode.Accepted)
     assert SettingsDialog().concurrency == baseline
+
+
+def test_settings_dialog_reject_blocked_while_connectivity_check_in_flight(qapp):
+    """连接测试后台线程还没跑完时，Cancel/关闭不能真的关掉对话框——销毁一个仍在运行
+    的 QThread 会在 C++ 层直接 abort（这个项目已经踩过好几次这类无预兆闪退）。"""
+    dialog = SettingsDialog()
+    _select_online_engine(dialog)
+    dialog._api_key_edit.setText("test-key")
+    dialog._connectivity_transport = _mock_transport()
+
+    dialog._on_accept()
+    assert dialog._busy is True
+
+    _SENTINEL_RESULT = 42  # 跟 Accepted(1)/Rejected(0) 都不同，专门用来验证下面的
+    # reject() 到底有没有真的执行到 super().reject()（会把 result 改写成 Rejected）
+    dialog.done(_SENTINEL_RESULT)
+    assert dialog.result() == _SENTINEL_RESULT
+
+    dialog.reject()  # 检测还在飞，这次应该被挡住，不改变 result()
+    assert dialog.result() == _SENTINEL_RESULT
+
+    worker = dialog._check_worker
+    assert worker is not None
+    assert worker.wait(10_000), "连接测试线程没在超时内跑完"
+    qapp.processEvents()
+
+    assert dialog._busy is False
+    dialog.reject()  # 检测已经跑完，这次应该能正常关闭
+    assert dialog.result() == int(QDialog.DialogCode.Rejected)
 
 
 def test_extract_worker_end_to_end(qapp, tmp_path: Path, mz_project: Path):
