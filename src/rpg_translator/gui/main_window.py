@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from rpg_translator.config import get_deepseek_api_key
 from rpg_translator.core.evb_unpack import find_evb_candidate
 from rpg_translator.core.pipeline import (
+    MissingApiKeyError,
     UnknownEngineError,
     db_path_for_project,
     detect_adapter,
@@ -56,14 +57,19 @@ from rpg_translator.gui.workers import (
     UnpackWorker,
 )
 from rpg_translator.translate.batch_translator import DEFAULT_BATCH_SIZE, DEFAULT_PROMPT_STRATEGY
+from rpg_translator.translate.llm_client import LLMConfig
 from rpg_translator.translate.local_engine import (
     LOCAL_ENGINE_MODEL_ALIAS,
     BundledEngine,
     LocalEngineProcess,
     find_bundled_engine,
+    get_app_root,
 )
 from rpg_translator.translate.pricing import estimate_cost_cny
 from rpg_translator.translate.sakura_prompt import SAKURA_PROMPT_STRATEGY
+from rpg_translator.unity.deploy import DeployResult, RemoveResult, deploy, remove
+from rpg_translator.unity.detect import UnityTarget, detect_unity
+from rpg_translator.unity.translate_shim import TranslateShimServer
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +332,14 @@ class MainWindow(QMainWindow):
         self._pending_switch_variant: str | None = None
         self._WORKER_STOP_TIMEOUT_MS = 5000
 
+        # 识别到 Unity 工程时才非 None；跟 self._adapter（RPG Maker 家族）互斥，
+        # 两条路径共用同一个拖拽入口但分叉走不同面板（见 _on_path_dropped）。
+        self._unity_target: UnityTarget | None = None
+        # 本机常驻的翻译 shim server，跟 self._local_engine_process 一样是"跟随
+        # App 生命周期手动 start/stop"的普通对象，不是 QThread；closeEvent 里
+        # 一并停掉，避免遗留占着端口的孤儿线程。
+        self._unity_shim_server: TranslateShimServer | None = None
+
         # log_message/stage_changed 信号来自后台线程，两个 provider 都报错时高并发
         # 下每个批次的每次重试/限流冷却/换 provider 都各发一条（见 llm_client.py 的
         # on_log），跟 _on_progress_changed 注释里那次"appendPlainText 撑爆崩溃"是
@@ -441,8 +455,8 @@ class MainWindow(QMainWindow):
         self._log.setUndoRedoEnabled(False)
         self._log.setMaximumBlockCount(5000)
 
-        translate_box = QGroupBox("2. 翻译（后台跑，结果先存本地，不动游戏文件）")
-        translate_layout = QVBoxLayout(translate_box)
+        self._translate_box = QGroupBox("2. 翻译（后台跑，结果先存本地，不动游戏文件）")
+        translate_layout = QVBoxLayout(self._translate_box)
         translate_layout.addLayout(start_row)
         translate_layout.addWidget(self._progress_bar)
         translate_layout.addWidget(self._eta_label)
@@ -467,12 +481,54 @@ class MainWindow(QMainWindow):
         inject_row.addWidget(self._open_output_button)
         inject_row.addStretch(1)
 
-        inject_box = QGroupBox(
+        self._inject_box = QGroupBox(
             "3. 注入（直接把已翻译内容写回拖入的游戏工程本身，原文自动备份、"
             "不会丢；写盘失败可以直接重试，不用重新翻译）"
         )
-        inject_layout = QVBoxLayout(inject_box)
+        inject_layout = QVBoxLayout(self._inject_box)
         inject_layout.addLayout(inject_row)
+
+        self._unity_deploy_button = QPushButton("部署翻译外挂")
+        self._unity_deploy_button.clicked.connect(self._on_unity_deploy_clicked)
+
+        self._unity_remove_button = QPushButton("卸载还原")
+        self._unity_remove_button.setObjectName("secondaryButton")
+        self._unity_remove_button.clicked.connect(self._on_unity_remove_clicked)
+
+        self._unity_sakura_warning_label = QLabel(
+            "当前翻译引擎是本地 Sakura（RPG Maker 语法特化模型），翻译 Unity 游戏"
+            "建议在设置里切换在线 Provider。"
+        )
+        self._unity_sakura_warning_label.setObjectName("infoLabel")
+        self._unity_sakura_warning_label.setWordWrap(True)
+        self._unity_sakura_warning_label.setVisible(False)
+
+        self._unity_status_label = QLabel("")
+        self._unity_status_label.setObjectName("infoLabel")
+        self._unity_status_label.setWordWrap(True)
+
+        # 不能直接把 self._open_output_button 塞进这个新 QHBoxLayout——一个
+        # QWidget 同时只能属于一个 layout，重复 addWidget 会把它从原来的
+        # inject_row 里挪走。这里另建一个同样打开 self._project_dir 的按钮实例。
+        self._unity_open_output_button = QPushButton("打开游戏文件夹")
+        self._unity_open_output_button.setObjectName("secondaryButton")
+        self._unity_open_output_button.clicked.connect(self._on_open_output_clicked)
+
+        unity_row = QHBoxLayout()
+        unity_row.addWidget(self._unity_deploy_button)
+        unity_row.addWidget(self._unity_remove_button)
+        unity_row.addWidget(self._unity_open_output_button)
+        unity_row.addStretch(1)
+
+        self._unity_deploy_box = QGroupBox(
+            "2. 部署（运行时外挂翻译：装好后自行启动游戏即可，翻译发生在游戏运行"
+            "期间，不产出译文文件，不改游戏文件本体，随时可卸载还原）"
+        )
+        unity_deploy_layout = QVBoxLayout(self._unity_deploy_box)
+        unity_deploy_layout.addWidget(self._unity_sakura_warning_label)
+        unity_deploy_layout.addLayout(unity_row)
+        unity_deploy_layout.addWidget(self._unity_status_label)
+        self._unity_deploy_box.setVisible(False)
 
         self._switch_original_button = QPushButton("切换为原文")
         self._switch_original_button.setObjectName("secondaryButton")
@@ -522,8 +578,9 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.addLayout(header_row)
         layout.addWidget(project_box)
-        layout.addWidget(translate_box, stretch=1)
-        layout.addWidget(inject_box)
+        layout.addWidget(self._translate_box, stretch=1)
+        layout.addWidget(self._inject_box)
+        layout.addWidget(self._unity_deploy_box)
         layout.addWidget(share_box)
         self.setCentralWidget(central)
 
@@ -610,6 +667,15 @@ class MainWindow(QMainWindow):
             )
             return False
         self._project_dir = path
+        # 无条件先重置 Unity 分支的状态/面板可见性，覆盖"先拖了个 Unity 工程、
+        # 又拖了个 RPG Maker 工程（或反过来）"的场景——不会两个面板同时显示，
+        # 也不会残留上一次识别结果。_show_unity_panel 命中时会再把下面两行
+        # 设回 False，这里先无条件设 True 是为了"识别到 RPG Maker 引擎"这条
+        # 路径不用再单独写一遍。
+        self._unity_target = None
+        self._unity_deploy_box.setVisible(False)
+        self._translate_box.setVisible(True)
+        self._inject_box.setVisible(True)
         try:
             adapter = detect_adapter(path)
         except UnknownEngineError:
@@ -617,6 +683,10 @@ class MainWindow(QMainWindow):
             if evb_candidate is not None:
                 self._start_evb_unpack(evb_candidate)
                 return False
+            unity_target = detect_unity(path)
+            if unity_target is not None:
+                self._show_unity_panel(unity_target)
+                return True
             self._info_label.setText("未识别到支持的 RPG Maker 引擎")
             self._adapter = None
             self._start_button.setEnabled(False)
@@ -641,6 +711,102 @@ class MainWindow(QMainWindow):
         self._preview_worker.failed.connect(self._on_preview_extract_failed)
         self._preview_worker.start()
         return True
+
+    def _show_unity_panel(self, target: UnityTarget) -> None:
+        self._unity_target = target
+        self._translate_box.setVisible(False)
+        self._inject_box.setVisible(False)
+        self._unity_deploy_box.setVisible(True)
+        # RPG Maker 分支的状态/按钮不会因为 self._translate_box/_inject_box 被
+        # 隐藏就自动失效——share_box（切换原文/译文、导出/导入翻译包）常驻可见，
+        # 不重置的话，先拖一个已经注入过的 RPG Maker 工程、再拖 Unity 目录，
+        # "切换为原文/译文"仍然可点，点下去会在 Unity 目录里找不到备份，弹一个
+        # 跟眼前操作对不上的错误框。照抄"未识别到支持的引擎"分支的重置动作。
+        self._adapter = None
+        self._start_button.setEnabled(False)
+        self._switch_original_button.setEnabled(False)
+        self._switch_translated_button.setEnabled(False)
+        self._open_output_button.setVisible(False)
+        backend_label = {"mono": "Mono", "il2cpp": "IL2CPP"}[target.backend]
+        self._info_label.setText(
+            f"识别到 Unity 工程（{backend_label} / {target.arch}）：{target.exe_path.name}"
+        )
+        self._unity_status_label.setText("尚未部署")
+
+        qsettings = QSettings(ORG_NAME, APP_NAME)
+        is_local = qsettings.value("engine", "online") == ENGINE_LOCAL
+        self._unity_sakura_warning_label.setVisible(is_local)
+
+    def _resolve_shim_llm_config(self) -> LLMConfig:
+        """跟 _start_translate_worker 的引擎分流逻辑保持一致：本地 Sakura 也能用
+        （只警告不拦，见 _show_unity_panel），在线走 DeepSeek 等 provider。Unity
+        场景不需要 batch_size/并发/fallback 这些批量翻译才有意义的参数，shim 是
+        单条无状态请求。"""
+        qsettings = QSettings(ORG_NAME, APP_NAME)
+        if qsettings.value("engine", "online") == ENGINE_LOCAL:
+            api_key, base_url, model = resolve_local_config(qsettings)
+            if (not base_url or not model) and self._bundled_local_base_url:
+                base_url = self._bundled_local_base_url
+                model = LOCAL_ENGINE_MODEL_ALIAS
+            return LLMConfig(api_key=api_key, base_url=base_url, model=model, timeout=180.0)
+        base_url = resolve_base_url(qsettings)
+        model = str(qsettings.value("model", "deepseek-v4-flash"))
+        api_key = get_deepseek_api_key()
+        if not api_key:
+            raise MissingApiKeyError("未配置 DeepSeek API Key，请先在设置里配置。")
+        return LLMConfig(api_key=api_key, base_url=base_url, model=model, timeout=60.0)
+
+    def _on_unity_deploy_clicked(self) -> None:
+        if self._unity_target is None:
+            return
+        try:
+            config = self._resolve_shim_llm_config()
+        except MissingApiKeyError as e:
+            QMessageBox.warning(self, "缺少 API Key", str(e))
+            return
+
+        # 每次点「部署」都停掉旧 shim、拿新配置重新起一个——不复用已有实例。
+        # 用户很可能是"部署过一次 -> 发现翻译引擎配错了 -> 去设置里改 -> 回来
+        # 重新点部署"，旧实例的 config 是部署时那一刻的快照，闭包在
+        # TranslateShimServer 内部改不了，必须整个换新的才能让新配置生效。
+        self._stop_unity_shim_server()
+        self._unity_shim_server = TranslateShimServer(config)
+        port = self._unity_shim_server.start()
+
+        try:
+            result: DeployResult = deploy(self._unity_target, port, get_app_root() / "resources")
+        except Exception as e:
+            logger.exception("Unity mod 部署失败")
+            QMessageBox.critical(self, "部署失败", str(e))
+            self._stop_unity_shim_server()
+            return
+
+        self._unity_status_label.setText(
+            f"部署完成，共写入/覆盖 {len(result.deployed_files)} 个文件。"
+            "请自行启动游戏（Steam/直接运行 exe 均可）。"
+            "翻译在本程序和游戏都运行期间才生效——关闭本程序或重新部署后，"
+            "需要重启游戏才能连上新的翻译地址。"
+        )
+
+    def _on_unity_remove_clicked(self) -> None:
+        if self._unity_target is None:
+            return
+        game_dir = self._unity_target.exe_path.parent
+        try:
+            result: RemoveResult = remove(game_dir)
+        except Exception as e:
+            logger.exception("Unity mod 卸载失败")
+            QMessageBox.critical(self, "卸载失败", str(e))
+            return
+        self._unity_status_label.setText(
+            f"卸载完成：还原 {len(result.restored)} 个文件，删除 {len(result.removed)} 个新增文件。"
+        )
+        self._stop_unity_shim_server()
+
+    def _stop_unity_shim_server(self) -> None:
+        if self._unity_shim_server is not None:
+            self._unity_shim_server.stop()
+            self._unity_shim_server = None
 
     def _on_preview_extract_done(self, units: list, resume_note: str) -> None:
         path = self._project_dir
@@ -1042,6 +1208,7 @@ class MainWindow(QMainWindow):
         running = [worker for worker in self._all_workers() if worker is not None and worker.isRunning()]
         if not running:
             self._stop_local_engine()
+            self._stop_unity_shim_server()
             event.accept()
             return
 
@@ -1061,6 +1228,7 @@ class MainWindow(QMainWindow):
             return
 
         self._stop_local_engine()
+        self._stop_unity_shim_server()
         event.accept()
 
     def _stop_local_engine(self) -> None:
