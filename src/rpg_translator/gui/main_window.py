@@ -66,7 +66,7 @@ from rpg_translator.translate.local_engine import (
     get_app_root,
 )
 from rpg_translator.translate.pricing import estimate_cost_cny
-from rpg_translator.translate.sakura_prompt import SAKURA_PROMPT_STRATEGY
+from rpg_translator.translate.sakura_prompt import SAKURA_PROMPT_STRATEGY, SAKURA_PROMPT_STRATEGY_14B
 from rpg_translator.unity.deploy import DeployResult, RemoveResult, deploy, remove
 from rpg_translator.unity.detect import UnityTarget, detect_unity
 from rpg_translator.unity.translate_shim import TranslateShimServer
@@ -1010,7 +1010,14 @@ class MainWindow(QMainWindow):
                 base_url = self._bundled_local_base_url
                 model = LOCAL_ENGINE_MODEL_ALIAS
             fallback_api_key = fallback_base_url = fallback_model = None
-            prompt_strategy = SAKURA_PROMPT_STRATEGY
+            # 14B 版本的 Sakura-GalTransl 对控制码占位符有一个 7B 上不存在的特殊
+            # 毛病（见 sakura_prompt.py 里 SAKURA_PROMPT_STRATEGY_14B 的说明），
+            # 单靠模型名里有没有"14b"这个子串判断——粗糙但够用，没有更可靠的信号
+            # 能区分部署的是哪个具体模型（本地 provider 只填了 base_url+模型名，
+            # 没有额外的模型元数据接口）。
+            prompt_strategy = (
+                SAKURA_PROMPT_STRATEGY_14B if "14b" in model.lower() else SAKURA_PROMPT_STRATEGY
+            )
             # 本地量化小模型处理一批几十条的请求天然比云端 API 慢（实测局域网测试机
             # 上一批 20 行在并发负载下就要 15+ 秒），共用云端那套 60 秒超时容易在
             # 批次较大或并发排队时误触发超时重试，反而更慢——给本地引擎一个更宽松

@@ -264,6 +264,11 @@ class PromptStrategy:
     # （_has_all_placeholders 对空 mapping 永远返回 True）和 restore()（空 mapping
     # 下是恒等操作）自动退化成"不做任何事"，不需要额外分支。
     wrap_control_codes: bool = True
+    # protect() 生成占位符 token 时用的格式，None 表示用 protect() 自己的默认格式
+    # （⟦CCn⟧）。只有 wrap_control_codes=True 时才有意义——见
+    # sakura_prompt.py 的 SAKURA_PROMPT_STRATEGY_14B，那边换成不带括号的纯字母
+    # 数字格式，是针对 14B 模型丢括号占位符这个具体毛病加的。
+    placeholder_token: Callable[[int], str] | None = None
     # 随请求体一起发给 provider 的采样参数覆盖（temperature/top_p 等，OpenAI 兼容
     # 字段名）。不同 provider 的合理默认值差别很大：DeepSeek 之类通用云端模型没有
     # 已知需要偏离默认值的证据，留空不覆盖；专门微调过的本地小模型（见
@@ -459,7 +464,7 @@ async def translate_units(
             cache_hits.append((group, result_prefix + cached))
         else:
             if prompt_strategy.wrap_control_codes:
-                protected_text, mapping = protect(source_text)
+                protected_text, mapping = protect(source_text, token_fn=prompt_strategy.placeholder_token)
             else:
                 # 不包装占位符，但控制码本身原样交给模型——仍然要能校验模型是不是
                 # 老实保留了这些码，否则校验形同虚设（见 wrap_control_codes 的说明）。

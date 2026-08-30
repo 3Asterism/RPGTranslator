@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Callable
 
 CONTROL_CODE_PATTERN = re.compile(r"\\[A-Za-z]+(\[[^\]]*\])?|\\[.^!|]|\r\n|\n")
 # 末尾 \r\n|\n 分支：数据库 note/description 这类字段常见的真实换行符（不是游戏
@@ -33,11 +34,19 @@ _SPEAKER_TAG_PATTERN = re.compile(r"(⟦CC\d+⟧)<([^>\n]*)>")
 _SPEAKER_TAG_PATTERN = re.compile(r"(⟦CC\d+⟧)<([^>\n]*)>")
 
 
-def protect(text: str) -> tuple[str, dict[str, str]]:
+def protect(text: str, token_fn: Callable[[int], str] | None = None) -> tuple[str, dict[str, str]]:
+    """token_fn 可以换掉默认的 ⟦CCn⟧ 占位符格式——2026-08 实测 Sakura-GalTransl-14B
+    对"整行几乎就是一个被 \\C[n]...\\C[0] 包住的短专有名词"这类行，不管标记长什么样
+    （原始反斜杠码、⟦CCn⟧ 占位符）都有约定俗成的丢弃倾向（会把标记当装饰符号一并
+    吞掉，或者换成书名号这类它自己学到的等价物），但对完全不带括号/标点的纯字母
+    数字 token（比如 QCC00）保留得很稳（同一批测试里 33/33 次完整保留）。见
+    sakura_prompt.py 的 SAKURA_PROMPT_STRATEGY_14B。"""
+    if token_fn is None:
+        token_fn = lambda n: f"⟦CC{n}⟧"  # noqa: E731
     mapping: dict[str, str] = {}
 
     def repl(m: re.Match[str]) -> str:
-        token = f"⟦CC{len(mapping)}⟧"
+        token = token_fn(len(mapping))
         mapping[token] = m.group(0)
         return token
 
@@ -56,8 +65,20 @@ def protect(text: str) -> tuple[str, dict[str, str]]:
     return _SPEAKER_TAG_PATTERN.sub(speaker_repl, protected), mapping
 
 
+def bare_alnum_token(n: int) -> str:
+    """给 protect() 用的无括号占位符格式：QCC00/QCC01/…，固定 2 位数字补零——
+    保证任何一个 token 都不会是另一个 token 的字符串前缀（QCC1 不补零的话会是
+    QCC10 的前缀），从根上避免 restore() 替换时互相污染，不用依赖替换顺序兜底。
+    2 位数字上限 100 个不同控制码/行，正常游戏文本不会有一行踩到这个上限。"""
+    return f"QCC{n:02d}"
+
+
 def restore(text: str, mapping: dict[str, str]) -> str:
-    for token, code in mapping.items():
+    # 按 token 长度从长到短替换：不带括号分隔符的 token（见 protect 的 token_fn）
+    # 短序号可能是长序号的字符串前缀（比如 "QCC1" 是 "QCC10" 的前缀），先替换短的
+    # 会把长 token 从中间截断污染掉；⟦CCn⟧ 这种带括号的格式本来就不会有这个前缀
+    # 冲突，但排序不影响它的正确性，统一按这个顺序处理更省心。
+    for token, code in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
         text = text.replace(token, code)
     return text
 

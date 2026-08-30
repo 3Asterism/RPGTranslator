@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
+from rpg_translator.codec.control_codes import bare_alnum_token
 from rpg_translator.translate.batch_translator import Job, PromptStrategy
 
 # SakuraLLM/GalTransl 官方 prompt 模板（来自 GalTransl 项目 Backend/Prompts.py 的
@@ -122,4 +124,32 @@ SAKURA_PROMPT_STRATEGY = PromptStrategy(
     # （夹带上下文、行数错位）的概率，进而触发 batch_translator._bisect_batch
     # 的重试开销。这里在请求体里显式覆盖，不依赖具体部署环境有没有配对。
     extra_body={"temperature": 0.1, "top_p": 0.3},
+)
+
+
+# 2026-08-30 实测发现 Sakura-GalTransl-14B-v3.8（比上面 7B 更大的同系列模型）在
+# "整行几乎就是一个被 \C[n]...\C[0] 包住的短专有名词"这类行上，有个很固执的学习
+# 到的习惯：不管标记长什么样都会被当"装饰符号"处理掉——原始反斜杠码 \C[n] 会被
+# 直接丢掉或换成书名号《》这类它自己学到的等价物（哪怕 system prompt 里明确给了
+# 反例演示也没用），SAKURA_PROMPT_STRATEGY 关掉占位符包装后依赖的"8/8 原样保留"
+# 假设是照 7B 验证的，在 14B 上不成立；换成 wrap_control_codes=True 用的默认
+# ⟦CCn⟧ 占位符同样会被丢括号。唯一实测稳定的是完全不带括号/标点的纯字母数字
+# token（bare_alnum_token，比如 QCC00）——同一批混合场景测试（多个不同 token、
+# 嵌在长句中间、被引号包裹）33/33 次完整保留，不管是短行还是长句。
+#
+# 这不是通用结论，只对这个具体模型这个具体量化版本成立——所以单独开一个策略，不
+# 直接改上面 SAKURA_PROMPT_STRATEGY 影响到已经验证稳定的 7B 行为，由调用方
+# （main_window.py）按当前配置的本地模型名判断该用哪一个。
+SAKURA_SYSTEM_PROMPT_14B = (
+    SAKURA_SYSTEM_PROMPT
+    + "文本中形如 QCC00、QCC01 这样的字母加两位数字组合是控制码占位符，"
+    "必须原样照抄进译文对应位置，不能翻译、不能移动、不能增删、不能在两侧加任何"
+    "括号/书名号/引号等符号。"
+)
+
+SAKURA_PROMPT_STRATEGY_14B = replace(
+    SAKURA_PROMPT_STRATEGY,
+    system_prompt=SAKURA_SYSTEM_PROMPT_14B,
+    wrap_control_codes=True,
+    placeholder_token=bare_alnum_token,
 )

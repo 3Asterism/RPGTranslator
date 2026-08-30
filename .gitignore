@@ -22,3 +22,8 @@ game/
 # gitignore 明确写了这条），用 "*" 只排除直接子项才能让下面的例外规则生效。
 resources/unity_mod/*
 !resources/unity_mod/SOURCES.md
+
+# resources/fonts/ 同理：跑 scripts/fetch_translation_font.py 下载的第三方字体，
+# 不进 git（体积大），SOURCES.md 记录下载来源/sha256 的例外规则跟上面一样。
+resources/fonts/*
+!resources/fonts/SOURCES.md

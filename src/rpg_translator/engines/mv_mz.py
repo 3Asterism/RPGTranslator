@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any, ClassVar
 
 from rpg_translator.core.ir import EngineName, TextUnit, compute_text_unit_id
 from rpg_translator.engines.base import EngineAdapter, copy_project_if_different
+from rpg_translator.translate.local_engine import get_app_root
 
 _DATABASE_FILES = [
     "Actors.json",
@@ -34,6 +36,68 @@ _MAP_FILE_RE = re.compile(r"^Map\d{3}\.json$")
 _PURE_TAG_NOTE_RE = re.compile(r"^(\s*<[^<>\r\n]+>\s*)+$")
 
 _JSON_DUMP_KWARGS: dict[str, Any] = {"ensure_ascii": False, "separators": (",", ":")}
+
+# 2026-08-30 实测：日文原版游戏的主字体（比如某个作者自制的装饰字体）经常不含
+# 简体中文专有字形（"么"这种在日文汉字里根本用不到的字），翻译成中文后这些字
+# 直接显示空白。RPG Maker MV/MZ 的对话框文字是 Canvas fillText 画的，试过把
+# System.json 的 advanced.fallbackFonts 从 "Verdana, sans-serif" 改成带
+# "Microsoft YaHei" 的多字体链——不生效，这个引擎版本的 Canvas 渲染不会真的
+# 按 CSS font-family 那样逐个尝试列表里的后备字体，只认第一个。唯一可靠的办法
+# 是直接把主字体本身换掉，不依赖 fallback 链。
+#
+# 选霞鹜文楷（LXGWWenKai-Regular.ttf）不是随手选的：它是专门为覆盖尽可能全的
+# 简繁中日汉字设计的开源字体（SIL OFL 协议，允许打包分发），楷体观感也比微软
+# 雅黑这类系统黑体更贴近视觉小说/galgame 对话框常见的字体风格。字体文件本身
+# 不进 git（20+MB），跑 scripts/fetch_translation_font.py 下载到
+# resources/fonts/，来源/校验值见该目录下的 SOURCES.md。
+_FONT_RESOURCE_NAME = "LXGWWenKai-Regular.ttf"
+_FONT_LICENSE_NAME = "OFL.txt"
+
+
+def patch_font_for_chinese(output_dir: Path, data_dir: str) -> None:
+    """把 resources/fonts/ 下载好的中文字体拷进游戏的 fonts/ 目录，改
+    System.json 的 mainFontFilename/numberFontFilename 指向它。本地没跑过
+    fetch_translation_font.py 时 resources/fonts/ 不存在，直接跳过——不阻塞
+    正常的文本注入，只是这次注入不会自动修字体（跟 build.py 里
+    _bundle_unity_mod_assets 对本地引擎缺失时的降级方式一致）。
+
+    故意不放进 EngineAdapter.inject() 里——inject() 的行为被
+    tests/test_engines_mv_mz.py 的字节级往返一致性测试覆盖（比如
+    test_m1_roundtrip_untranslated_inject_is_byte_identical），换字体会让
+    System.json 必然产生变化，破坏那份"只改目标译文、其它字节不动"的保证。
+    这里是给 core/pipeline.py 的 run_inject/run_full 用的独立步骤，只在真实
+    的"写回游戏"流程里跑，不掺进 inject() 本身的契约。"""
+    font_src = get_app_root() / "resources" / "fonts" / _FONT_RESOURCE_NAME
+    license_src = get_app_root() / "resources" / "fonts" / _FONT_LICENSE_NAME
+    if not font_src.is_file():
+        print(
+            "[mv_mz] resources/fonts/ 里没有字体文件，跳过换字体这一步"
+            "（先跑 scripts/fetch_translation_font.py 才能让注入自动修复缺字问题）"
+        )
+        return
+
+    system_json_path = output_dir / data_dir / "System.json"
+    data = json.loads(system_json_path.read_text(encoding="utf-8"))
+    # 正常的 RPG Maker MV/MZ 工程 System.json 一定有 advanced 这个字段（字体/分辨率
+    # 这类引擎级配置都在里面）；测试用的极简合成 fixture 不带这个字段是预期内的，
+    # 不是"这个工程坏了"。先检查完再决定要不要往 fonts/ 目录拷文件，不做一半白
+    # 拷一份 20+MB 字体又用不上的无效功。
+    if "advanced" not in data:
+        print("[mv_mz] System.json 里没有 advanced 字段，跳过换字体这一步")
+        return
+
+    # data_dir 是 "data"（MZ）或 "www/data"（MV），同级的 fonts/ 目录就是把
+    # 最后一段 "data" 换成 "fonts"，两种引擎布局都适用。
+    fonts_dir = output_dir / Path(data_dir).parent / "fonts"
+    fonts_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(font_src, fonts_dir / _FONT_RESOURCE_NAME)
+    if license_src.is_file():
+        shutil.copy2(license_src, fonts_dir / _FONT_LICENSE_NAME)
+
+    data["advanced"]["mainFontFilename"] = _FONT_RESOURCE_NAME
+    data["advanced"]["numberFontFilename"] = _FONT_RESOURCE_NAME
+    system_json_path.write_text(json.dumps(data, **_JSON_DUMP_KWARGS), encoding="utf-8")
+    print(f"[mv_mz] 已将游戏主字体换成 {_FONT_RESOURCE_NAME}，修复简体中文缺字问题")
 
 
 def _parse_locator(locator: str) -> list[str | int]:

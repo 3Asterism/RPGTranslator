@@ -9,7 +9,7 @@ from typing import Callable, Literal
 from rpg_translator.core.ir import TextUnit
 from rpg_translator.core.store import Store
 from rpg_translator.engines.base import EngineAdapter
-from rpg_translator.engines.mv_mz import MVAdapter, MZAdapter
+from rpg_translator.engines.mv_mz import MVAdapter, MZAdapter, patch_font_for_chinese
 from rpg_translator.engines.vxace import VXAceAdapter
 from rpg_translator.engines.wolf import WolfAdapter
 from rpg_translator.engines.xp_vx import VXAdapter, XPAdapter
@@ -59,6 +59,15 @@ def run_extract(project_dir: Path, db_path: Path) -> list[TextUnit]:
     return units
 
 
+def _patch_font_if_mv_mz(adapter: EngineAdapter, output_dir: Path) -> None:
+    """MV/MZ 引擎特有的换字体步骤（见 engines/mv_mz.py 的 patch_font_for_chinese
+    说明：这两个引擎的日文原版字体常缺简体中文专有字形，Canvas 渲染又不吃
+    System.json 的 fallbackFonts 多字体链，只能直接换主字体）。其它引擎
+    （XP/VXAce/Wolf）目前没发现同类问题，也没做对应的字体资源，不在这触发。"""
+    if isinstance(adapter, (MVAdapter, MZAdapter)):
+        patch_font_for_chinese(output_dir, adapter.data_dir)
+
+
 def run_inject(project_dir: Path, db_path: Path, output_dir: Path | None = None) -> list[TextUnit]:
     """把翻译结果写回游戏工程。output_dir 缺省就是 project_dir 本身——原地注入，
     不再另外拷贝一份"汉化"目录（省一倍磁盘、也不用用户在两个文件夹之间找）。传入
@@ -70,6 +79,7 @@ def run_inject(project_dir: Path, db_path: Path, output_dir: Path | None = None)
         units = store.list_units()
     _stash_original_variant(project_dir, output_dir, units)
     adapter.inject(project_dir, units, output_dir)
+    _patch_font_if_mv_mz(adapter, output_dir)
     _stash_translated_variant(output_dir, units)
     return units
 
@@ -316,6 +326,7 @@ async def run_full(
         on_stage("写回中…")
     _stash_original_variant(project_dir, output_dir, all_units)
     adapter.inject(project_dir, all_units, output_dir)
+    _patch_font_if_mv_mz(adapter, output_dir)
     _stash_translated_variant(output_dir, all_units)
     return all_units
 

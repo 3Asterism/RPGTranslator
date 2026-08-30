@@ -42,6 +42,23 @@ def _bundle_unity_mod_assets() -> None:
         print(f"[build] 已打包 resources/unity_mod/{variant}")
 
 
+def _bundle_translation_font() -> None:
+    """把本地已经跑过 scripts/fetch_translation_font.py 产出的 resources/fonts/
+    拷进打包产物——engines/mv_mz.py 的 patch_font_for_chinese() 运行时从
+    get_app_root() / "resources" / "fonts" 找这份字体，frozen 情况下
+    get_app_root() 就是这个 dist/RPGTranslator/ 目录。本地没跑过 fetch 脚本时
+    resources/fonts/ 不存在，直接跳过——不阻塞常规打包，只是这份产物里 MV/MZ
+    注入不会自动修字体（跟 _bundle_unity_mod_assets 的降级方式一致）。"""
+    src = ROOT / "resources" / "fonts"
+    if not src.is_dir():
+        print("[build] resources/fonts/ 不存在，跳过字体打包"
+              "（先跑 scripts/fetch_translation_font.py 才能让打包产物支持自动修复缺字）")
+        return
+    dest = DIST_APP_DIR / "resources" / "fonts"
+    shutil.copytree(src, dest, dirs_exist_ok=True)
+    print("[build] 已打包 resources/fonts/")
+
+
 def main() -> int:
     cmd = [
         sys.executable,
@@ -62,6 +79,7 @@ def main() -> int:
         return result.returncode
 
     _bundle_unity_mod_assets()
+    _bundle_translation_font()
     return 0
 
 
