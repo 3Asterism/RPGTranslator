@@ -27,8 +27,9 @@ the project spec's secondhand section 6.4):
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
-from rpg_translator.core.ir import TextUnit, compute_text_unit_id
+from rpg_translator.core.ir import EngineName, TextUnit, compute_text_unit_id
 from rpg_translator.engines.base import EngineAdapter, copy_project_if_different
 from rpg_translator.engines.wolf_binary import (
     Command,
@@ -62,6 +63,11 @@ def _nonempty_texts(commands: list[Command], locator_prefix: str) -> list[tuple[
 
 
 class WolfAdapter(EngineAdapter):
+    # GUI（main_window.py 的 _ENGINE_LABELS）和 TextUnit.engine 都要读这个字段——
+    # 之前漏加，其它引擎（mv/mz/vxace/xp/vx）都在各自的 Adapter 类上定义了同名
+    # ClassVar，只有 Wolf 漏掉，导致识别到 Wolf 工程后 GUI 直接 AttributeError。
+    engine_name: ClassVar[EngineName] = "wolf"
+
     @staticmethod
     def detect(project_dir: Path) -> bool:
         basic_data = project_dir / "Data" / "BasicData"

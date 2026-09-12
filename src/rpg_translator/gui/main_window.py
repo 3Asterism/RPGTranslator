@@ -79,6 +79,7 @@ _ENGINE_LABELS = {
     "vxace": "RPG Maker VX Ace",
     "xp": "RPG Maker XP",
     "vx": "RPG Maker VX",
+    "wolf": "WOLF RPG Editor",
 }
 
 # 手写 QSS，不引入 qt-material 之类的第三方主题库——保持 PyInstaller 打包体积和

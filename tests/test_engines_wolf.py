@@ -30,6 +30,12 @@ def test_wolf_detected_via_basic_data(wolf_project: Path):
     assert WolfAdapter.detect(wolf_project) is True
 
 
+def test_wolf_adapter_declares_engine_name():
+    """GUI（main_window.py 的 _ENGINE_LABELS）和 TextUnit.engine 都要读这个
+    ClassVar——之前漏加过，识别到 Wolf 工程后 GUI 直接 AttributeError。"""
+    assert WolfAdapter.engine_name == "wolf"
+
+
 def test_wolf_not_detected_on_unrelated_dir(tmp_path: Path):
     assert WolfAdapter.detect(tmp_path) is False
 

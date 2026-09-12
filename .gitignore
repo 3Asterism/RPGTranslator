@@ -27,3 +27,8 @@ resources/unity_mod/*
 # 不进 git（体积大），SOURCES.md 记录下载来源/sha256 的例外规则跟上面一样。
 resources/fonts/*
 !resources/fonts/SOURCES.md
+
+# resources/wolf_dec/ 同理：跑 scripts/fetch_wolf_dec.py 下载的 UberWolfCli.exe
+# （解包 WOLF RPG Editor 打包发行版 Data.wolf 用），不进 git，SOURCES.md 例外。
+resources/wolf_dec/*
+!resources/wolf_dec/SOURCES.md

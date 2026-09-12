@@ -59,6 +59,26 @@ def _bundle_translation_font() -> None:
     print("[build] 已打包 resources/fonts/")
 
 
+def _bundle_wolf_dec() -> None:
+    """把本地已经跑过 scripts/fetch_wolf_dec.py 产出的 resources/wolf_dec/ 拷进
+    打包产物——engines/wolf_archive.py 的 find_uberwolf_cli() 运行时从
+    get_app_root() / "resources" / "wolf_dec" 找这个 exe，frozen 情况下
+    get_app_root() 就是这个 dist/RPGTranslator/ 目录。本地没跑过 fetch 脚本时
+    resources/wolf_dec/ 不存在，直接跳过——不阻塞常规打包，只是这份产物里遇到
+    "整个 Data 目录打包成单个 Data.wolf" 这种 WOLF RPG Editor 发行版会报错要求
+    先解包（跟 _bundle_unity_mod_assets 的降级方式一致），不拷贝 SOURCES.md（来源
+    记录，不是运行时依赖）。"""
+    src = ROOT / "resources" / "wolf_dec" / "UberWolfCli.exe"
+    if not src.is_file():
+        print("[build] resources/wolf_dec/UberWolfCli.exe 不存在，跳过"
+              "（先跑 scripts/fetch_wolf_dec.py 才能让打包产物支持解包 WOLF Data.wolf）")
+        return
+    dest_dir = DIST_APP_DIR / "resources" / "wolf_dec"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest_dir / "UberWolfCli.exe")
+    print("[build] 已打包 resources/wolf_dec/UberWolfCli.exe")
+
+
 def main() -> int:
     cmd = [
         sys.executable,
@@ -80,6 +100,7 @@ def main() -> int:
 
     _bundle_unity_mod_assets()
     _bundle_translation_font()
+    _bundle_wolf_dec()
     return 0
 
 

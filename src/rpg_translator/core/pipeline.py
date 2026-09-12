@@ -12,6 +12,7 @@ from rpg_translator.engines.base import EngineAdapter
 from rpg_translator.engines.mv_mz import MVAdapter, MZAdapter, patch_font_for_chinese
 from rpg_translator.engines.vxace import VXAceAdapter
 from rpg_translator.engines.wolf import WolfAdapter
+from rpg_translator.engines.wolf_archive import ensure_wolf_unpacked
 from rpg_translator.engines.xp_vx import VXAdapter, XPAdapter
 from rpg_translator.translate.batch_translator import (
     DEFAULT_BATCH_SIZE,
@@ -45,6 +46,10 @@ class MissingApiKeyError(Exception):
 
 
 def detect_adapter(project_dir: Path) -> EngineAdapter:
+    # WOLF RPG Editor 打包发行版（整个 Data 目录压成单个 Data.wolf）需要先解包成
+    # 明文 Data/ 目录，WolfAdapter.detect() 才认得出来——见 wolf_archive.py 的说明。
+    # 已经解包过、或压根不是这种布局时是个便宜的目录检查，可以放心每次都调用。
+    ensure_wolf_unpacked(project_dir)
     for adapter_cls in REGISTERED_ADAPTERS:
         if adapter_cls.detect(project_dir):
             return adapter_cls()
